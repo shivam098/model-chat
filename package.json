@@ -1,0 +1,54 @@
+{
+  "name": "model-chat",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24.13.0 <25" },
+  "scripts": {
+    "dev": "node scripts/serve.mjs --dev",
+    "build": "next build --webpack",
+    "start": "node scripts/serve.mjs",
+    "tunnel": "node scripts/tunnel.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test --test-concurrency=1 tests/*.test.ts",
+    "test:browser": "playwright test",
+    "test:restart": "tsx --test tests/restart.integration.ts",
+    "test:tunnel": "tsx --test tests/tunnel.integration.ts",
+    "test:public": "tsx tests/public-preview.integration.ts",
+    "admin:role": "tsx scripts/account-role.ts",
+    "backup": "node scripts/backup-db.mjs",
+    "check:copilot": "tsx scripts/check-copilot.ts",
+    "copilot:login": "node scripts/copilot-login.mjs"
+  },
+  "dependencies": {
+    "@github/copilot-sdk": "1.0.28",
+    "better-auth": "1.7.13",
+    "better-sqlite3": "13.0.3",
+    "read-excel-file": "9.3.12",
+    "lucide-react": "1.61.0",
+    "mammoth": "1.13.0",
+    "next": "16.4.3",
+    "pdfjs-dist": "6.4.299",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1",
+    "sharp": "0.35.5",
+    "yauzl": "3.4.0",
+    "zod": "4.6.7"
+  },
+  "overrides": {
+    "@github/copilot-sdk": { "zod": "$zod" }
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "@types/better-sqlite3": "9.6.0",
+    "@types/node": "^24.0.0",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@types/yauzl": "3.4.0",
+    "jszip": "3.10.2",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3"
+  }
+}
