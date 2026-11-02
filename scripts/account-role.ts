@@ -19,10 +19,10 @@ try {
 } finally { db.close(); }
 const backup = spawnSync(process.execPath, ["scripts/backup-db.mjs"], { stdio: "inherit" });
 if (backup.error || backup.status !== 0) throw new Error("The consistent backup failed; no role change was attempted.");
-const { getAuth } = await import("../lib/auth");
-const { getStore } = await import("../lib/store");
+const { Store } = await import("../lib/store");
 const { AccessService } = await import("../lib/access");
-await getAuth();
-const result = new AccessService(getStore()).setRoleLocally(email, role);
-console.log(JSON.stringify({ account: result.email, role: result.appRole, passwordAndHistoryUnchanged: true }));
-getStore().db.close();
+const writable = new Database(path.join(directory, "model-chat.db"));
+try {
+  const result = new AccessService(new Store(writable)).setRoleLocally(email, role);
+  console.log(JSON.stringify({ account: result.email, role: result.appRole, passwordAndHistoryUnchanged: true }));
+} finally { writable.close(); }

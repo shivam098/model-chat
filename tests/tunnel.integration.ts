@@ -77,6 +77,11 @@ test("tunnel mode allows email/password signup without OTP and preserves secure 
     for (const invalid of [{ email: "not-email", password }, { email: "new@example.test", password: "short" }]) {
       assert.equal((await directRequest(local + "/api/auth/sign-up/email", { method: "POST", headers, body: JSON.stringify(invalid) })).status, 400);
     }
+    for (const injected of [{ appRole: "superuser" }, { role: "superuser" }]) {
+      assert.equal((await directRequest(local + "/api/auth/sign-up/email", {
+        method: "POST", headers, body: JSON.stringify({ email: "forged-role@example.test", password, ...injected }),
+      })).status, 400, "Public signup must not assign a role.");
+    }
     const newSignup = await directRequest(local + "/api/auth/sign-up/email", {
       method: "POST", headers, body: JSON.stringify({ email: "new@example.test", password }),
     });
@@ -85,6 +90,17 @@ test("tunnel mode allows email/password signup without OTP and preserves secure 
     assert.ok(newCookies.some(value => /session_token/.test(value) && /;\s*Secure/i.test(value)));
     const newCookie = newCookies.map(value => value.split(";")[0]).join("; ");
     assert.equal((await directRequest(local + "/api/account", { headers: { ...headers, cookie: newCookie } })).status, 200, "Signup creates a session immediately, without OTP");
+    const ordinary = await (await directRequest(local + "/api/account", { headers: { ...headers, cookie: newCookie } })).json();
+    assert.equal(ordinary.user.appRole, "user");
+    assert.equal(ordinary.actor.id, ordinary.user.id);
+    assert.equal((await directRequest(local + "/api/admin/users", { headers: { ...headers, cookie: newCookie } })).status, 403);
+    assert.equal((await directRequest(local + "/api/admin/audit", { headers: { ...headers, cookie: newCookie } })).status, 403);
+    assert.equal((await directRequest(local + "/api/admin/acting", {
+      method: "POST", headers: { ...headers, cookie: newCookie }, body: JSON.stringify({ userId: ordinary.user.id }),
+    })).status, 403);
+    const forgedCookie = `${newCookie}; model-chat-acting=forged-other-user`;
+    const unmodified = await (await directRequest(local + "/api/account", { headers: { ...headers, cookie: forgedCookie } })).json();
+    assert.equal(unmodified.user.id, ordinary.user.id, "An invented acting cookie is not an authorization source.");
     assert.equal((await directRequest(local + "/api/chats", { headers })).status, 401);
     assert.equal((await directRequest(local + "/api/chats", { method: "POST", headers: { ...headers, origin: "https://evil.test" } })).status, 403);
     const insecure = await directRequest(local + "/", { headers: { ...headers, "x-forwarded-proto": "http" } });

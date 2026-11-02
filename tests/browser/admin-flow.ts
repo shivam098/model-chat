@@ -8,7 +8,11 @@ import { AccessService } from "../../lib/access";
 export async function runAdminFlow(page: Page, bob: Page, adminEmail: string, bobEmail: string) {
   const origin = "http://127.0.0.1:3211";
   expect(page.url().startsWith(origin)).toBe(true);
-  const database = new Database(path.resolve(".local", "browser-test-data", "model-chat.db"));
+  const testDirectory = process.env.MODEL_CHAT_TEST_DATA_DIR;
+  if (!testDirectory || !path.resolve(testDirectory).startsWith(path.resolve(".local") + path.sep) || !path.basename(testDirectory).startsWith("browser-test-")) {
+    throw new Error("An isolated browser-test data directory is required.");
+  }
+  const database = new Database(path.join(testDirectory, "model-chat.db"));
   const store = new Store(database);
   const roles = new AccessService(store);
   let requests = 0;

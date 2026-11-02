@@ -118,6 +118,8 @@ Drafts are autosaved to their owned chat and flushed before chat/user switches. 
 
 The audit view records real actor ID, subject ID, action, object ID, time, outcome and a bounded outcome reason. It does not store prompt text, filenames/file contents, authentication tokens or password hashes. Audit records survive account deletion. Ordinary users cannot read the audit or administration endpoints.
 
+`npm run backup` creates a consistent SQLite snapshot and a content-free row-count/hash manifest in `.local\backups`. To verify that an additive migration preserved all original columns, run `node scripts/backup-db.mjs --verify "<path-to-preservation.json>"` before resuming user traffic. Role changes intentionally affect the added role column, not existing password/history fields.
+
 ## Privacy and security model
 
 **This app is local-only by default, with an optional public shared preview; it is not production hosting.** The explicit temporary-tunnel mode above is the supported remote-access mode. All accounts use the **same host owner's Copilot entitlement and billing allowance**, with separate histories and files. Email addresses are account labels, not verified identities. Email/password signup, login, and logout work locally and through the public link without OTP. There is no Google OAuth, email verification, password reset, recovery service, or GitHub OAuth flow.
@@ -161,7 +163,9 @@ Focused tests cover ownership on guessed IDs, persistence/reopen/model context, 
 
 The tunnel integration test uses port 3213 and synthetic accounts to verify new signup without OTP, existing-account login/logout, invalid credentials, two-account demo isolation, Secure cookies, origin rejection, and local-to-HTTPS redirects. It does not create a real external tunnel or send credentials to Cloudflare.
 
-Browser tests use installed **Microsoft Edge**, create only test accounts in `.local/browser-test-data`, and launch their own loopback server on port 3211. They exercise the two-field signup form, real Better Auth, server ownership, uploads/downloads, chat CRUD, logout/login, desktop/mobile demo menus, draft preservation, separate demo chats, no hidden demo generation, and simulated unsupported/denied microphone behavior. Tests do not make model calls by default.
+Browser tests use installed **Microsoft Edge**, create test accounts in a unique `.local/browser-test-<id>` directory, and launch their own loopback server on port 3211. They exercise the two-field signup form, real Better Auth, server ownership, uploads/downloads, chat CRUD, logout/login, desktop/mobile demo menus, draft preservation, separate demo chats, no hidden demo generation, and simulated unsupported/denied microphone behavior. Tests do not make model calls by default.
+
+The same browser flow also checks superuser search, acting/return, original-history preservation, per-user drafts, auditing, native image uploads, and role revocation. Set `MODEL_CHAT_ADMIN_LIVE_TEST=1` and run `npm run test:browser -- --grep "accounts, ownership"` to additionally make **one real native-image request while acting as a user** and verify the reply stays in that user's chat. Synthetic roles exist only in the isolated test database.
 
 To include **two small real Copilot requests** (file-grounded streaming, reload, and switching models):
 
@@ -184,6 +188,7 @@ Official references used for this implementation:
 - [Copilot authentication](https://github.com/github/copilot-sdk/blob/main/docs/auth/authenticate.md)
 - [Copilot empty mode and isolation](https://github.com/github/copilot-sdk/blob/main/docs/setup/multi-tenancy.md)
 - [Copilot bundled runtime](https://github.com/github/copilot-sdk/blob/main/docs/setup/bundled-cli.md)
+- [Copilot native image input and model limits](https://github.com/github/copilot-sdk/blob/main/docs/features/image-input.md)
 - [Better Auth installation and SQLite](https://www.better-auth.com/docs/installation)
 
 The implementation is checked against the installed SDK **1.0.28 / runtime 1.0.105** types rather than assuming evolving examples match the installed package.

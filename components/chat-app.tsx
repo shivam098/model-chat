@@ -236,6 +236,7 @@ export function ChatApp() {
       draftSaved.current = { userId: userRef.current!.id, chatId: result.chat.id, draft: result.chat.draft || "", model: result.chat.model || modelRef.current };
       setDetail(result);
       setDraft(result.chat.draft || "");
+      setDraftState("saved");
       if (result.chat.model) setSelectedModel(result.chat.model);
       window.history.replaceState(null, "", `?chat=${chat.id}`);
     } catch (error) { if (request === selection.current) report(error); }
@@ -259,7 +260,7 @@ export function ChatApp() {
     const text = draftRef.current;
     const model = modelRef.current;
     const saved = draftSaved.current;
-    if ((!chatId && !text) || (saved?.userId === owner && saved.chatId === chatId && saved.draft === text && saved.model === model)) return;
+    if ((!chatId && !text) || (saved?.userId === owner && saved.chatId === chatId && saved.draft === text && saved.model === model)) { setDraftState("saved"); return; }
     setDraftState("saving");
     const operation = (async () => {
       try {
@@ -515,6 +516,7 @@ export function ChatApp() {
         }
         draftRef.current = next.slice(0, LIMITS.inputCharacters);
         setDraft(draftRef.current);
+        setDraftState("saving");
       }
       setInterim(interimText);
     };
@@ -605,7 +607,7 @@ export function ChatApp() {
         <div className="topbar-title"><IconButton label="Open sidebar" onClick={() => setSidebar(true)}><PanelLeft size={20} /></IconButton><button className="menu-button" onClick={() => setMenu(true)}><Menu size={18} /><span>Menu</span></button><span>{detail?.chat.title || "A fresh conversation"}</span></div>
         <div className="model-control">
           <span className={`status-dot ${connectionError ? "offline" : ""}`} />
-          <select aria-label="Select model" value={selectedModel} disabled={locked || modelLoading || !models.length} onChange={event => setSelectedModel(event.target.value)}>
+          <select aria-label="Select model" value={selectedModel} disabled={locked || modelLoading || !models.length} onChange={event => { setSelectedModel(event.target.value); setDraftState("saving"); }}>
             {!selectedModel && <option value="">{modelLoading ? "Connecting..." : "No models available"}</option>}
             {selectedModel && !modelAvailable && <option value={selectedModel}>{selectedModel} (unavailable)</option>}
             {models.map(model => <option value={model.id} key={model.id}>{model.name}{model.vision ? " · vision" : ""}{model.multiplier !== undefined ? ` · ${model.multiplier}x` : ""}</option>)}
@@ -628,9 +630,9 @@ export function ChatApp() {
             <h1>What&apos;s on your mind?</h1>
             <p>{pending.length ? <>Your files are ready.<br />Ask a question to start exploring them.</> : <>Start with a thought, a question, or a file.<br />Pick a model. Make room for an idea.</>}</p>
             {pending.length === 0 && <div className="suggestions">
-              <button onClick={() => { setDraft("Help me think through an idea. Ask me one useful question to get started."); composer.current?.focus(); }}><MessageSquare size={20} /><strong>Think it through</strong><span>Find a new perspective</span></button>
+              <button onClick={() => { setDraft("Help me think through an idea. Ask me one useful question to get started."); setDraftState("saving"); composer.current?.focus(); }}><MessageSquare size={20} /><strong>Think it through</strong><span>Find a new perspective</span></button>
               <button onClick={() => fileInput.current?.click()} disabled={locked}><FileText size={20} /><strong>Explore a document</strong><span>Turn information into insight</span></button>
-              <button onClick={() => { setDraft("Help me write something clear and concise. Ask what I want to communicate."); composer.current?.focus(); }}><Pencil size={20} /><strong>Find the right words</strong><span>Bring a first draft to life</span></button>
+              <button onClick={() => { setDraft("Help me write something clear and concise. Ask what I want to communicate."); setDraftState("saving"); composer.current?.focus(); }}><Pencil size={20} /><strong>Find the right words</strong><span>Bring a first draft to life</span></button>
             </div>}
           </div> : <div className="message-list">
             {detail.messages.map(item => <article key={item.id} className={`message ${item.role}`} aria-label={`${item.role === "user" ? "Your" : "Assistant"} message`}>
@@ -655,7 +657,7 @@ export function ChatApp() {
           {pending.length > 0 && <div className="pending-files">{pending.map(file => <div className="file-chip" title={`${file.notes} ${file.characters.toLocaleString()} characters.`} key={file.id}><FileText size={16} /><span>{file.name}<small>{(file.size / 1024).toFixed(0)} KB · ready</small></span><IconButton label={`Remove ${file.name}`} disabled={locked} onClick={() => void removeFile(file)}><X size={14} /></IconButton></div>)}</div>}
           <label className="sr-only" htmlFor="message">Message</label>
           <textarea id="message" ref={composer} rows={2} placeholder={listening ? "Listening... your words will appear here" : "Ask anything, or bring a file into the conversation..."} value={draft}
-            onChange={event => { draftRef.current = event.target.value; setDraft(event.target.value); }} maxLength={LIMITS.inputCharacters} disabled={busy || loadingChat || remoteBusy || demoLoading || switching}
+            onChange={event => { draftRef.current = event.target.value; setDraft(event.target.value); setDraftState("saving"); }} maxLength={LIMITS.inputCharacters} disabled={busy || loadingChat || remoteBusy || demoLoading || switching}
             onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send(); } }} />
           {interim && <div className="interim" aria-live="polite">{interim}</div>}
           <div className="composer-tools">

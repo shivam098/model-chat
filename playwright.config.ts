@@ -1,5 +1,8 @@
 import { defineConfig } from "@playwright/test";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
+
+process.env.MODEL_CHAT_TEST_DATA_DIR ||= path.resolve(".local", `browser-test-${randomUUID()}`);
 
 export default defineConfig({
   testDir: "./tests/browser",
@@ -13,6 +16,6 @@ export default defineConfig({
     url: "http://127.0.0.1:3211/api/health",
     timeout: 120_000,
     reuseExistingServer: false,
-    env: { MODEL_CHAT_DATA_DIR: path.resolve(".local", "browser-test-data") },
+    env: { MODEL_CHAT_DATA_DIR: process.env.MODEL_CHAT_TEST_DATA_DIR },
   },
 });
