@@ -41,3 +41,4 @@
 .audit-event>div{display:flex;flex-wrap:wrap;gap:8px}.audit-event time{color:var(--muted);margin-left:auto}.audit-event dl{display:grid;grid-template-columns:85px 1fr;gap:4px;margin:10px 0 0}
 .audit-event dt{color:var(--muted)}.audit-event dd{margin:0;overflow-wrap:anywhere;font-family:Consolas,monospace;font-size:10px}
 @media(max-width:760px){.acting-banner{padding:10px 14px}.acting-banner button{font-size:11px}.admin-user{align-items:flex-start;flex-wrap:wrap}.admin-row-actions{flex-direction:row}.audit-event time{margin-left:0}}
+.extracted-text{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;line-height:1.7;max-height:55dvh;overflow:auto;background:var(--soft);padding:14px;border-radius:9px}

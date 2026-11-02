@@ -2,6 +2,7 @@ import { test, expect, type Page } from "@playwright/test";
 import { randomUUID } from "node:crypto";
 import { runAdminFlow } from "./admin-flow";
 import type { DictationEvent } from "../../lib/voice";
+import { runMediaFlow } from "./media-flow";
 
 const origin = "http://127.0.0.1:3211";
 const password = "Test-only password! 48291";
@@ -17,6 +18,7 @@ async function signUp(page: Page, address: string) {
   await expect(page.getByRole("heading", { name: "What's on your mind?" })).toBeVisible();
 }
 test("accounts, ownership, files, histories, password validation and responsive UI", async ({ page, browser }) => {
+  if (process.env.MODEL_CHAT_MEDIA_TEST === "1") test.setTimeout(300_000);
   const errors: string[] = [];
   page.on("pageerror", error => errors.push(error.message));
   await signUp(page, email);
@@ -98,7 +100,8 @@ test("accounts, ownership, files, histories, password validation and responsive 
   await page.reload();
   await expect(page.getByLabel("Message", { exact: true })).toHaveValue(/Using sample-budget.csv/);
   expect(modelRequests).toBe(0);
-  const explicitRequests = await runAdminFlow(page, bob, email, bobEmail);
+  const mediaRequests = process.env.MODEL_CHAT_MEDIA_TEST === "1" ? await runMediaFlow(page, bob) : 0;
+  const explicitRequests = mediaRequests + await runAdminFlow(page, bob, email, bobEmail);
   await other.close();
 
   await page.setViewportSize({ width: 390, height: 844 });

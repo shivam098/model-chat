@@ -4,7 +4,7 @@ import { getStore } from "@/lib/store";
 import { AccessService, type AccessContext } from "@/lib/access";
 import { AppError, errorResponse } from "@/lib/errors";
 import { assertLocalRequest, readBytes, readJson, requireAccess } from "@/lib/http";
-import { LIMITS } from "@/lib/contracts";
+import { LIMITS, isMediaExtension, uploadByteLimit } from "@/lib/contracts";
 import { extractFile, validateFileName } from "@/lib/files";
 import { listModels, runCopilotReply } from "@/lib/copilot";
 import { buildPrompt } from "@/lib/context";
@@ -14,11 +14,13 @@ import { signupSchema } from "@/lib/signup";
 import { DEMO_IDS } from "@/lib/demos";
 import { createDemoChat } from "@/lib/demo-storage";
 import { nativeImages } from "@/lib/native-images";
+import { mediaStatus, processMedia, type MediaFrame } from "@/lib/media";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 const parsingState = globalThis as typeof globalThis & { modelChatParsing?: Set<string> };
 const parsing = parsingState.modelChatParsing ||= new Set();
+const mediaState = globalThis as typeof globalThis & { modelChatMediaBusy?: boolean };
 type RouteContext = { params: Promise<{ segments: string[] }> };
 const accountId = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
 const draftSchema = z.object({
@@ -79,6 +81,9 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
     }, chat => chat?.id ?? null);
     if (s.length === 1 && s[0] === "account" && method === "GET") {
       return Response.json(run("workspace.account", user.id, () => guard.account(ctx)));
+    }
+    if (s.length === 1 && s[0] === "media-status" && method === "GET") {
+      return Response.json(run("media.status", null, () => mediaStatus()));
     }
     if (s[0] === "admin") {
       if (s.length === 2 && s[1] === "acting" && method === "POST") {
@@ -179,16 +184,25 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
       store.assertIdle(user.id, chatId);
       if (parsing.size >= 2 || parsing.has(user.id)) throw new AppError(429, "Another file is being processed. Wait a moment and try again.");
       parsing.add(user.id);
+      let media = false;
+      let mediaSlot = false;
       try {
         let name: string;
         try { name = decodeURIComponent(request.headers.get("x-file-name") || ""); }
         catch { throw new AppError(400, "Invalid file name."); }
-        validateFileName(name);
-        const bytes = await readBytes(request, LIMITS.fileBytes);
-        const result = await extractFile(name, bytes);
-        const attachment = run("file.upload", null, () => store.addFile(user.id, chatId, name, bytes, result.text, result.notes, result.mimeType), file => file.id);
+        const extension = validateFileName(name);
+        media = isMediaExtension(extension);
+        if (media && mediaState.modelChatMediaBusy) throw new AppError(429, "Another audio/video file is being processed. Wait for it to finish and try again.");
+        if (media) { mediaState.modelChatMediaBusy = true; mediaSlot = true; }
+        const bytes = await readBytes(request, uploadByteLimit(name));
+        const result: { text: string; notes: string; mimeType?: string; frames?: MediaFrame[] } = media
+          ? await processMedia(extension, bytes, request.signal, () => { guard.check(ctx); })
+          : await extractFile(name, bytes);
+        request.signal.throwIfAborted();
+        const frames = result.frames ?? [];
+        const attachment = run("file.upload", null, () => store.addFile(user.id, chatId, name, bytes, result.text, result.notes, result.mimeType, frames), file => file.id);
         return Response.json({ attachment }, { status: 201 });
-      } finally { parsing.delete(user.id); }
+      } finally { parsing.delete(user.id); if (mediaSlot) mediaState.modelChatMediaBusy = false; }
     }
     if (s.length === 4 && s[2] === "files") {
       const file = store.file(user.id, chatId, s[3]);
@@ -202,6 +216,10 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
         run("file.delete", file.id, () => store.deleteFile(user.id, chatId, s[3]));
         return Response.json({ ok: true });
       }
+    }
+    if (s.length === 5 && s[2] === "files" && s[4] === "extracted" && method === "GET") {
+      const file = store.fileText(user.id, chatId, s[3]);
+      return Response.json(run("file.text.read", file.id, () => ({ name: file.name, text: file.text, notes: file.notes })));
     }
     throw new AppError(404, "Endpoint not found.");
   } catch (error) {

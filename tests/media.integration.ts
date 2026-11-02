@@ -1,0 +1,78 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import Database from "better-sqlite3";
+import { processMedia, mediaStatus } from "../lib/media";
+import { Store } from "../lib/store";
+import { AppError } from "../lib/errors";
+
+test("installed local Whisper transcribes real speech and video frames remain owned and persistent", { timeout: 360_000 }, async () => {
+  assert.equal(mediaStatus().ready, true, "Run npm run setup:media first.");
+  const directory = await mkdtemp(path.resolve(".local", "media-test-"));
+  try {
+    const speech = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-File", path.resolve("tests", "generate-speech.ps1")], {
+      env: { ...process.env, MODEL_CHAT_MEDIA_FIXTURES: directory }, encoding: "utf8", timeout: 30_000,
+    });
+    assert.equal(speech.status, 0, speech.stderr);
+    const fixtures = spawnSync("python", ["-X", "faulthandler", path.resolve("tests", "make-media-fixtures.py"), directory], { encoding: "utf8", timeout: 30_000 });
+    assert.equal(fixtures.status, 0, fixtures.stdout + fixtures.stderr);
+    const config = new AbortController();
+    const audio = await processMedia("wav", await readFile(path.join(directory, "speech.wav")), config.signal, () => {});
+    assert.match(audio.text.toLowerCase(), /blue notebook/);
+    assert.match(audio.text.toLowerCase(), /twenty|20/);
+    assert.equal(audio.frames.length, 0);
+    assert.equal(audio.mimeType, "audio/wav");
+    const mp3 = await processMedia("mp3", await readFile(path.join(directory, "speech.mp3")), config.signal, () => {});
+    assert.match(mp3.text.toLowerCase(), /blue notebook/);
+    const videoBytes = await readFile(path.join(directory, "speech-video.mp4"));
+    const video = await processMedia("mp4", videoBytes, config.signal, () => {});
+    assert.match(video.text.toLowerCase(), /blue notebook/);
+    assert.ok(video.frames.length >= 2 && video.frames.length <= 4);
+    assert.notDeepEqual(video.frames[0].bytes, video.frames.at(-1)!.bytes);
+    assert.equal(video.mimeType, "video/mp4");
+    const silent = await processMedia("mp4", await readFile(path.join(directory, "silent-video.mp4")), config.signal, () => {});
+    assert.match(silent.text, /No audio track/);
+    assert.ok(silent.frames.length >= 2);
+    await assert.rejects(() => processMedia("wav", readFileSyncBuffer("too-long.wav"), config.signal, () => {}), /3 minutes/);
+    await assert.rejects(() => processMedia("mp4", Buffer.from("#EXTM3U\nhttps://example.invalid/secret"), config.signal, () => {}), /do not match/);
+    const cancelled = new AbortController();
+    const pending = processMedia("wav", await readFile(path.join(directory, "speech.wav")), cancelled.signal, () => {});
+    setTimeout(() => cancelled.abort(), 50);
+    await assert.rejects(() => pending, /cancelled/);
+    let checks = 0;
+    await assert.rejects(() => processMedia("wav", readFileSyncBuffer("speech.wav"), config.signal, () => {
+      if (++checks > 1) throw new AppError(403, "Actor access revoked.");
+    }), /revoked/);
+
+    const file = path.join(directory, "storage.sqlite");
+    const db = new Database(file);
+    db.exec("CREATE TABLE user(id TEXT PRIMARY KEY); INSERT INTO user VALUES ('alice'),('bob')");
+    const store = new Store(db);
+    const chat = store.createChat("alice");
+    const attachment = store.addFile("alice", chat.id, "recording.mp4", videoBytes, video.text, video.notes, video.mimeType, video.frames);
+    assert.equal(store.attachments("alice", chat.id)[0].frameCount, video.frames.length);
+    assert.equal(store.contextImages("alice", chat.id, [attachment.id]).length, video.frames.length);
+    const turn = store.beginTurn("alice", chat.id, "Summarize the recording", "vision-model", [attachment.id]);
+    store.saveReply("alice", chat.id, turn.assistant.id, "fixture response", "complete");
+    db.close();
+    const reopened = new Database(file);
+    try {
+      const saved = new Store(reopened);
+      assert.match(saved.contextFiles("alice", chat.id, [])[0].text.toLowerCase(), /blue notebook/);
+      assert.equal(saved.contextImages("alice", chat.id, []).length, video.frames.length);
+      assert.throws(() => saved.contextImages("bob", chat.id, []), /not found/);
+      assert.deepEqual(saved.file("alice", chat.id, attachment.id).bytes, videoBytes);
+      saved.deleteChat("alice", chat.id);
+      assert.equal((reopened.prepare("SELECT count(*) count FROM app_media_frame").get() as { count: number }).count, 0);
+    } finally { reopened.close(); }
+    console.log("Real WAV/MP3/video speech, silent-video frames, limits, cancellation, revocation, ownership and restart persistence passed.");
+
+    function readFileSyncBuffer(name: string) {
+      // These files were generated by this test, never taken from a user's uploads.
+      return readFileSync(path.join(directory, name));
+    }
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});

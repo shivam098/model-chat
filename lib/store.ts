@@ -4,6 +4,7 @@ import path from "node:path";
 import { dataDirectory, ensureDataDirectory } from "./config";
 import { AppError } from "./errors";
 import { LIMITS, type Chat, type Message, type MessageStatus, type Attachment } from "./contracts";
+import type { MediaFrame } from "./media";
 
 export type FileRecord = Attachment & { text: string; bytes: Buffer };
 export class Store {
@@ -35,6 +36,12 @@ export class Store {
         mimeType TEXT NOT NULL DEFAULT 'text/plain'
       );
       CREATE INDEX IF NOT EXISTS app_file_chat ON app_file(chatId);
+      CREATE TABLE IF NOT EXISTS app_media_frame (
+        id TEXT PRIMARY KEY, fileId TEXT NOT NULL REFERENCES app_file(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL, seconds REAL NOT NULL CHECK(seconds>=0),
+        mimeType TEXT NOT NULL CHECK(mimeType='image/jpeg'), bytes BLOB NOT NULL,
+        UNIQUE(fileId,position)
+      );
       CREATE TABLE IF NOT EXISTS app_acting (
         sessionId TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
         id TEXT NOT NULL UNIQUE, actorId TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
@@ -104,7 +111,7 @@ export class Store {
   }
   attachments(userId: string, chatId: string): Attachment[] {
     this.chat(userId, chatId);
-    return this.db.prepare("SELECT id,chatId,messageId,name,size,characters,notes,createdAt,mimeType FROM app_file WHERE chatId=? ORDER BY createdAt,rowid").all(chatId) as Attachment[];
+    return this.db.prepare("SELECT f.id,f.chatId,f.messageId,f.name,f.size,f.characters,f.notes,f.createdAt,f.mimeType,(SELECT count(*) FROM app_media_frame m WHERE m.fileId=f.id) AS frameCount FROM app_file f WHERE f.chatId=? ORDER BY f.createdAt,f.rowid").all(chatId) as Attachment[];
   }
   file(userId: string, chatId: string, fileId: string): FileRecord {
     this.chat(userId, chatId);
@@ -112,16 +119,25 @@ export class Store {
     if (!row) throw new AppError(404, "File not found.");
     return row;
   }
-  addFile(userId: string, chatId: string, name: string, bytes: Buffer, text: string, notes: string, mimeType = "text/plain") {
+  fileText(userId: string, chatId: string, fileId: string) {
+    this.chat(userId, chatId);
+    const row = this.db.prepare("SELECT id,name,text,notes FROM app_file WHERE chatId=? AND id=?").get(chatId, fileId) as { id: string; name: string; text: string; notes: string } | undefined;
+    if (!row) throw new AppError(404, "File not found.");
+    return row;
+  }
+  addFile(userId: string, chatId: string, name: string, bytes: Buffer, text: string, notes: string, mimeType = "text/plain", frames: MediaFrame[] = []) {
     return this.db.transaction(() => {
       this.assertIdle(userId, chatId);
       const current = this.attachments(userId, chatId);
       if (current.length >= LIMITS.filesPerChat) throw new AppError(400, "Each chat can hold up to 8 files.");
       if (current.reduce((n, f) => n + f.characters, text.length) > LIMITS.chatFileCharacters) throw new AppError(400, "This chat's files exceed the 60,000-character limit. Use a smaller file or a new chat.");
-      const total = this.db.prepare("SELECT COALESCE(SUM(f.size),0) AS size FROM app_file f JOIN app_chat c ON f.chatId=c.id WHERE c.userId=?").get(userId) as { size: number };
-      if (total.size + bytes.length > LIMITS.userFileBytes) throw new AppError(400, "Your files exceed 50 MB. Delete old chats or files first.");
+      if (frames.length > LIMITS.videoFrames || frames.some(frame => frame.bytes.length > LIMITS.videoFrameBytes || frame.seconds < 0 || frame.seconds > LIMITS.mediaSeconds + 0.5)) throw new AppError(400, "Sampled video frames exceed the supported limits.");
+      const total = this.db.prepare("SELECT COALESCE(SUM(f.size + COALESCE((SELECT SUM(length(m.bytes)) FROM app_media_frame m WHERE m.fileId=f.id),0)),0) AS size FROM app_file f JOIN app_chat c ON f.chatId=c.id WHERE c.userId=?").get(userId) as { size: number };
+      if (total.size + bytes.length + frames.reduce((sum, frame) => sum + frame.bytes.length, 0) > LIMITS.userFileBytes) throw new AppError(400, "Your files and generated frames exceed 50 MB. Delete old chats or files first.");
       const id = randomUUID();
       this.db.prepare("INSERT INTO app_file(id,chatId,messageId,name,size,characters,notes,text,bytes,createdAt,mimeType) VALUES (?,?,NULL,?,?,?,?,?,?,?,?)").run(id, chatId, name, bytes.length, text.length, notes, text, bytes, Date.now(), mimeType);
+      const insertFrame = this.db.prepare("INSERT INTO app_media_frame VALUES (?,?,?,?,?,?)");
+      frames.forEach((frame, position) => insertFrame.run(randomUUID(), id, position, frame.seconds, frame.mimeType, frame.bytes));
       return this.attachments(userId, chatId).find(f => f.id === id)!;
     })();
   }
@@ -132,21 +148,30 @@ export class Store {
     this.db.prepare("DELETE FROM app_file WHERE chatId=? AND id=?").run(chatId, fileId);
   }
   contextFiles(userId: string, chatId: string, pendingIds: string[]) {
-    this.chat(userId, chatId);
+    const attachments = this.attachments(userId, chatId);
     for (const id of pendingIds) {
-      if (this.file(userId, chatId, id).messageId) throw new AppError(400, "This file has already been sent.");
+      const file = attachments.find(item => item.id === id);
+      if (!file) throw new AppError(404, "File not found.");
+      if (file.messageId) throw new AppError(400, "This file has already been sent.");
     }
-    return this.attachments(userId, chatId)
+    return attachments
       .filter(f => f.messageId || pendingIds.includes(f.id))
       .map(f => {
-        const full = this.file(userId, chatId, f.id);
+        const full = this.fileText(userId, chatId, f.id);
         return { id: full.id, name: full.name, text: full.text };
       });
   }
   contextImages(userId: string, chatId: string, pendingIds: string[]) {
     this.contextFiles(userId, chatId, pendingIds);
-    return this.attachments(userId, chatId).filter(file => file.mimeType?.startsWith("image/") && (file.messageId || pendingIds.includes(file.id)))
-      .map(file => this.file(userId, chatId, file.id));
+    return this.attachments(userId, chatId).filter(file => file.messageId || pendingIds.includes(file.id)).flatMap(file => {
+      if (file.mimeType?.startsWith("image/")) return [this.file(userId, chatId, file.id)];
+      if (!file.mimeType?.startsWith("video/")) return [];
+      const frames = this.db.prepare("SELECT id,seconds,mimeType,bytes FROM app_media_frame WHERE fileId=? ORDER BY position").all(file.id) as { id: string; seconds: number; mimeType: string; bytes: Buffer }[];
+      return frames.map(frame => ({
+        ...file, id: frame.id, name: `${file.name} [sample at ${frame.seconds.toFixed(2)}s]`,
+        mimeType: frame.mimeType, bytes: frame.bytes, size: frame.bytes.length, text: `[Sampled video frame at approximately ${frame.seconds.toFixed(2)}s]`,
+      }));
+    });
   }
   beginTurn(userId: string, chatId: string, content: string, model: string, fileIds: string[]) {
     return this.db.transaction(() => {

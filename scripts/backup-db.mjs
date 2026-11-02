@@ -38,9 +38,9 @@ if (verify >= 0) {
   const backupPath = path.join(directory, "model-chat.sqlite");
   const live = new Database(database, { readonly: true });
   try { await live.backup(backupPath); } finally { live.close(); }
-  chmodSync(backupPath, 0o600);
-  const snapshot = new Database(backupPath, { readonly: true });
+  const snapshot = new Database(backupPath);
   try {
+    snapshot.pragma("journal_mode = DELETE");
     const tables = snapshot.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(({ name }) => {
       const columns = snapshot.pragma(`table_info(${quote(name)})`).map(column => column.name);
       return { name, columns, ...fingerprint(snapshot, name, columns) };
@@ -48,5 +48,5 @@ if (verify >= 0) {
     const manifestPath = path.join(directory, "preservation.json");
     writeFileSync(manifestPath, JSON.stringify({ createdAt: new Date().toISOString(), backupPath, tables }, null, 2), { mode: 0o600 });
     console.log(JSON.stringify({ backupPath, manifestPath, tables: tables.map(table => ({ name: table.name, rows: table.count })) }, null, 2));
-  } finally { snapshot.close(); }
+  } finally { snapshot.close(); chmodSync(backupPath, 0o600); }
 }

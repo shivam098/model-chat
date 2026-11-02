@@ -43,7 +43,8 @@ test("native image bytes persist, remain owned and are resent when a chat is reo
 test("unsupported or misleading inputs fail explicitly instead of pretending to analyze media", async () => {
   await assert.rejects(() => extractFile("fake.png", Buffer.from("<svg></svg>")), /do not match/);
   await assert.rejects(() => extractFile("bad.jpg", Buffer.from("not a jpeg")), /do not match/);
-  for (const name of ["recording.wav", "music.mp3", "clip.mp4", "movie.webm"]) assert.throws(() => validateFileName(name), /not audio\/video understanding/);
+  for (const name of ["recording.wav", "music.mp3", "clip.mp4", "movie.webm"]) assert.equal(validateFileName(name), name.split(".").at(-1));
+  assert.throws(() => validateFileName("network-playlist.m3u8"), /supported/);
   const bytes = await sharp({ create: { width: 8200, height: 1, channels: 3, background: "red" } }).png().toBuffer();
   await assert.rejects(() => extractFile("wide.png", bytes), /dimension limit/);
 });

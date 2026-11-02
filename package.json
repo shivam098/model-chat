@@ -15,10 +15,12 @@
     "test:restart": "tsx --test tests/restart.integration.ts",
     "test:tunnel": "tsx --test tests/tunnel.integration.ts",
     "test:public": "tsx tests/public-preview.integration.ts",
+    "test:media": "tsx --test tests/media.integration.ts",
     "admin:role": "tsx scripts/account-role.ts",
     "backup": "node scripts/backup-db.mjs",
     "check:copilot": "tsx scripts/check-copilot.ts",
-    "copilot:login": "node scripts/copilot-login.mjs"
+    "copilot:login": "node scripts/copilot-login.mjs",
+    "setup:media": "node scripts/setup-media.mjs"
   },
   "dependencies": {
     "@github/copilot-sdk": "1.0.28",

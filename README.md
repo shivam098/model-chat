@@ -68,6 +68,25 @@ Use the paperclip to upload documents; ask a question and send to include them. 
 
 **Dictation** is browser speech recognition, not a realtime audio conversation. Click Dictate, acknowledge the privacy notice, allow microphone access, then review the transcript before sending. Browser support varies. Permission denial, missing microphones, and unsupported browsers leave text input usable. **Read aloud** uses browser speech synthesis and can be stopped. Actual microphone accuracy and available voices depend on your browser and device; browser services may process audio online.
 
+### Local audio/video uploads
+
+Uploaded recordings use a separate **local** processing path: faster-whisper transcribes speech on the host CPU, and PyAV decodes media using its bundled FFmpeg libraries. Video also produces up to four timestamped JPEG samples. Copilot receives the transcript and sampled images when you press Send, not raw native audio/video. Use a vision-capable model for videos. Transcription and frame extraction do not themselves make Copilot model requests.
+
+This machine already has Python 3.12, faster-whisper 1.2.1, PyAV 18, and a complete cached `large-v3-turbo` model. Configure the app to reuse them:
+
+```powershell
+npm run setup:media
+# Alternatively, select an already-cached smaller model or a particular Python:
+npm run setup:media -- --model small
+npm run setup:media -- --python "C:\path\to\python.exe" --model large-v3-turbo
+```
+
+Setup performs an **offline-only** model lookup and writes private `.local\media-config.json`. It does not download models or modify the global Python installation. If the required packages are absent on another machine, install `requirements-media.txt` into an app-local virtual environment using your approved package index, obtain model weights through an approved source, and pass that interpreter/model to setup. No speech API key, extra cloud provider, Torch, or standalone FFmpeg executable is needed.
+
+Use the eye icon on an attachment to inspect its extracted transcript before sending. Processing can be cancelled from the composer. One media worker runs at a time, with a 90-second deadline. It revalidates the requester's access while running and cleans its private temporary directory afterwards. The cached model is loaded per worker; this can use several GB of RAM and substantial CPU. Short clips work best; a valid file can still time out on a slow machine.
+
+Machine transcripts can mishear or miss speech. Audio without speech is reported as such, not analyzed for arbitrary sound effects. Video frames are sparse samples, not continuous motion understanding; important events between frames may be missed. Public-link uploads still pass through Cloudflare even though transcription runs locally. Original files, transcripts and frames remain private app data, subject to administrator access and the same ownership/audit rules as other attachments.
+
 ### How Model Chat works & Demos
 
 Open **Menu → How Model Chat works & Demos** from the hamburger button on desktop or mobile. The guide is also available before signing in; launching a sample requires an account.
@@ -83,18 +102,21 @@ Three examples are provided: **Explore a sample budget** (small synthetic CSV), 
 | Text | `.txt`, `.md`, `.csv`, `.json`; UTF-8 only; JSON must be valid |
 | Additional text | `.log`, `.yaml`, `.yml`, `.xml`; treated as UTF-8 data, never executed |
 | Native images | PNG, JPEG, WebP, static GIF; up to 5 MB / 16 megapixels / 8192 pixels per dimension; requires an advertised vision-capable model |
+| Audio | MP3, WAV, M4A, AAC, FLAC, OGG and OPUS; local machine transcript with approximate timestamps |
+| Video | MP4, MOV, WEBM, MKV and AVI with decodable streams; speech transcript plus up to 4 sampled JPEG frames; requires a vision model |
 | PDF | Selectable text, at most 100 pages; page markers included |
 | Word | `.docx` document text; no formatting, images, comments, macros, or embedded objects |
 | Excel | `.xlsx`, up to 20 sheets / 10,000 nonempty cells; sheet and cell markers; cached formula values only |
-| Files | 5 MB and 30,000 extracted characters per file; 4 per message; 8 and 60,000 extracted characters per chat |
-| Storage | 50 MB of original files per local account; at most 100 chats / 100 turns per chat |
+| Files | Documents/images: 5 MB each; media: 25 MB **and** 3 minutes each; 30,000 extracted characters per file; 4 per message; 8 and 60,000 extracted characters per chat |
+| Storage | 50 MB of originals plus generated frames per account; at most 100 chats / 100 turns per chat |
 | Messages | 8,000 input characters; 32,000 output characters; full context capped at 100,000 UTF-8 bytes and a conservative model-specific budget |
 | Processing | 20-second file parser timeout; 256 MB worker heap; ZIP preflight: 2,000 entries / 20 MB expanded / bounded compression ratio |
+| Media processing | One local worker; 90-second timeout; 3-minute decoded duration; video dimensions at most 4096 / 16 MP; up to 4 frames, each at most 512 KB |
 | Generation | One reply per account, two per app; four-minute overall timeout |
 
 Images use the official SDK's native base64 blob attachments. Original bytes remain in owned SQLite storage and are resent on later turns/reopened chats. Model-specific image MIME, count and byte limits are checked; changing to an incompatible model fails explicitly rather than silently omitting images.
 
-Scanned PDFs need OCR, which is **not** included. Password-protected documents, executable/ZIP uploads, legacy `.doc`/`.xls`, charts, animated images, audio uploads, and video are **not** supported. The installed Copilot SDK documents native image input, not native audio/video understanding. No separate transcription model or paid provider has been added; use transcripts or representative still images for those formats. Spreadsheet formulas are not executed; missing cached formula results are omitted. Extraction may lose layout, and AI answers should be checked against the original file.
+Scanned PDFs need OCR, which is **not** included. Password-protected documents, executable/ZIP uploads, network playlists, legacy `.doc`/`.xls`, charts and animated images are **not** supported. Media containers/codecs must be decodable by the installed PyAV. Files are never executed, and decoding disallows network protocols and external media references. The installed Copilot SDK's native input is still images; the app now supplies local transcripts and sampled video frames for audio/video files. Spreadsheet formulas are not executed; missing cached formula results are omitted. Extraction may lose information, so check answers against the original.
 
 ## Superuser administration
 
@@ -127,7 +149,7 @@ The audit view records real actor ID, subject ID, action, object ID, time, outco
 - The server binds only to `127.0.0.1`, verifies the exact Host/Origin, rejects cross-site API requests, and requires a same-origin header for mutations. Normal top-level links to the app's homepage are allowed. **Do not expose it through other tunnels, reverse proxies, or the LAN.** Use the explicit tunnel launcher so the remote-access protections are applied. Browser preview surfaces that proxy requests using a different origin can be refused.
 - Better Auth hashes passwords, stores sessions server-side, and issues HttpOnly, SameSite=Strict cookies. Cookies are Secure in HTTPS tunnel mode and not Secure only for local loopback HTTP. No auth tokens go in localStorage. The launcher supplies a fixed, unspoofable loopback identity for auth rate limiting, shared by remote sign-in attempts too.
 - Every chat, message, draft, demo, attachment, download, rename, delete, and stop operation checks ownership on the server. Ordinary users are isolated; a superuser may explicitly act as a user with auditing. The administrator can therefore access users' chats/files and operate in their workspaces. Files live as BLOBs in SQLite, not under a public web root. Client MIME and paths are never trusted.
-- Document parsers run in bounded worker threads. Office archives are inspected before parsing; external file access, macros, and executable payloads are rejected. This is resource isolation, **not** an OS sandbox or a substitute for patched parser dependencies.
+- Document parsers run in bounded worker threads. Office archives are inspected before parsing; external file access, macros, and executable payloads are rejected. Media runs in a bounded-lifetime Python child process with offline model loading, fixed decoder formats, byte/duration/frame limits and periodic authorization checks. Neither mechanism is an OS sandbox or a substitute for patched parser dependencies.
 - Copilot uses `mode: "empty"`, `availableTools: []`, explicit tool exclusions, and a rejecting permission handler. MCP servers, custom agents/skills/hooks/instructions, host git context, cross-session memory/store, and embedding retrieval are disabled. The app checks the runtime's initialized tool metadata is **empty before sending any prompt**; otherwise it fails closed.
 - The model sees only the authorized conversation and extracted files as a JSON data payload. A separate system instruction treats file content as untrusted, not permission grants. No model tools, shell execution, browsing, or arbitrary filesystem access are exposed.
 - Prompts, conversation context, extracted file text, and native image attachments are sent to **GitHub Copilot** when you send a message, subject to your plan's policies. Local storage is **not encrypted at rest**. Windows account or backup access can expose it; store only data you are allowed to send and retain.
@@ -140,6 +162,8 @@ By default `.local/` contains:
 - `auth-secret`: generated once with cryptographic randomness; keep it with the database when backing up.
 - `copilot/`: app-scoped runtime configuration and temporary SDK sessions. Normal completed/cancelled sessions are deleted; a forced OS/process shutdown may leave diagnostic/session remnants here.
 - `server.lock`: prevents two app servers from using the same store.
+- `media-config.json`: local Python/model paths and detected versions; never committed.
+- `processing/`: per-job private temporary media directories, removed on normal completion/cancellation.
 
 The app now lives in **Downloads**, outside the former OneDrive folder. Private `.local/` data, backups, `.env` files, uploads, runtime state, `node_modules`, build outputs and test artifacts are ignored and must never be pushed to GitHub. The former OneDrive location may retain cloud version-history copies; moving local files cannot erase those.
 
@@ -163,6 +187,16 @@ Focused tests cover ownership on guessed IDs, persistence/reopen/model context, 
 
 The tunnel integration test uses port 3213 and synthetic accounts to verify new signup without OTP, existing-account login/logout, invalid credentials, two-account demo isolation, Secure cookies, origin rejection, and local-to-HTTPS redirects. It does not create a real external tunnel or send credentials to Cloudflare.
 
+`npm run test:media` uses the configured local Whisper runtime and Windows' installed speech synthesizer to generate and transcribe synthetic WAV/MP3/video fixtures. It checks real words, silent video sampling, limits, cancellation, revoked access, owned storage and reopen behavior. It does not call Copilot or use user uploads. To add real media upload/preview/cancellation checks to the browser flow:
+
+```powershell
+$env:MODEL_CHAT_MEDIA_TEST = '1'
+npm run test:browser -- --grep "accounts, ownership"
+Remove-Item Env:\MODEL_CHAT_MEDIA_TEST
+```
+
+Additionally setting `MODEL_CHAT_MEDIA_LIVE_TEST=1` makes one explicit Copilot request in that browser check to verify a response is grounded in both the machine transcript and sampled frames. It consumes the host owner's Copilot quota.
+
 Browser tests use installed **Microsoft Edge**, create test accounts in a unique `.local/browser-test-<id>` directory, and launch their own loopback server on port 3211. They exercise the two-field signup form, real Better Auth, server ownership, uploads/downloads, chat CRUD, logout/login, desktop/mobile demo menus, draft preservation, separate demo chats, no hidden demo generation, and simulated unsupported/denied microphone behavior. Tests do not make model calls by default.
 
 The same browser flow also checks superuser search, acting/return, original-history preservation, per-user drafts, auditing, native image uploads, and role revocation. Set `MODEL_CHAT_ADMIN_LIVE_TEST=1` and run `npm run test:browser -- --grep "accounts, ownership"` to additionally make **one real native-image request while acting as a user** and verify the reply stays in that user's chat. Synthetic roles exist only in the isolated test database.
@@ -181,7 +215,7 @@ For an explicit end-to-end check of the **currently running public tunnel**, `np
 
 ## Source map
 
-`components/chat-app.tsx` and `app/globals.css` implement the interface. `app/api/[...segments]/route.ts` handles the API. `lib/auth.ts` owns Better Auth; `lib/signup.ts` validates the short signup payload. `lib/demos.ts` contains synthetic samples and `lib/demo-storage.ts` creates owned, transactional demo chats. `lib/store.ts` owns SQLite and ownership, `lib/context.ts` builds bounded context, `lib/copilot.ts` owns runtime isolation, and `lib/stream.ts` handles durable streaming. `scripts/extract-file.mjs` is the bounded parser worker. `scripts/serve.mjs` is the loopback-bound launcher.
+`components/chat-app.tsx` and `app/globals.css` implement the interface. `app/api/[...segments]/route.ts` handles the API. `lib/auth.ts` owns Better Auth; `lib/signup.ts` validates the short signup payload. `lib/demos.ts` contains synthetic samples and `lib/demo-storage.ts` creates owned, transactional demo chats. `lib/store.ts` owns SQLite and ownership, `lib/context.ts` builds bounded context, `lib/copilot.ts` owns runtime isolation, and `lib/stream.ts` handles durable streaming. `scripts/extract-file.mjs` is the document/image worker; `lib/media.ts` and `scripts/media-worker.py` handle local recordings. `scripts/serve.mjs` is the loopback-bound launcher.
 
 Official references used for this implementation:
 

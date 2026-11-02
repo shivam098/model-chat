@@ -1,16 +1,14 @@
 import { Worker } from "node:worker_threads";
 import path from "node:path";
 import { AppError } from "./errors";
-import { LIMITS } from "./contracts";
+import { LIMITS, isMediaExtension } from "./contracts";
 
 export function validateFileName(name: string) {
   if (!name || name.length > 160 || /[\\/:*?"<>|\u0000-\u001f\u007f]/.test(name) || name.endsWith(".") || name.endsWith(" ")) {
     throw new AppError(400, "Use a simple file name (up to 160 characters, without paths or special characters).");
   }
   const extension = name.split(".").at(-1)?.toLowerCase() || "";
-  if (["mp3", "wav", "m4a", "aac", "flac", "ogg", "opus", "mp4", "mov", "webm", "mkv", "avi"].includes(extension)) {
-    throw new AppError(415, "This Copilot SDK exposes native image input, not audio/video understanding. Attach a transcript or still images instead; no separate transcription service is enabled.");
-  }
+  if (isMediaExtension(extension)) return extension;
   if (!["txt", "md", "csv", "json", "log", "yaml", "yml", "xml", "pdf", "docx", "xlsx", "png", "jpg", "jpeg", "webp", "gif"].includes(extension)) {
     throw new AppError(415, "Use a supported document, UTF-8 text file, or PNG/JPEG/WebP/static GIF image. Executables and arbitrary archives are not supported.");
   }

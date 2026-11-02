@@ -10,3 +10,6 @@ playwright-report/
 *.db-*
 *.sqlite*
 *.log
+__pycache__/
+*.pyc
+.venv/
