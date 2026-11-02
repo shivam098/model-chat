@@ -1,6 +1,7 @@
 import { test, expect, type Page } from "@playwright/test";
 import { randomUUID } from "node:crypto";
 import { runAdminFlow } from "./admin-flow";
+import type { DictationEvent } from "../../lib/voice";
 
 const origin = "http://127.0.0.1:3211";
 const password = "Test-only password! 48291";
@@ -169,6 +170,30 @@ test("browser unsupported voice and denied microphone retain fully working text 
   await expect(page.locator(".notice")).toContainText("Microphone access was denied");
   await page.getByLabel("Message", { exact: true }).fill("Still able to type.");
   await expect(page.getByLabel("Message", { exact: true })).toHaveValue("Still able to type.");
+  await page.evaluate(() => {
+    class Recognition {
+      onresult: ((event: DictationEvent) => void) | null = null;
+      onend: (() => void) | null = null;
+      start() {
+        Object.defineProperty(window, "injectLateTranscript", {
+          configurable: true,
+          value: () => this.onresult?.({ resultIndex: 0, results: { length: 1, 0: { isFinal: true, 0: { transcript: "LATE_PRIVATE_TRANSCRIPT" } } } }),
+        });
+      }
+      stop() { this.onend?.(); }
+      abort() { this.onend?.(); }
+    }
+    Object.defineProperty(window, "SpeechRecognition", { value: Recognition, configurable: true });
+  });
+  await page.getByRole("button", { name: "Dictate", exact: true }).click();
+  await page.getByRole("button", { name: "New conversation +", exact: true }).click();
+  await expect(page.getByLabel("Message", { exact: true })).toHaveValue("");
+  await page.evaluate(() => {
+    const inject = (window as Window & { injectLateTranscript?: () => void }).injectLateTranscript;
+    if (!inject) throw new Error("The synthetic dictation callback was not registered.");
+    inject();
+  });
+  await expect(page.getByLabel("Message", { exact: true })).toHaveValue("");
   await context.close();
 });
 test("live Copilot streaming and switched-model file context", async ({ page }) => {

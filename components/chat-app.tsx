@@ -93,7 +93,7 @@ export function ChatApp() {
   function applyAccount(account: AccountView, chatId?: string | null) {
     workspaceEpoch.current++;
     selection.current++;
-    generation.current?.abort(); recognition.current?.abort(); stopSpeaking();
+    generation.current?.abort(); stopDictation(); stopSpeaking();
     userRef.current = account.user; detailRef.current = null; draftRef.current = ""; modelRef.current = "";
     draftSaved.current = null;
     setUser(account.user); setActor(account.actor); setDetail(null); setChats([]); setDraft(""); setSelectedModel("");
@@ -209,9 +209,15 @@ export function ChatApp() {
     window.speechSynthesis?.cancel();
     setSpeaking(null);
   }
+  function stopDictation() {
+    const current = recognition.current;
+    recognition.current = null;
+    current?.abort();
+    setListening(false); setInterim("");
+  }
   function clearAccount() {
     generation.current?.abort();
-    recognition.current?.abort();
+    stopDictation();
     stopSpeaking();
     userRef.current = null;
     workspaceEpoch.current++; detailRef.current = null; draftRef.current = ""; draftSaved.current = null;
@@ -227,7 +233,7 @@ export function ChatApp() {
     const request = ++selection.current;
     setLoadingChat(true); setNotice(""); setSidebar(false); follow.current = true;
     stopSpeaking();
-    recognition.current?.abort();
+    stopDictation();
     try {
       await flushDraft(true);
       const result = await api<ChatDetail>(`/api/chats/${chat.id}`);
@@ -244,7 +250,10 @@ export function ChatApp() {
   }
   async function ensureChat() {
     if (detailRef.current) return detailRef.current.chat;
+    const owner = userRef.current?.id;
+    const epoch = workspaceEpoch.current;
     const { chat } = await api<{ chat: Chat }>("/api/chats", { method: "POST" });
+    if (owner !== userRef.current?.id || epoch !== workspaceEpoch.current) throw new RequestError("The active workspace changed.", 409, "workspace-changed");
     const next = { chat, messages: [], attachments: [] };
     detailRef.current = next;
     setDetail(next); setChats(previous => [chat, ...previous]);
@@ -289,13 +298,14 @@ export function ChatApp() {
     try { await operation; } finally { if (draftWrite.current === operation) draftWrite.current = null; }
   }
   async function newChat(skipSave = false) {
+    stopDictation();
     if (!skipSave) {
       setSwitching(true);
       try { await flushDraft(true); } catch (error) { report(error); setSwitching(false); return; }
     }
     selection.current++; setDetail(null); detailRef.current = null; setDraft(""); setNotice(""); setSidebar(false);
     draftRef.current = ""; draftSaved.current = null;
-    stopSpeaking(); recognition.current?.abort();
+    stopSpeaking(); stopDictation();
     window.history.replaceState(null, "", "/");
     composer.current?.focus();
     setSwitching(false);
@@ -303,6 +313,7 @@ export function ChatApp() {
   async function actAs(userId: string, chatId?: string) {
     if (locked || actor?.appRole !== "superuser" || acting) return;
     setSwitching(true);
+    stopDictation();
     try {
       await flushDraft(true);
       const result = await api<AccountView & { chatId: string | null }>("/api/admin/acting", {
@@ -316,6 +327,7 @@ export function ChatApp() {
   async function returnToSelf() {
     if (locked) return;
     setSwitching(true);
+    stopDictation();
     try {
       await flushDraft(true);
       const result = await api<AccountView & { chatId: string | null }>("/api/admin/stop", {
@@ -329,7 +341,7 @@ export function ChatApp() {
     if (!userRef.current || locked || demoLaunch.current) return;
     demoLaunch.current = true;
     setDemoLoading(true); setNotice("");
-    stopSpeaking(); recognition.current?.abort();
+    stopSpeaking(); stopDictation();
     const accountId = userRef.current.id;
     const request = ++selection.current;
     const prior = detailRef.current;
@@ -371,7 +383,7 @@ export function ChatApp() {
   async function send(event?: FormEvent) {
     event?.preventDefault();
     if (locked || !modelAvailable || !draft.trim()) return;
-    recognition.current?.stop(); setInterim("");
+    stopDictation();
     const content = draft.trim();
     const ownerId = userRef.current?.id;
     const epoch = workspaceEpoch.current;
@@ -458,7 +470,7 @@ export function ChatApp() {
         const { attachment } = await api<{ attachment: Attachment }>(`/api/chats/${chat.id}/files`, {
           method: "POST", headers: { "Content-Type": "application/octet-stream", "X-File-Name": encodeURIComponent(file.name) }, body: file,
         });
-        setDetail(previous => previous && ({ ...previous, attachments: [...previous.attachments, attachment] }));
+        setDetail(previous => previous?.chat.id === chat.id ? ({ ...previous, attachments: [...previous.attachments, attachment] }) : previous);
       }
     } catch (error) { report(error); }
     finally { setUploading(false); if (fileInput.current) fileInput.current.value = ""; }
@@ -490,6 +502,7 @@ export function ChatApp() {
   }
   async function logout() {
     try {
+      stopDictation();
       if (!busyRef.current) await flushDraft(true);
       await api("/api/auth/sign-out", { method: "POST", body: "{}" });
       clearAccount();
@@ -501,8 +514,13 @@ export function ChatApp() {
     if (!Constructor) { setNotice("Dictation is not supported by this browser. Use a supported browser such as Edge or Chrome, or type instead."); return; }
     stopSpeaking();
     const instance = new Constructor();
+    const epoch = workspaceEpoch.current;
+    const owner = userRef.current?.id;
+    const selectedChat = selection.current;
+    const current = () => recognition.current === instance && epoch === workspaceEpoch.current && owner === userRef.current?.id && selectedChat === selection.current;
     instance.lang = navigator.language || "en-US"; instance.interimResults = true; instance.continuous = true;
     instance.onresult = event => {
+      if (!current()) return;
       let final = ""; let interimText = "";
       for (let i = event.resultIndex; i < event.results.length; i++) {
         if (event.results[i].isFinal) final += event.results[i][0].transcript + " ";
@@ -520,8 +538,8 @@ export function ChatApp() {
       }
       setInterim(interimText);
     };
-    instance.onerror = event => { if (event.error !== "aborted") setNotice(voiceError(event.error)); setListening(false); setInterim(""); };
-    instance.onend = () => { setListening(false); setInterim(""); };
+    instance.onerror = event => { if (!current()) return; if (event.error !== "aborted") setNotice(voiceError(event.error)); setListening(false); setInterim(""); };
+    instance.onend = () => { if (current()) { setListening(false); setInterim(""); } };
     recognition.current = instance;
     try { instance.start(); setListening(true); } catch (error) { setNotice(message(error)); }
   }
