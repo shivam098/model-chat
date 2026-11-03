@@ -2,7 +2,8 @@ export const LIMITS = {
   fileBytes: 5 * 1024 * 1024,
   videoFrames: 4,
   videoFrameBytes: 512 * 1024,
-  filesPerMessage: 4,
+  transfersPerUser: 3,
+  transfersPerApp: 6,
   fileCharacters: 30_000,
   chatFileCharacters: 60_000,
   promptBytes: 100_000,
@@ -15,6 +16,8 @@ export const MEDIA_EXTENSIONS = ["mp3", "wav", "m4a", "aac", "flac", "ogg", "opu
 export function isMediaExtension(extension: string) { return MEDIA_EXTENSIONS.includes(extension.toLowerCase()); }
 export const FILE_ACCEPT = ".txt,.md,.csv,.json,.log,.yaml,.yml,.xml,.pdf,.docx,.xlsx,.png,.jpg,.jpeg,.webp,.gif,.mp3,.wav,.m4a,.aac,.flac,.ogg,.opus,.mp4,.mov,.webm,.mkv,.avi";
 export interface NativeImage { type: "blob"; data: string; mimeType: string; displayName: string }
+export interface ImageSource { id: string; fileId: string; name: string; mimeType: string; size: number }
+export interface ImageAnalysis { fileId: string; imageId: string; model: string; content: string; createdAt: number }
 export type MessageStatus = "complete" | "streaming" | "cancelled" | "error";
 export interface Chat {
   id: string;
@@ -61,10 +64,12 @@ export interface Model {
   name: string;
   multiplier?: number;
   vision?: boolean;
+  maxImages?: number;
 }
 export type StreamEvent =
   | { type: "start"; user: Message; assistant: Message }
   | { type: "delta"; text: string }
   | { type: "replace"; text: string }
+  | { type: "progress"; stage: string }
   | { type: "done"; message: Message }
   | { type: "error"; error: string };

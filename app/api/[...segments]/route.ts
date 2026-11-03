@@ -6,14 +6,13 @@ import { AppError, errorResponse } from "@/lib/errors";
 import { assertLocalRequest, readBytes, readJson, requireAccess } from "@/lib/http";
 import { LIMITS } from "@/lib/contracts";
 import { validateFileName } from "@/lib/files";
-import { listModels, modelPromptTokens, runCopilotReply } from "@/lib/copilot";
-import { buildPrompt } from "@/lib/context";
+import { listModels, runCopilotReply } from "@/lib/copilot";
+import { prepareImageTurn } from "@/lib/image-turn";
 import { createChatStream, stopReply, stopSessionReplies, hasSessionReply } from "@/lib/stream";
 import { tunnelMode } from "@/lib/config";
 import { signupSchema } from "@/lib/signup";
 import { DEMO_IDS } from "@/lib/demos";
 import { createDemoChat } from "@/lib/demo-storage";
-import { nativeImages } from "@/lib/native-images";
 import { mediaStatus } from "@/lib/media";
 import { UploadStore } from "@/lib/upload-store";
 import { receiveUpload, rejectExecutableHeader, requireDiskCapacity, UPLOAD_PART_BYTES } from "@/lib/upload-io";
@@ -21,8 +20,15 @@ import { startFileJobs } from "@/lib/file-jobs";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-const parsingState = globalThis as typeof globalThis & { modelChatParsing?: Set<string> };
-const parsing = parsingState.modelChatParsing ||= new Set();
+const parsingState = globalThis as typeof globalThis & { modelChatTransfers?: Map<string, number> };
+const parsing = parsingState.modelChatTransfers ||= new Map();
+function transferSlot(userId: string) {
+  if ((parsing.get(userId) || 0) >= LIMITS.transfersPerUser || [...parsing.values()].reduce((sum, value) => sum + value, 0) >= LIMITS.transfersPerApp) {
+    throw new AppError(429, "All file-transfer slots are busy. This upload can retry shortly.");
+  }
+  parsing.set(userId, (parsing.get(userId) || 0) + 1);
+  return () => { const remaining = (parsing.get(userId) || 1) - 1; if (remaining) parsing.set(userId, remaining); else parsing.delete(userId); };
+}
 type RouteContext = { params: Promise<{ segments: string[] }> };
 const accountId = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
 const draftSchema = z.object({
@@ -133,7 +139,7 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
     }
     if (s.length === 1 && s[0] === "models" && method === "GET") {
       const models = await listModels(new URL(request.url).searchParams.get("refresh") === "1");
-      return Response.json(run("models.list", null, () => ({ models: models.map(m => ({ id: m.id, name: m.name, multiplier: m.billing?.multiplier, vision: Boolean(m.capabilities.supports.vision && m.capabilities.limits.vision) })), authenticated: true })));
+      return Response.json(run("models.list", null, () => ({ models: models.map(m => ({ id: m.id, name: m.name, multiplier: m.billing?.multiplier, vision: Boolean(m.capabilities.supports.vision && m.capabilities.limits.vision), maxImages: m.capabilities.limits.vision?.max_prompt_images })), authenticated: true })));
     }
     if (s[0] !== "chats") throw new AppError(404, "Endpoint not found.");
     if (s.length === 1) {
@@ -162,7 +168,7 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
       const body = await readJson(request, z.object({
         content: z.string().trim().min(1, "Write a message first.").max(LIMITS.inputCharacters),
         model: z.string().min(1).max(128),
-        fileIds: z.array(z.uuid()).max(LIMITS.filesPerMessage).default([]),
+        fileIds: z.array(z.uuid()).default([]),
       }).strict());
       if (new Set(body.fileIds).size !== body.fileIds.length) throw new AppError(400, "Repeated file IDs are not allowed.");
       store.assertIdle(user.id, chatId);
@@ -171,25 +177,19 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
       guard.check(ctx);
       const model = models.find(m => m.id === body.model);
       if (!model) throw new AppError(400, "That model is no longer available. Refresh the model list and select another.");
-      const promptTokens = modelPromptTokens(model.capabilities.limits);
-      if (promptTokens === undefined) throw new AppError(503, "The selected model did not publish a usable context limit. Refresh the model list and select another.");
-      const images = nativeImages(store.contextImages(user.id, chatId, body.fileIds), model);
-      const excerpts = store.contextFiles(user.id, chatId, body.fileIds, body.content);
-      const unavailable = store.attachments(user.id, chatId).filter(file => !file.messageId && file.processingStatus && file.processingStatus !== "ready").map(file => ({ name: file.name, status: file.processingStatus }));
-      const prompt = buildPrompt(store.messages(user.id, chatId), excerpts, body.content,
-        promptTokens - images.length * 4096, unavailable);
-      return createChatStream(store, user.id, chatId, body.content, body.model, body.fileIds, prompt, runCopilotReply, request.signal, {
+      const turn = prepareImageTurn(store, user.id, chatId, body.content, body.fileIds, model, runCopilotReply,
+        (id, outcome, reason) => guard.record(ctx, "image.analysis", id, outcome, reason, true));
+      return createChatStream(store, user.id, chatId, body.content, body.model, body.fileIds, turn.prompt, turn.runner, request.signal, {
         actorId: ctx.actor.id, sessionId: ctx.sessionId, check: () => { guard.check(ctx); },
         accepted: (userMessageId, assistantId) => {
           guard.record(ctx, "message.send", userMessageId, "allowed");
           guard.record(ctx, "message.begin", assistantId, "allowed");
         },
         finished: (messageId, status, lost) => guard.record(ctx, "message.finish", messageId, lost ? "denied" : status === "error" ? "error" : "allowed", lost ? "access_ended" : status),
-      }, images);
+      });
     }
     if (s.length === 3 && s[2] === "files" && method === "POST") {
-      if (parsing.size >= 2 || parsing.has(user.id)) throw new AppError(429, "Another file transfer is active. Try again when it has finished uploading.");
-      parsing.add(user.id);
+      const release = transferSlot(user.id);
       let fileId: string | undefined;
       try {
         let name: string;
@@ -205,7 +205,7 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
         startFileJobs(store).tick();
         return Response.json({ attachment: store.attachments(user.id, chatId).find(file => file.id === fileId) }, { status: 202 });
       } catch (error) { if (fileId) uploads.discardIncomplete(fileId); throw error; }
-      finally { parsing.delete(user.id); }
+      finally { release(); }
     }
     if (s.length === 3 && s[2] === "files" && method === "GET") {
       return Response.json(run("file.list", chatId, () => ({ attachments: store.attachments(user.id, chatId) })));
@@ -218,8 +218,7 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
       return Response.json({ fileId, partBytes: UPLOAD_PART_BYTES }, { status: 201 });
     }
     if (s.length === 6 && s[2] === "files" && s[4] === "parts" && method === "POST") {
-      if (parsing.size >= 2 || parsing.has(user.id)) throw new AppError(429, "Another file transfer is active. Try again after this part finishes.");
-      parsing.add(user.id);
+      const release = transferSlot(user.id);
       try {
         const fileId = z.uuid().parse(s[3]);
         store.fileText(user.id, chatId, fileId);
@@ -231,7 +230,7 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
         await requireDiskCapacity(bytes.length);
         run("file.upload.part", fileId, () => { uploads.assertUploader(ctx, fileId); uploads.append(fileId, position, bytes); });
         return Response.json({ received: true });
-      } finally { parsing.delete(user.id); }
+      } finally { release(); }
     }
     if (s.length === 5 && s[2] === "files" && ["complete", "retry", "cancel"].includes(s[4]) && method === "POST") {
       const fileId = z.uuid().parse(s[3]);

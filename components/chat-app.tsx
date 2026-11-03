@@ -11,6 +11,7 @@ import type { AccountView, AppUser } from "@/lib/access";
 import { AdminPanel } from "./admin-panel";
 
 type User = AppUser;
+type Transfer = { id: string; name: string; progress: number; fileId?: string; error?: string; active: boolean };
 class RequestError extends Error { constructor(message: string, public status: number, public code?: string) { super(message); } }
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, { ...init, headers: { ...(init?.body && typeof init.body === "string" ? { "Content-Type": "application/json" } : {}), ...init?.headers } });
@@ -42,7 +43,8 @@ export function ChatApp() {
   const [loadingChat, setLoadingChat] = useState(false);
   const [busy, setBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
-  const [transferProgress, setTransferProgress] = useState("");
+  const [transfers, setTransfers] = useState<Transfer[]>([]);
+  const [streamStage, setStreamStage] = useState("Thinking");
   const [mediaInfo, setMediaInfo] = useState<{ ready: boolean; model: string | null; message: string } | null>(null);
   const [filePreview, setFilePreview] = useState<{ name: string; text: string; notes: string; nextCursor: number | null; cursor: number; file: Attachment } | null>(null);
   const [draft, setDraft] = useState("");
@@ -69,6 +71,7 @@ export function ChatApp() {
   const recognition = useRef<Dictation | null>(null);
   const generation = useRef<AbortController | null>(null);
   const uploadController = useRef<AbortController | null>(null);
+  const transferControllers = useRef(new Map<string, AbortController>());
   const speechEpoch = useRef(0);
   const draftRef = useRef(draft);
   const selection = useRef(0);
@@ -92,6 +95,9 @@ export function ChatApp() {
   const locked = busy || uploading || loadingChat || remoteBusy || demoLoading || switching;
   const acting = Boolean(actor && user && actor.id !== user.id);
   const modelAvailable = models.some(m => m.id === selectedModel);
+  const newImageCount = readyPending.reduce((count, file) => count + (file.mimeType?.startsWith("image/") ? 1 : file.frameCount || 0), 0);
+  const imageLimit = models.find(model => model.id === selectedModel)?.maxImages || 0;
+  const extraImageRequests = imageLimit ? Math.ceil(Math.max(0, newImageCount - imageLimit) / imageLimit) : 0;
   function api<T>(url: string, init?: RequestInit) {
     const subject = userRef.current?.id;
     return requestJson<T>(url, { ...init, headers: { ...(subject ? { "x-model-chat-subject": subject } : {}), ...init?.headers } });
@@ -105,6 +111,7 @@ export function ChatApp() {
     setUser(account.user); setActor(account.actor); setDetail(null); setChats([]); setDraft(""); setSelectedModel("");
     setAdmin(false); setMenu(false); setSidebar(false); setSettings(false); setDraftState("saved");
     setFilePreview(null);
+    setTransfers([]); setStreamStage("Thinking");
     if (chatId !== undefined) window.history.replaceState(null, "", chatId ? `?chat=${chatId}` : "/");
   }
 
@@ -253,10 +260,10 @@ export function ChatApp() {
     workspaceEpoch.current++; detailRef.current = null; draftRef.current = ""; draftSaved.current = null;
     selection.current++;
     setUser(null); setChats([]); setDetail(null); setModels([]); setSelectedModel("");
-    setDraft(""); setBusy(false); setUploading(false); setSettings(false); setSidebar(false);
+    setDraft(""); setBusy(false); setUploading(false); setTransfers([]); setSettings(false); setSidebar(false);
     setMenu(false); setHow(false); setDemoLoading(false);
     setActor(null); setAdmin(false); setSwitching(false);
-    setFilePreview(null); setTransferProgress("");
+    setFilePreview(null); setStreamStage("Thinking");
     setSpeaking(null); setInterim(""); setVoiceConsent(false); setConnectionError("");
     window.history.replaceState(null, "", "/");
   }
@@ -411,20 +418,24 @@ export function ChatApp() {
     const [updated, listed] = await Promise.all([api<ChatDetail>(`/api/chats/${id}`), api<{ chats: Chat[] }>("/api/chats")]);
     if (userRef.current && detailRef.current?.chat.id === id) { setDetail(updated); setChats(listed.chats); }
   }
-  async function send(event?: FormEvent) {
+  async function send(event?: FormEvent, textOnly = false) {
     event?.preventDefault();
     if (locked || !modelAvailable || !draft.trim()) return;
+    if (!textOnly && (pending.length !== readyPending.length || transfers.some(transfer => transfer.error))) {
+      setNotice("Some attached files are still processing or could not be uploaded. Nothing was sent. Wait or retry/remove those files, or explicitly choose Send text only.");
+      return;
+    }
     stopDictation();
     const content = draft.trim();
     const ownerId = userRef.current?.id;
     const epoch = workspaceEpoch.current;
-    setBusy(true); setNotice(""); follow.current = true;
+    setBusy(true); setNotice(""); setStreamStage("Preparing attachments"); follow.current = true;
     const controller = new AbortController();
     generation.current = controller;
     let chatId: string | undefined;
     let accepted = false;
     let done = false;
-    const selectedFiles = readyPending.slice(0, LIMITS.filesPerMessage);
+    const selectedFiles = textOnly ? [] : pending;
     try {
       await flushDraft(true);
       const chat = await ensureChat();
@@ -452,6 +463,8 @@ export function ChatApp() {
             messages: [...previous.messages, item.user, item.assistant],
             attachments: previous.attachments.map(f => selectedFiles.some(p => p.id === f.id) ? { ...f, messageId: item.user.id } : f),
           }));
+        } else if (item.type === "progress") {
+          setStreamStage(item.stage);
         } else if (item.type === "delta" || item.type === "replace") {
           setDetail(previous => previous && ({ ...previous, messages: previous.messages.map((m, index) => index === previous.messages.length - 1 ?
             { ...m, content: item.type === "delta" ? m.content + item.text : item.text } : m) }));
@@ -490,64 +503,102 @@ export function ChatApp() {
     try { await api(`/api/chats/${detail.chat.id}/stop`, { method: "POST" }); }
     catch (error) { report(error); }
   }
-  async function upload(files: FileList | null) {
-    if (!files?.length || locked) return;
+  async function upload(files: FileList | File[] | null) {
+    if (!files?.length) return;
+    if (locked) { setNotice("Finish the current transfer or reply before adding another selection of files."); return; }
+    const selected = Array.from(files).map(file => ({ file, id: crypto.randomUUID() }));
+    for (const item of selected) transferControllers.current.set(item.id, new AbortController());
     setUploading(true); setNotice("");
+    setTransfers(previous => [...previous, ...selected.map(item => ({ id: item.id, name: item.file.name, progress: 0, active: false }))]);
     const controller = new AbortController();
     uploadController.current = controller;
     const uploadEpoch = workspaceEpoch.current;
     const owner = userRef.current?.id;
     let chatId: string | undefined;
-    let currentFile: string | undefined;
+    const update = (id: string, values: Partial<Transfer>) => {
+      if (workspaceEpoch.current === uploadEpoch) setTransfers(previous => previous.map(item => item.id === id ? { ...item, ...values } : item));
+    };
     try {
       await flushDraft(true);
       const chat = await ensureChat();
       chatId = chat.id;
-      for (const file of Array.from(files)) {
-        controller.signal.throwIfAborted();
-        const started = await api<{ fileId: string; partBytes: number }>(`/api/chats/${chat.id}/files/start`, {
-          method: "POST", signal: controller.signal, body: JSON.stringify({ name: file.name, size: file.size }), headers: { "x-model-chat-subject": owner! },
-        });
-        currentFile = started.fileId;
-        for (let offset = 0, position = 0; offset < file.size; offset += started.partBytes, position++) {
-          setTransferProgress(`${file.name} · ${Math.round(offset / file.size * 100)}% uploaded`);
-          for (let attempt = 0; ; attempt++) {
-            try {
-              await api(`/api/chats/${chat.id}/files/${currentFile}/parts/${position}`, {
-                method: "POST", signal: controller.signal, headers: { "Content-Type": "application/octet-stream", "x-model-chat-subject": owner! },
-                body: file.slice(offset, offset + started.partBytes),
-              });
-              break;
-            } catch (error) {
-              if (controller.signal.aborted || attempt >= 2 || !(error instanceof TypeError || (error instanceof RequestError && (error.status >= 500 || error.status === 429)))) throw error;
-              await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
-              controller.signal.throwIfAborted();
+      let next = 0;
+      const transfer = async ({ file, id }: typeof selected[number]) => {
+        const local = transferControllers.current.get(id)!;
+        const signal = AbortSignal.any([controller.signal, local.signal]);
+        let currentFile: string | undefined;
+        let accepted = false;
+        try {
+          signal.throwIfAborted();
+          update(id, { active: true });
+          const started = await api<{ fileId: string; partBytes: number }>(`/api/chats/${chat.id}/files/start`, {
+            method: "POST", signal, body: JSON.stringify({ name: file.name, size: file.size }), headers: { "x-model-chat-subject": owner! },
+          });
+          currentFile = started.fileId;
+          update(id, { fileId: currentFile });
+          for (let offset = 0, position = 0; offset < file.size; offset += started.partBytes, position++) {
+            for (let attempt = 0; ; attempt++) {
+              try {
+                await api(`/api/chats/${chat.id}/files/${currentFile}/parts/${position}`, {
+                  method: "POST", signal, headers: { "Content-Type": "application/octet-stream", "x-model-chat-subject": owner! },
+                  body: file.slice(offset, offset + started.partBytes),
+                });
+                break;
+              } catch (error) {
+                if (signal.aborted || attempt >= 4 || !(error instanceof TypeError || (error instanceof RequestError && (error.status >= 500 || error.status === 429)))) throw error;
+                await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
+                signal.throwIfAborted();
+              }
             }
+            update(id, { progress: Math.min(1, (offset + started.partBytes) / file.size) });
           }
+          const { attachment } = await api<{ attachment: Attachment }>(`/api/chats/${chat.id}/files/${currentFile}/complete`, {
+            method: "POST", signal, headers: { "x-model-chat-subject": owner! },
+          });
+          accepted = true;
+          if (workspaceEpoch.current !== uploadEpoch) return;
+          setDetail(previous => previous?.chat.id === chat.id ? ({ ...previous, attachments: [...previous.attachments.filter(item => item.id !== attachment.id), attachment] }) : previous);
+          setTransfers(previous => previous.filter(item => item.id !== id));
+        } catch (error) {
+          if (workspaceEpoch.current !== uploadEpoch) return;
+          if (signal.aborted) setTransfers(previous => previous.filter(item => item.id !== id));
+          else { update(id, { active: false, error: message(error) }); report(error); }
+        } finally {
+          if (!accepted && currentFile && workspaceEpoch.current === uploadEpoch) {
+            try {
+              if (local.signal.aborted) {
+                await api(`/api/chats/${chat.id}/files/${currentFile}`, { method: "DELETE", headers: { "x-model-chat-subject": owner! } });
+              } else {
+                const saved = (await api<{ attachments: Attachment[] }>(`/api/chats/${chat.id}/files`)).attachments.find(item => item.id === currentFile);
+                if (saved && !saved.uploadComplete) await api(`/api/chats/${chat.id}/files/${currentFile}/cancel`, { method: "POST", headers: { "x-model-chat-subject": owner! } });
+              }
+              setTransfers(previous => previous.filter(item => item.id !== id));
+            } catch (error) { if (!(error instanceof RequestError && [404, 409].includes(error.status))) report(error); }
+          }
+          transferControllers.current.delete(id);
         }
-        const { attachment } = await api<{ attachment: Attachment }>(`/api/chats/${chat.id}/files/${currentFile}/complete`, {
-          method: "POST", signal: controller.signal, headers: { "x-model-chat-subject": owner! },
-        });
-        currentFile = undefined;
-        if (workspaceEpoch.current !== uploadEpoch) return;
-        setDetail(previous => previous?.chat.id === chat.id ? ({ ...previous, attachments: [...previous.attachments.filter(item => item.id !== attachment.id), attachment] }) : previous);
-      }
+      };
+      await Promise.all(Array.from({ length: Math.min(LIMITS.transfersPerUser, selected.length) }, async () => {
+        while (next < selected.length) { const item = selected[next++]; await transfer(item); }
+      }));
     } catch (error) {
       if (workspaceEpoch.current === uploadEpoch) {
-        if (controller.signal.aborted) setNotice("Upload stopped. Files already queued continue processing in their original chats.");
-        else report(error);
+        if (controller.signal.aborted) {
+          setNotice("Upload stopped. Files already queued continue processing in their original chats.");
+          setTransfers(previous => previous.filter(item => !selected.some(file => file.id === item.id)));
+        } else {
+          setTransfers(previous => previous.map(item => selected.some(file => file.id === item.id) ? { ...item, active: false, error: message(error) } : item));
+          report(error);
+        }
       }
     }
     finally {
-      if (currentFile && chatId && workspaceEpoch.current === uploadEpoch) {
-        try { await api(`/api/chats/${chatId}/files/${currentFile}/cancel`, { method: "POST", headers: { "x-model-chat-subject": owner! } }); }
-        catch (error) { if (!(error instanceof RequestError && error.status === 409)) report(error); }
-      }
+      for (const item of selected) transferControllers.current.delete(item.id);
       if (chatId && workspaceEpoch.current === uploadEpoch && detailRef.current?.chat.id === chatId && userRef.current) {
         try { await refreshChat(chatId); } catch (error) { report(error); }
       }
       if (uploadController.current === controller) {
-        setUploading(false); setTransferProgress(""); uploadController.current = null;
+        setUploading(false); uploadController.current = null;
         if (fileInput.current) fileInput.current.value = "";
       }
     }
@@ -568,10 +619,11 @@ export function ChatApp() {
     } catch (error) { if (epoch === workspaceEpoch.current) report(error); }
   }
   async function removeFile(file: Attachment) {
+    const epoch = workspaceEpoch.current;
     try {
       await api(`/api/chats/${file.chatId}/files/${file.id}`, { method: "DELETE" });
-      setDetail(previous => previous && ({ ...previous, attachments: previous.attachments.filter(f => f.id !== file.id) }));
-    } catch (error) { report(error); }
+      if (workspaceEpoch.current === epoch) setDetail(previous => previous?.chat.id === file.chatId ? { ...previous, attachments: previous.attachments.filter(f => f.id !== file.id) } : previous);
+    } catch (error) { if (workspaceEpoch.current === epoch) report(error); }
   }
   async function saveTitle(event: FormEvent) {
     event.preventDefault();
@@ -753,7 +805,7 @@ export function ChatApp() {
               {item.role === "assistant" ? <div className="markdown">
                 {item.content ? <Markdown remarkPlugins={[remarkGfm]} skipHtml disallowedElements={["img"]} components={{
                   a: ({ href, children }) => <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>,
-                }}>{item.content}</Markdown> : item.status === "streaming" ? <span className="thinking"><i /><i /><i />Thinking</span> : <p className="muted">No answer was generated.</p>}
+                }}>{item.content}</Markdown> : item.status === "streaming" ? <span className="thinking"><i /><i /><i />{busy ? streamStage : "Processing attachments or generating reply"}</span> : <p className="muted">No answer was generated.</p>}
               </div> : <div className="user-text">{item.content}</div>}
               {detail.attachments.filter(f => f.messageId === item.id).map(file => <span key={file.id}><a className="file-chip sent" title={file.notes} href={`/api/chats/${file.chatId}/files/${file.id}`}><FileText size={14} /><span>{file.name}</span><ArrowDown size={13} /></a><IconButton label={`Preview extracted text for ${file.name}`} onClick={() => void previewFile(file)}><Eye size={14} /></IconButton></span>)}
               {item.error && <div className={`message-status ${item.status}`} role="status">{item.error}</div>}
@@ -763,8 +815,19 @@ export function ChatApp() {
         <div ref={bottom} />
       </div>
       <div className="composer-wrap">
-        <form className={`composer ${listening ? "listening" : ""}`} onSubmit={send}>
-          {pending.length > 0 && <div className="pending-files">{pending.map(file => {
+        <form className={`composer ${listening ? "listening" : ""}`} onSubmit={send}
+          onDragOver={event => { if (event.dataTransfer.types.includes("Files")) event.preventDefault(); }}
+          onDrop={event => { if (event.dataTransfer.files.length) { event.preventDefault(); void upload(event.dataTransfer.files); } }}>
+          {transfers.length > 0 && <div className="pending-files" aria-label="File transfers">{transfers.map(transfer => <div className="file-chip transfer" key={transfer.id} data-active={transfer.active}>
+            {transfer.active ? <LoaderCircle className="spin" size={16} /> : <FileText size={16} />}
+            <span>{transfer.name}<small>{transfer.error || (transfer.active ? `${Math.round(transfer.progress * 100)}% uploaded` : "Waiting to upload")}</small>
+              <progress aria-label={`Upload progress for ${transfer.name}`} max={1} value={transfer.progress} /></span>
+            <IconButton label={`Remove transfer ${transfer.name}`} onClick={() => {
+              transferControllers.current.get(transfer.id)?.abort();
+              setTransfers(previous => previous.filter(item => item.id !== transfer.id));
+            }}><X size={14} /></IconButton>
+          </div>)}</div>}
+          {pending.length > 0 && <div className="pending-files">{pending.filter(file => !transfers.some(transfer => transfer.fileId === file.id && !transfer.error)).map(file => {
             const status = file.processingStatus || "ready";
             const running = ["queued", "processing"].includes(status);
             return <div className={`file-chip file-job ${status}`} title={`${file.notes} ${file.characters.toLocaleString()} characters.`} key={file.id}>
@@ -774,15 +837,16 @@ export function ChatApp() {
               {file.uploadComplete !== 0 && <a className="icon-button" aria-label={`Download original ${file.name}`} href={`/api/chats/${file.chatId}/files/${file.id}`}><ArrowDown size={14} /></a>}
               {(running || status === "uploading") && <IconButton label={`Cancel processing ${file.name}`} onClick={() => void controlFile(file, "cancel")}><Square size={14} /></IconButton>}
               {file.uploadComplete !== 0 && ["failed", "cancelled"].includes(status) && <IconButton label={`Retry processing ${file.name}`} onClick={() => void controlFile(file, "retry")}><RefreshCw size={14} /></IconButton>}
-              <IconButton label={`Remove ${file.name}`} disabled={locked} onClick={() => void removeFile(file)}><X size={14} /></IconButton>
+              <IconButton label={`Remove ${file.name}`} disabled={busy || remoteBusy || switching || demoLoading} onClick={() => void removeFile(file)}><X size={14} /></IconButton>
             </div>;
           })}</div>}
-          {pending.some(file => file.processingStatus && file.processingStatus !== "ready") && <p className="file-guidance">Files still processing or needing retry are not sent to the model. You can send text now and ask about them when ready.</p>}
-          {readyPending.length > LIMITS.filesPerMessage && <p className="file-guidance">Send includes the first {LIMITS.filesPerMessage} ready new files. Remaining files stay attached for the next message.</p>}
+          {pending.some(file => file.processingStatus && file.processingStatus !== "ready") && <p className="file-guidance">Send will include every attached file once ready. Wait or retry/remove unfinished files, or choose Send text only to leave them for later.</p>}
+          {extraImageRequests > 0 && <p className="file-guidance" role="status">These images/frames need up to {extraImageRequests} additional Copilot {extraImageRequests === 1 ? "request" : "requests"} with this model, using extra quota. Each is analyzed separately at its supplied detail; one reply combines the results. Analyses are saved for later turns.</p>}
           <label className="sr-only" htmlFor="message">Message</label>
           <textarea id="message" ref={composer} rows={2} placeholder={listening ? "Listening... your words will appear here" : "Ask anything, or bring a file into the conversation..."} value={draft}
             onChange={event => { draftRef.current = event.target.value; setDraft(event.target.value); setDraftState("saving"); }} maxLength={LIMITS.inputCharacters} disabled={busy || loadingChat || remoteBusy || demoLoading || switching}
-            onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send(); } }} />
+            onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send(); } }}
+            onPaste={event => { if (event.clipboardData.files.length) { event.preventDefault(); void upload(event.clipboardData.files); } }} />
           {interim && <div className="interim" aria-live="polite">{interim}</div>}
           <div className="composer-tools">
             <div className="tool-group">
@@ -791,13 +855,17 @@ export function ChatApp() {
               <button type="button" className={`voice-button ${listening ? "active" : ""}`} disabled={locked || !dictationAvailable}
                 title={!dictationAvailable ? "Dictation unavailable in this browser; text chat works." : "Dictate with your browser's speech service"}
                 onClick={() => listening ? recognition.current?.stop() : startDictation()}><Mic size={18} /><span>{listening ? "Stop dictation" : "Dictate"}</span></button>
-              <span className="upload-status">{uploading ? transferProgress || "Starting upload..." : pending.length ? `${readyPending.length} ready · ${pending.length - readyPending.length} pending` : ""}</span>
+              <span className="upload-status">{uploading ? `${transfers.filter(item => item.active).length} uploading` : pending.length ? `${readyPending.length} ready · ${pending.length - readyPending.length} pending` : ""}</span>
               {uploading && <button type="button" className="voice-button" onClick={() => uploadController.current?.abort()}>Cancel upload</button>}
             </div>
             <div className="send-group">{draft.length > 7000 && <small>{draft.length}/{LIMITS.inputCharacters}</small>}
               {busy || remoteBusy ? <button type="button" className="send-button stop" aria-label="Stop reply" onClick={() => void stop()}><Square size={17} fill="currentColor" /></button> :
                 <button type="submit" className="send-button" aria-label="Send message" disabled={!draft.trim() || locked || !modelAvailable}><ArrowUp size={21} /></button>}
             </div>
+          </div>
+          <div className="attachment-actions">
+            <p className="attachment-hint">Select multiple files, drop them here, or paste images. Send includes all attached files.</p>
+            {(pending.length > 0 || transfers.some(transfer => transfer.error)) && <button type="button" className="voice-button" disabled={!draft.trim() || locked || !modelAvailable} onClick={() => void send(undefined, true)}>Send text only</button>}
           </div>
         </form>
         <div className="composer-caption"><span>{draftState === "saving" ? "Saving draft..." : draftState === "error" ? "Draft not saved — retry before leaving" : "Draft saved"} · {dictationAvailable ? "Enter to send · Shift + Enter for a new line" : "Text chat is ready"}</span><button onClick={() => setSettings(true)}>Files & privacy <ShieldCheck size={12} /></button></div>
@@ -808,7 +876,13 @@ export function ChatApp() {
       <div className="settings-account"><span className="avatar">{user.name.slice(0, 1).toUpperCase()}</span><div><strong>{user.name}</strong><p>{user.email}</p></div></div>
       <div className="settings-section"><h3><ShieldCheck size={16} /> {access.tunnelMode ? "Temporary remote access" : "Personal, local-only"}</h3><p>{access.tunnelMode ? "A temporary Cloudflare HTTPS tunnel is active. Anyone with the link can create an email/password account without OTP. This link uses the app's password login, not Cloudflare Access. Cloudflare relays the traffic. Stop the tunnel when finished." : "This app listens on 127.0.0.1 only. Use only the app's explicit temporary-tunnel mode for remote access; do not otherwise expose it through a proxy, LAN or the internet."} App accounts have separate histories and files, but all use the host owner&apos;s Copilot account and usage limits.</p><p>Histories and original files stay in this app&apos;s local SQLite database. Prompts, chat context and extracted file text go to GitHub Copilot when you send. These are not end-to-end encrypted; people with access to your Windows account or backups can read local data.</p></div>
       <div className="settings-section"><h3><span className={`status-dot ${connectionError ? "offline" : ""}`} /> Copilot connection</h3><p>{connectionError || `${models.length} models discovered from the Copilot SDK. Availability may differ from the desktop app and can change with your plan.`}</p><p>Already signed-in CLI credentials are reused through supported SDK authentication. If sign-in is needed, run this from the app folder:</p><code className="command">npm run copilot:login</code><button className="secondary-button" onClick={() => void refreshModels()} disabled={modelLoading}><RefreshCw size={14} /> Refresh connection</button></div>
-      <div className="settings-section"><h3><FileText size={16} /> Files and model context</h3><p>TXT, Markdown, CSV, JSON, LOG, YAML and XML (UTF-8), PDF, DOCX, XLSX, PNG/JPEG/WebP/static GIF, and the audio/video formats below. There is no preset total file-size or account-storage quota. Uploads use small transport parts; actual free disk space is checked. Processing happens after storage, independently of the chat UI, with status, cancellation and retry.</p><p>Full extracted text is indexed and available through the paged eye-icon preview. A model request includes up to 4 ready new files and a shared 60,000-character file-context budget. For longer files it receives explicitly labeled relevant or representative excerpts, not every word. Pending/failed files are not presented as read. Original files and full extracted text are retained.</p><p>Safe decoder budgets still apply: images up to 16 megapixels/8192 pixels per dimension, video frames up to 4096 pixels, bounded archive expansion and isolated document-parser memory. Images are normalized for model input. PDF needs selectable text; no scanned-PDF OCR. Office extracts text/cached values, not macros, charts or embedded files. Unsupported or unsafe files report an error; nothing is executed.</p><p>Sent files remain available in later turns. Download originals from their message chips and inspect extracted text with the eye icon. Remove unsent files with X; delete a chat to remove its history and files. Up to 100 chats / 100 turns per chat. Model context remains finite without silently discarding saved messages.</p></div>
+      <div className="settings-section"><h3><FileText size={16} /> Files and model context</h3>
+        <p>Select multiple supported files together, add another selection, drag files onto the composer or paste images. Three files can transfer concurrently per account, six across the app. Each shows progress and can be removed. Processing continues in the background.</p>
+        <p>Send includes every attached file, not just the first four. Unfinished or failed attachments must finish or be retried/removed; Send text only explicitly leaves attachments for later. Full extracted text is retained and indexed. Requests use labeled excerpts within a shared context budget adjusted for conversation history, rather than silently dropping files.</p>
+        <p>If current images or video frames exceed the model&apos;s per-request image allowance, additional real Copilot requests analyze the overflow at the supplied pixel detail. They use extra quota; one final reply combines the results. Completed per-image analyses are saved. Earlier images are represented by these saved analyses or prior conversation, not claimed to be freshly re-viewed. Reattach an original if a later question needs a fresh pixel inspection. Descriptions can miss details; originals remain available.</p>
+        <p>TXT, Markdown, CSV, JSON, LOG, YAML/XML, selectable-text PDF, DOCX, XLSX, PNG/JPEG/WebP/static GIF, and the listed audio/video formats remain supported. There is no preset total file-size or storage quota; disk reserves and decoder safeguards still apply. Images are normalized for model input (16 MP/8192-pixel source limit); video frames have a 4096-pixel limit. No scanned-PDF OCR, macros or executable uploads. Context and model output remain finite; original files and saved prompts are not truncated.</p>
+        <p>Download originals from message chips. X removes unsent files; deleting a chat removes its files and saved image analyses. Histories and drafts survive user/chat switches. Up to 100 chats and 100 turns per chat remain.</p>
+      </div>
       <div className="settings-section"><h3><Mic size={16} /> Local audio/video processing</h3><p>{mediaInfo?.message || "Checking local media configuration..."} {mediaInfo?.ready && <>Whisper model: {mediaInfo.model}, running on this computer&apos;s CPU.</>}</p><p>MP3, WAV, M4A, AAC, FLAC, OGG, OPUS, MP4, MOV, WEBM, MKV and AVI are accepted when their streams are decodable. Speech becomes a machine transcript; video also supplies up to four still frames. Copilot receives those extracted inputs when you press Send, not native audio/video. Transcription can be imperfect, and unsampled visual events may be missed.</p><p>One recording and one document can process at a time; others wait in a durable queue. No media-duration or overall-processing deadline is imposed. Long recordings are decoded/transcribed in bounded-memory windows, and processing may take a long time. Closing the browser does not discard accepted uploads. Interrupted jobs resume from the beginning after a server restart. Administrator-created delegated jobs stop if that administrator loses access or signs out. Transcription uses installed local packages/cached weights, without a speech API key. Public-link uploads pass through Cloudflare.</p></div>
       <div className="settings-section"><h3><ShieldCheck size={16} /> Administrator access</h3><p>The app superuser can view users&apos; chat sessions and files and act as a user to send messages or modify chats. An audit log records the real actor, effective user, action, object IDs, time and outcome—not prompt/file contents or credentials. {acting && <>You are still signed in as {actor?.email}; signing out ends that real login session.</>}</p></div>
       <div className="settings-section"><h3><Mic size={16} /> Voice, without the surprises</h3><p>Dictation uses browser speech recognition, not a realtime audio model. Your browser may send microphone audio to its speech provider. Read-aloud uses your browser&apos;s voices, which may also use an online service. Text works without either feature.</p><p>No email verification, password reset, or recovery service is configured. Use a unique password and keep a local backup. A temporary shared preview is not production hosting.</p></div>

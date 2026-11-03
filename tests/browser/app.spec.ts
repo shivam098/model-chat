@@ -24,7 +24,7 @@ test("accounts, ownership, files, histories, password validation and responsive 
   await signUp(page, email);
   await expect(page.getByRole("button", { name: "Attach files", exact: true })).toBeEnabled();
   await page.locator('input[type="file"]').setInputFiles({ name: "project-notes.txt", mimeType: "application/x-untrusted", buffer: Buffer.from("Project Birch. Revenue is 42.") });
-  await expect(page.locator(".file-chip").filter({ hasText: "project-notes.txt" })).toBeVisible();
+  await expect(page.locator(".file-job").filter({ hasText: "project-notes.txt" })).toBeVisible();
   const chatId = new URL(page.url()).searchParams.get("chat")!;
   const detailResponse = await page.request.get(`/api/chats/${chatId}`);
   expect(detailResponse.status()).toBe(200);

@@ -86,20 +86,30 @@ export function createChatStream(store: Store, userId: string, chatId: string, c
             lastSave = Date.now();
           }
         };
-        const timeout = setTimeout(() => controller.abort(new Error("timeout")), 240_000);
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        const requestStarted = () => {
+          clearTimeout(timeout);
+          timeout = setTimeout(() => controller.abort(new Error("timeout")), 240_000);
+        };
+        requestStarted();
+        let stage = "Generating reply";
+        const heartbeat = setInterval(() => { if (checkAccess()) send({ type: "progress", stage }); }, 15_000);
         const authorizationTimer = security ? setInterval(checkAccess, 500) : undefined;
         try {
-          await runner({ model, prompt, images, authorize: security?.check, signal: controller.signal, onDelta: text => accept(text, false), onReplace: text => accept(text, true) });
+          await runner({ model, prompt, images, authorize: security?.check, signal: controller.signal,
+            onRequestStart: requestStarted, onProgress: value => { stage = value; if (checkAccess()) send({ type: "progress", stage }); },
+            onDelta: text => accept(text, false), onReplace: text => accept(text, true) });
           if (controller.signal.aborted) throw new DOMException("Reply cancelled", "AbortError");
           if (!text.trim()) throw new AppError(503, "Copilot returned no text. The request was saved, but no answer was generated.");
         } catch (cause) {
           status = controller.signal.aborted ? "cancelled" : "error";
           if (outputExceeded) error = "Reply stopped at the 32,000-character output limit.";
-          else if (controller.signal.reason instanceof Error && controller.signal.reason.message === "timeout") error = "The reply exceeded four minutes and was stopped.";
+          else if (controller.signal.reason instanceof Error && controller.signal.reason.message === "timeout") error = "A model request exceeded four minutes and was stopped.";
           else if (controller.signal.aborted) error = "Reply stopped. Any partial text is saved.";
           else error = copilotError(cause).message;
         } finally {
           clearTimeout(timeout);
+          clearInterval(heartbeat);
           clearInterval(authorizationTimer);
           requestSignal.removeEventListener("abort", requestAbort);
           checkAccess();

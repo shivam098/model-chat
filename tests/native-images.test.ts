@@ -20,7 +20,7 @@ test("raster images are validated and passed as native blobs, not pretend OCR te
     assert.match(parsed.text, /Native image input/);
   }
 });
-test("native image bytes persist, remain owned and are resent when a chat is reopened", async () => {
+test("native image bytes persist and remain available only to their owner after reopening", async () => {
   const db = new Database(":memory:");
   db.exec("CREATE TABLE user(id TEXT PRIMARY KEY); INSERT INTO user VALUES ('alice'),('bob')");
   try {

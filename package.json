@@ -15,6 +15,7 @@
     "test:restart": "tsx --test tests/restart.integration.ts",
     "test:tunnel": "tsx --test tests/tunnel.integration.ts",
     "test:public": "tsx tests/public-preview.integration.ts",
+    "test:multifile:public": "tsx tests/multi-file-public.integration.ts",
     "test:media": "tsx --test tests/media.integration.ts",
     "admin:role": "tsx scripts/account-role.ts",
     "backup": "node scripts/backup-db.mjs",

@@ -127,9 +127,12 @@ export interface ReplyInput {
   onReplace: (text: string) => void;
   images?: NativeImage[];
   authorize?: () => void;
+  onProgress?: (stage: string) => void;
+  onRequestStart?: () => void;
 }
 export type ReplyRunner = (input: ReplyInput) => Promise<void>;
-export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDelta, onReplace, images, authorize }) => {
+export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDelta, onReplace, images, authorize, onRequestStart }) => {
+  onRequestStart?.();
   const sessionId = `modelchat-${randomUUID()}`;
   const directory = path.join(copilotHome, "requests", sessionId);
   await mkdir(directory, { recursive: true, mode: 0o700 });

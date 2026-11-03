@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { dataDirectory, ensureDataDirectory } from "./config";
 import { AppError } from "./errors";
-import { LIMITS, type Chat, type Message, type MessageStatus, type Attachment } from "./contracts";
+import { LIMITS, type Chat, type Message, type MessageStatus, type Attachment, type ImageSource, type ImageAnalysis } from "./contracts";
 import type { MediaFrame } from "./media";
 import { installUploadSchema, fileTextPage, fileContextExcerpt } from "./upload-store";
 
@@ -42,6 +42,11 @@ export class Store {
         position INTEGER NOT NULL, seconds REAL NOT NULL CHECK(seconds>=0),
         mimeType TEXT NOT NULL CHECK(mimeType='image/jpeg'), bytes BLOB NOT NULL,
         UNIQUE(fileId,position)
+      );
+      CREATE TABLE IF NOT EXISTS app_image_analysis (
+        fileId TEXT NOT NULL REFERENCES app_file(id) ON DELETE CASCADE,
+        imageId TEXT NOT NULL, model TEXT NOT NULL, content TEXT NOT NULL,
+        createdAt INTEGER NOT NULL, PRIMARY KEY(fileId,imageId)
       );
       CREATE TABLE IF NOT EXISTS app_acting (
         sessionId TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
@@ -144,7 +149,7 @@ export class Store {
     if (file.messageId) throw new AppError(409, "Files already sent are part of saved context. Delete the chat to remove them.");
     this.db.prepare("DELETE FROM app_file WHERE chatId=? AND id=?").run(chatId, fileId);
   }
-  contextFiles(userId: string, chatId: string, pendingIds: string[], query = "") {
+  contextFiles(userId: string, chatId: string, pendingIds: string[], query = "", totalBudget: number = LIMITS.chatFileCharacters) {
     const attachments = this.attachments(userId, chatId);
     for (const id of pendingIds) {
       const file = attachments.find(item => item.id === id);
@@ -155,8 +160,42 @@ export class Store {
     const selected = attachments
       .filter(f => f.messageId || pendingIds.includes(f.id))
       .filter(f => !f.processingStatus || f.processingStatus === "ready");
-    const budget = Math.max(256, Math.floor(LIMITS.chatFileCharacters / Math.max(1, selected.length)));
-    return selected.map(file => ({ id: file.id, name: file.name, text: fileContextExcerpt(this.db, file.id, query, budget) }));
+    const budget = Math.floor(totalBudget / Math.max(1, selected.length));
+    if (selected.length && budget < 256) throw new AppError(400, "The selected file names and excerpts cannot fit this model's context. Use a larger-context model or fewer attachments; nothing has been sent.");
+    return selected.map(file => ({ id: file.id, name: file.name, text: file.mimeType?.startsWith("image/")
+      ? "[Image file. imageContext identifies whether this request contains its pixels, saved AI analysis, or prior conversation only.]"
+      : fileContextExcerpt(this.db, file.id, query, budget) }));
+  }
+  imageSources(userId: string, chatId: string, pendingIds: string[]): ImageSource[] {
+    return this.attachments(userId, chatId).filter(file => file.messageId || pendingIds.includes(file.id)).flatMap(file => {
+      if (file.processingStatus && file.processingStatus !== "ready") return [];
+      if (file.mimeType?.startsWith("image/")) {
+        const normalized = this.db.prepare("SELECT mimeType,length(bytes) size FROM app_analysis_image WHERE fileId=?").get(file.id) as { mimeType: string; size: number } | undefined;
+        return [{ id: file.id, fileId: file.id, name: file.name, mimeType: normalized?.mimeType || file.mimeType, size: normalized?.size ?? file.size }];
+      }
+      const frames = this.db.prepare("SELECT id,seconds,mimeType,length(bytes) size FROM app_media_frame WHERE fileId=? ORDER BY position").all(file.id) as { id: string; seconds: number; mimeType: string; size: number }[];
+      return frames.map(frame => ({ id: frame.id, fileId: file.id, name: `${file.name} [sample at ${frame.seconds.toFixed(2)}s]`, mimeType: frame.mimeType, size: frame.size }));
+    });
+  }
+  imageFile(userId: string, chatId: string, source: ImageSource): FileRecord {
+    const file = this.attachments(userId, chatId).find(item => item.id === source.fileId);
+    if (!file) throw new AppError(404, "Image file not found.");
+    const row = source.id === file.id
+      ? this.db.prepare("SELECT bytes,mimeType FROM app_analysis_image WHERE fileId=?").get(file.id)
+      : this.db.prepare("SELECT bytes,mimeType FROM app_media_frame WHERE fileId=? AND id=?").get(file.id, source.id);
+    if (!row && source.id !== file.id) throw new AppError(404, "Image frame not found.");
+    const image = row as { bytes: Buffer; mimeType: string } | undefined;
+    return image ? { ...file, ...source, ...image, text: "[Image pixels]" } : this.file(userId, chatId, file.id);
+  }
+  imageAnalysis(userId: string, chatId: string, source: ImageSource): ImageAnalysis | undefined {
+    this.fileText(userId, chatId, source.fileId);
+    return this.db.prepare("SELECT * FROM app_image_analysis WHERE fileId=? AND imageId=?").get(source.fileId, source.id) as ImageAnalysis | undefined;
+  }
+  saveImageAnalysis(userId: string, chatId: string, source: ImageSource, model: string, content: string) {
+    this.imageFile(userId, chatId, source);
+    if (!content.trim() || content.length > 32_000) throw new AppError(502, "The image analysis was empty or exceeded its safe output budget.");
+    this.db.prepare("INSERT INTO app_image_analysis(fileId,imageId,model,content,createdAt) VALUES (?,?,?,?,?) ON CONFLICT(fileId,imageId) DO NOTHING")
+      .run(source.fileId, source.id, model, content, Date.now());
   }
   contextImages(userId: string, chatId: string, pendingIds: string[]) {
     this.contextFiles(userId, chatId, pendingIds);
