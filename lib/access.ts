@@ -131,6 +131,7 @@ export class AccessService {
     return { ...context, subject: this.user(context.actor.id), delegationId: null };
   }
   logout(actorId: string, sessionId: string) {
+    this.invalidateFileJobs(sessionId, null);
     const state = this.acting(sessionId);
     if (state?.actorId === actorId) {
       const actor = this.user(actorId);
@@ -174,6 +175,7 @@ export class AccessService {
     const user = this.user(matches[0].id);
     return this.store.db.transaction(() => {
       this.store.db.prepare("UPDATE user SET appRole=? WHERE id=?").run(role, user.id);
+      this.invalidateFileJobs(null, user.id);
       const states = this.store.db.prepare("SELECT id,sessionId,actorId,subjectId FROM app_acting WHERE actorId=? OR subjectId=?").all(user.id, user.id) as ActingRow[];
       for (const state of states) {
         this.record({ actor: this.user(state.actorId), subject: this.user(state.subjectId), sessionId: state.sessionId, delegationId: state.id },
@@ -183,6 +185,15 @@ export class AccessService {
       this.store.db.prepare("INSERT INTO app_audit(at,actorId,subjectId,action,objectId,outcome,reason,delegationId) VALUES (?,NULL,?,'role.change',?,'allowed',?,NULL)")
         .run(Date.now(), user.id, user.id, `local_console:${role}`);
       return { id: user.id, email: user.email, appRole: role };
+    })();
+  }
+  private invalidateFileJobs(sessionId: string | null, userId: string | null) {
+    this.store.db.transaction(() => {
+      const jobs = this.store.db.prepare(`UPDATE app_file_job SET status='cancelled',stage='Authorization ended',error=NULL,lease=NULL,updatedAt=?
+        WHERE actorId<>subjectId AND (sessionId=? OR actorId=? OR subjectId=?) AND status IN ('uploading','queued','processing')
+        RETURNING fileId,actorId,subjectId,delegationId`).all(Date.now(), sessionId, userId, userId) as { fileId: string; actorId: string; subjectId: string; delegationId: string | null }[];
+      const audit = this.store.db.prepare("INSERT INTO app_audit(at,actorId,subjectId,action,objectId,outcome,reason,delegationId) VALUES (?,?,?,'file.process',?,'denied',?,?)");
+      for (const job of jobs) audit.run(Date.now(), job.actorId, job.subjectId, job.fileId, userId ? "role_changed" : "logout", job.delegationId);
     })();
   }
 }

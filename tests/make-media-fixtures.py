@@ -5,6 +5,7 @@ from fractions import Fraction
 from pathlib import Path
 
 import av
+import numpy as np
 from PIL import Image, ImageDraw
 
 root = Path(sys.argv[1])
@@ -68,9 +69,17 @@ print("Encoding spoken MP4 fixture", flush=True)
 movie(root / "speech-video.mp4", True)
 print("Encoding silent MP4 fixture", flush=True)
 movie(root / "silent-video.mp4", False)
-with wave.open(str(root / "too-long.wav"), "wb") as output:
-    output.setnchannels(1)
+with wave.open(str(root / "long-speech.wav"), "wb") as output:
+    output.setnchannels(2)
     output.setsampwidth(2)
-    output.setframerate(16000)
-    output.writeframes(b"\x00\x00" * 16000 * 181)
-print("Synthetic WAV, MP3, spoken/silent MP4 and duration-limit fixtures created.")
+    output.setframerate(48000)
+    for _ in range(200):
+        output.writeframes(b"\x00" * 48000 * 4)
+    resampler = av.AudioResampler(format="s16", layout="stereo", rate=48000)
+    with av.open(str(source)) as audio:
+        for frame in audio.decode(audio=0):
+            for converted in resampler.resample(frame):
+                output.writeframes(converted.to_ndarray().astype(np.int16).tobytes())
+    for converted in resampler.resample(None):
+        output.writeframes(converted.to_ndarray().astype(np.int16).tobytes())
+print("Synthetic WAV/MP3/MP4 and >25 MB, >3-minute speech-at-200s fixtures created.")

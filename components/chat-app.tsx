@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { ArrowDown, ArrowUp, BookOpen, Check, ChevronDown, Eye, FileText, Leaf, LoaderCircle, LogOut, Menu, MessageSquare, Mic, PanelLeft, Paperclip, Pencil, Plus, RefreshCw, Settings2, ShieldCheck, Square, Trash2, Volume2, X } from "lucide-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { FILE_ACCEPT, LIMITS, uploadByteLimit, isMediaExtension, type Attachment, type Chat, type ChatDetail, type Model, type StreamEvent } from "@/lib/contracts";
+import { FILE_ACCEPT, LIMITS, type Attachment, type Chat, type ChatDetail, type Model, type StreamEvent } from "@/lib/contracts";
 import { dictationConstructor, voiceError, type Dictation, type VoiceWindow } from "@/lib/voice";
 import { DEMOS, type DemoId } from "@/lib/demos";
 import type { AccountView, AppUser } from "@/lib/access";
@@ -42,9 +42,9 @@ export function ChatApp() {
   const [loadingChat, setLoadingChat] = useState(false);
   const [busy, setBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
-  const [processingMedia, setProcessingMedia] = useState(false);
+  const [transferProgress, setTransferProgress] = useState("");
   const [mediaInfo, setMediaInfo] = useState<{ ready: boolean; model: string | null; message: string } | null>(null);
-  const [filePreview, setFilePreview] = useState<{ name: string; text: string; notes: string } | null>(null);
+  const [filePreview, setFilePreview] = useState<{ name: string; text: string; notes: string; nextCursor: number | null; cursor: number; file: Attachment } | null>(null);
   const [draft, setDraft] = useState("");
   const [sidebar, setSidebar] = useState(false);
   const [settings, setSettings] = useState(false);
@@ -86,6 +86,8 @@ export function ChatApp() {
   modelRef.current = selectedModel;
   busyRef.current = busy;
   const pending = detail?.attachments.filter(f => !f.messageId) || [];
+  const readyPending = pending.filter(file => !file.processingStatus || file.processingStatus === "ready");
+  const processing = detail?.attachments.some(file => ["uploading", "queued", "processing"].includes(file.processingStatus || "")) || false;
   const remoteBusy = Boolean(detail?.messages.some(m => m.status === "streaming"));
   const locked = busy || uploading || loadingChat || remoteBusy || demoLoading || switching;
   const acting = Boolean(actor && user && actor.id !== user.id);
@@ -202,6 +204,24 @@ export function ChatApp() {
     return () => clearInterval(timer);
   }, [remoteBusy, busy, detail?.chat.id]);
 
+  useEffect(() => {
+    if (!processing || !detail) return;
+    const id = detail.chat.id;
+    const epoch = workspaceEpoch.current;
+    let alive = true;
+    const timer = setInterval(() => {
+      api<{ attachments: Attachment[] }>(`/api/chats/${id}/files`).then(result => {
+        if (!alive || epoch !== workspaceEpoch.current) return;
+        setDetail(previous => previous?.chat.id === id ? { ...previous, attachments: result.attachments.map(file => {
+          const prior = previous.attachments.find(item => item.id === file.id);
+          return busyRef.current && prior?.messageId ? { ...file, messageId: prior.messageId } : file;
+        }) } : previous);
+      }).catch(error => { if (alive && epoch === workspaceEpoch.current) report(error); });
+    }, 1500);
+    return () => { alive = false; clearInterval(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [processing, detail?.chat.id, user?.id]);
+
   function report(error: unknown) {
     setNotice(message(error));
     if (error instanceof RequestError && error.status === 401) clearAccount();
@@ -236,7 +256,7 @@ export function ChatApp() {
     setDraft(""); setBusy(false); setUploading(false); setSettings(false); setSidebar(false);
     setMenu(false); setHow(false); setDemoLoading(false);
     setActor(null); setAdmin(false); setSwitching(false);
-    setFilePreview(null); setProcessingMedia(false);
+    setFilePreview(null); setTransferProgress("");
     setSpeaking(null); setInterim(""); setVoiceConsent(false); setConnectionError("");
     window.history.replaceState(null, "", "/");
   }
@@ -404,6 +424,7 @@ export function ChatApp() {
     let chatId: string | undefined;
     let accepted = false;
     let done = false;
+    const selectedFiles = readyPending.slice(0, LIMITS.filesPerMessage);
     try {
       await flushDraft(true);
       const chat = await ensureChat();
@@ -411,7 +432,7 @@ export function ChatApp() {
       const response = await fetch(`/api/chats/${chat.id}/messages`, {
         method: "POST", signal: controller.signal,
         headers: { "Content-Type": "application/json", "x-model-chat-subject": ownerId! },
-        body: JSON.stringify({ content, model: selectedModel, fileIds: pending.map(f => f.id) }),
+        body: JSON.stringify({ content, model: selectedModel, fileIds: selectedFiles.map(f => f.id) }),
       });
       if (!response.ok) {
         const data = await response.json();
@@ -429,7 +450,7 @@ export function ChatApp() {
           accepted = true; draftRef.current = ""; setDraft("");
           setDetail(previous => previous && ({ ...previous,
             messages: [...previous.messages, item.user, item.assistant],
-            attachments: previous.attachments.map(f => pending.some(p => p.id === f.id) ? { ...f, messageId: item.user.id } : f),
+            attachments: previous.attachments.map(f => selectedFiles.some(p => p.id === f.id) ? { ...f, messageId: item.user.id } : f),
           }));
         } else if (item.type === "delta" || item.type === "replace") {
           setDetail(previous => previous && ({ ...previous, messages: previous.messages.map((m, index) => index === previous.messages.length - 1 ?
@@ -471,48 +492,80 @@ export function ChatApp() {
   }
   async function upload(files: FileList | null) {
     if (!files?.length || locked) return;
-    if (pending.length + files.length > LIMITS.filesPerMessage) { setNotice("Attach up to 4 files per message."); return; }
     setUploading(true); setNotice("");
     const controller = new AbortController();
     uploadController.current = controller;
     const uploadEpoch = workspaceEpoch.current;
+    const owner = userRef.current?.id;
     let chatId: string | undefined;
+    let currentFile: string | undefined;
     try {
       await flushDraft(true);
       const chat = await ensureChat();
       chatId = chat.id;
       for (const file of Array.from(files)) {
-        setProcessingMedia(isMediaExtension(file.name.split(".").at(-1) || ""));
-        const maximum = uploadByteLimit(file.name);
-        if (file.size > maximum) throw new Error(`${file.name} exceeds ${maximum / 1024 / 1024} MB.`);
-        const { attachment } = await api<{ attachment: Attachment }>(`/api/chats/${chat.id}/files`, {
-          method: "POST", signal: controller.signal, headers: { "Content-Type": "application/octet-stream", "X-File-Name": encodeURIComponent(file.name) }, body: file,
+        controller.signal.throwIfAborted();
+        const started = await api<{ fileId: string; partBytes: number }>(`/api/chats/${chat.id}/files/start`, {
+          method: "POST", signal: controller.signal, body: JSON.stringify({ name: file.name, size: file.size }), headers: { "x-model-chat-subject": owner! },
         });
-        setDetail(previous => previous?.chat.id === chat.id ? ({ ...previous, attachments: [...previous.attachments, attachment] }) : previous);
+        currentFile = started.fileId;
+        for (let offset = 0, position = 0; offset < file.size; offset += started.partBytes, position++) {
+          setTransferProgress(`${file.name} · ${Math.round(offset / file.size * 100)}% uploaded`);
+          for (let attempt = 0; ; attempt++) {
+            try {
+              await api(`/api/chats/${chat.id}/files/${currentFile}/parts/${position}`, {
+                method: "POST", signal: controller.signal, headers: { "Content-Type": "application/octet-stream", "x-model-chat-subject": owner! },
+                body: file.slice(offset, offset + started.partBytes),
+              });
+              break;
+            } catch (error) {
+              if (controller.signal.aborted || attempt >= 2 || !(error instanceof TypeError || (error instanceof RequestError && (error.status >= 500 || error.status === 429)))) throw error;
+              await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
+              controller.signal.throwIfAborted();
+            }
+          }
+        }
+        const { attachment } = await api<{ attachment: Attachment }>(`/api/chats/${chat.id}/files/${currentFile}/complete`, {
+          method: "POST", signal: controller.signal, headers: { "x-model-chat-subject": owner! },
+        });
+        currentFile = undefined;
+        if (workspaceEpoch.current !== uploadEpoch) return;
+        setDetail(previous => previous?.chat.id === chat.id ? ({ ...previous, attachments: [...previous.attachments.filter(item => item.id !== attachment.id), attachment] }) : previous);
       }
     } catch (error) {
       if (workspaceEpoch.current === uploadEpoch) {
-        if (controller.signal.aborted) setNotice("File processing cancelled. Any file that had already completed remains in its original chat.");
+        if (controller.signal.aborted) setNotice("Upload stopped. Files already queued continue processing in their original chats.");
         else report(error);
       }
     }
     finally {
-      if (chatId && detailRef.current?.chat.id === chatId && userRef.current) {
+      if (currentFile && chatId && workspaceEpoch.current === uploadEpoch) {
+        try { await api(`/api/chats/${chatId}/files/${currentFile}/cancel`, { method: "POST", headers: { "x-model-chat-subject": owner! } }); }
+        catch (error) { if (!(error instanceof RequestError && error.status === 409)) report(error); }
+      }
+      if (chatId && workspaceEpoch.current === uploadEpoch && detailRef.current?.chat.id === chatId && userRef.current) {
         try { await refreshChat(chatId); } catch (error) { report(error); }
       }
       if (uploadController.current === controller) {
-        setUploading(false); setProcessingMedia(false); uploadController.current = null;
+        setUploading(false); setTransferProgress(""); uploadController.current = null;
         if (fileInput.current) fileInput.current.value = "";
       }
     }
   }
-  async function previewFile(file: Attachment) {
+  async function previewFile(file: Attachment, cursor = 0) {
     const epoch = workspaceEpoch.current;
     const selected = selection.current;
     try {
-      const preview = await api<{ name: string; text: string; notes: string }>(`/api/chats/${file.chatId}/files/${file.id}/extracted`);
-      if (epoch === workspaceEpoch.current && selected === selection.current) setFilePreview(preview);
+      const preview = await api<{ name: string; text: string; notes: string; nextCursor: number | null }>(`/api/chats/${file.chatId}/files/${file.id}/extracted?cursor=${cursor}`);
+      if (epoch === workspaceEpoch.current && selected === selection.current) setFilePreview({ ...preview, cursor, file });
     } catch (error) { report(error); }
+  }
+  async function controlFile(file: Attachment, action: "cancel" | "retry") {
+    const epoch = workspaceEpoch.current;
+    try {
+      const result = await api<{ attachment: Attachment }>(`/api/chats/${file.chatId}/files/${file.id}/${action}`, { method: "POST" });
+      if (epoch === workspaceEpoch.current) setDetail(previous => previous?.chat.id === file.chatId ? { ...previous, attachments: previous.attachments.map(item => item.id === file.id ? result.attachment : item) } : previous);
+    } catch (error) { if (epoch === workspaceEpoch.current) report(error); }
   }
   async function removeFile(file: Attachment) {
     try {
@@ -632,7 +685,7 @@ export function ChatApp() {
         {sample.id === "budget" ? <FileText size={21} /> : sample.id === "writing" ? <Pencil size={21} /> : <MessageSquare size={21} />}
         <strong>{sample.title}</strong><span>{sample.description}</span><small>Load example draft <ArrowUp size={12} className="arrow-right" /></small>
       </button>)}</div>
-      <div className="settings-section"><h3><Mic size={16} /> Voice and files</h3><p>Dictate uses your browser&apos;s speech service, which may process audio online. Read aloud uses browser voices. Uploaded recordings are different: their speech is transcribed locally with Whisper, and video adds up to four sampled frames. Review extracted text with the eye icon before sending.</p><p>Documents and images: up to 5 MB each. Audio/video: up to 25 MB and 3 minutes, with a 90-second processing limit. Videos and images need a model marked vision. Sampled frames do not show every event or continuous motion. No files are executed.</p></div>
+      <div className="settings-section"><h3><Mic size={16} /> Voice and files</h3><p>Dictate uses your browser&apos;s speech service, which may process audio online. Read aloud uses browser voices. Uploaded recordings are different: their speech is transcribed locally with Whisper, and video adds up to four sampled frames. Review extracted text with the eye icon before sending.</p><p>Uploads are saved in parts and processed in the background. There is no preset total upload-size, media-duration, or processing-time cutoff. Keep chatting or switch conversations while processing; cancel or retry from the file card. Available disk space, safe-format/decoder budgets, and model context still apply. Large files use labeled excerpts in model requests; full extracted text is available in pages. Videos and images need a vision model. Sampled frames are not continuous video understanding. No files are executed.</p></div>
     </Dialog>}
   </>;
   if (booting) return <main className="boot"><Brand /><LoaderCircle className="spin" aria-label="Loading account" /></main>;
@@ -685,7 +738,7 @@ export function ChatApp() {
             <div className="welcome-mark"><Leaf size={34} strokeWidth={1.4} /></div>
             <div className="eyebrow">YOUR MODELS. ONE QUIET SPACE.</div>
             <h1>What&apos;s on your mind?</h1>
-            <p>{pending.length ? <>Your files are ready.<br />Ask a question to start exploring them.</> : <>Start with a thought, a question, or a file.<br />Pick a model. Make room for an idea.</>}</p>
+            <p>{pending.length ? <>{processing ? "Your files are processing in the background." : readyPending.length ? "Your processed files are ready." : "Your uploads need attention."}<br />You can keep chatting while files are processed.</> : <>Start with a thought, a question, or a file.<br />Pick a model. Make room for an idea.</>}</p>
             {pending.length === 0 && <div className="suggestions">
               <button onClick={() => { setDraft("Help me think through an idea. Ask me one useful question to get started."); setDraftState("saving"); composer.current?.focus(); }}><MessageSquare size={20} /><strong>Think it through</strong><span>Find a new perspective</span></button>
               <button onClick={() => fileInput.current?.click()} disabled={locked}><FileText size={20} /><strong>Explore a document</strong><span>Turn information into insight</span></button>
@@ -711,7 +764,21 @@ export function ChatApp() {
       </div>
       <div className="composer-wrap">
         <form className={`composer ${listening ? "listening" : ""}`} onSubmit={send}>
-          {pending.length > 0 && <div className="pending-files">{pending.map(file => <div className="file-chip" title={`${file.notes} ${file.characters.toLocaleString()} characters.`} key={file.id}><FileText size={16} /><span>{file.name}<small>{(file.size / 1024).toFixed(0)} KB · ready{file.frameCount ? ` · ${file.frameCount} frames` : ""}</small></span><IconButton label={`Preview extracted text for ${file.name}`} disabled={locked} onClick={() => void previewFile(file)}><Eye size={14} /></IconButton><IconButton label={`Remove ${file.name}`} disabled={locked} onClick={() => void removeFile(file)}><X size={14} /></IconButton></div>)}</div>}
+          {pending.length > 0 && <div className="pending-files">{pending.map(file => {
+            const status = file.processingStatus || "ready";
+            const running = ["queued", "processing"].includes(status);
+            return <div className={`file-chip file-job ${status}`} title={`${file.notes} ${file.characters.toLocaleString()} characters.`} key={file.id}>
+              {running ? <LoaderCircle className="spin" size={16} /> : <FileText size={16} />}
+              <span>{file.name}<small>{(file.size / 1024 / 1024).toFixed(1)} MB · {file.processingStage || status}{file.processingProgress && running ? ` · ${Math.round(file.processingProgress * 100)}%` : ""}{file.frameCount ? ` · ${file.frameCount} frames` : ""}</small>{file.processingError && <small className="file-error">{file.processingError}</small>}</span>
+              <IconButton label={`Preview extracted text for ${file.name}`} disabled={status !== "ready"} onClick={() => void previewFile(file)}><Eye size={14} /></IconButton>
+              {file.uploadComplete !== 0 && <a className="icon-button" aria-label={`Download original ${file.name}`} href={`/api/chats/${file.chatId}/files/${file.id}`}><ArrowDown size={14} /></a>}
+              {(running || status === "uploading") && <IconButton label={`Cancel processing ${file.name}`} onClick={() => void controlFile(file, "cancel")}><Square size={14} /></IconButton>}
+              {file.uploadComplete !== 0 && ["failed", "cancelled"].includes(status) && <IconButton label={`Retry processing ${file.name}`} onClick={() => void controlFile(file, "retry")}><RefreshCw size={14} /></IconButton>}
+              <IconButton label={`Remove ${file.name}`} disabled={locked} onClick={() => void removeFile(file)}><X size={14} /></IconButton>
+            </div>;
+          })}</div>}
+          {pending.some(file => file.processingStatus && file.processingStatus !== "ready") && <p className="file-guidance">Files still processing or needing retry are not sent to the model. You can send text now and ask about them when ready.</p>}
+          {readyPending.length > LIMITS.filesPerMessage && <p className="file-guidance">Send includes the first {LIMITS.filesPerMessage} ready new files. Remaining files stay attached for the next message.</p>}
           <label className="sr-only" htmlFor="message">Message</label>
           <textarea id="message" ref={composer} rows={2} placeholder={listening ? "Listening... your words will appear here" : "Ask anything, or bring a file into the conversation..."} value={draft}
             onChange={event => { draftRef.current = event.target.value; setDraft(event.target.value); setDraftState("saving"); }} maxLength={LIMITS.inputCharacters} disabled={busy || loadingChat || remoteBusy || demoLoading || switching}
@@ -720,11 +787,11 @@ export function ChatApp() {
           <div className="composer-tools">
             <div className="tool-group">
               <input type="file" accept={FILE_ACCEPT} multiple ref={fileInput} className="sr-only" tabIndex={-1} onChange={event => void upload(event.target.files)} />
-              <IconButton label="Attach files" onClick={() => fileInput.current?.click()} disabled={locked || pending.length >= 4}>{uploading ? <LoaderCircle className="spin" size={19} /> : <Paperclip size={19} />}</IconButton>
+              <IconButton label="Attach files" onClick={() => fileInput.current?.click()} disabled={locked}>{uploading ? <LoaderCircle className="spin" size={19} /> : <Paperclip size={19} />}</IconButton>
               <button type="button" className={`voice-button ${listening ? "active" : ""}`} disabled={locked || !dictationAvailable}
                 title={!dictationAvailable ? "Dictation unavailable in this browser; text chat works." : "Dictate with your browser's speech service"}
                 onClick={() => listening ? recognition.current?.stop() : startDictation()}><Mic size={18} /><span>{listening ? "Stop dictation" : "Dictate"}</span></button>
-              <span className="upload-status">{uploading ? processingMedia ? "Processing media locally..." : "Reading your file..." : pending.length ? `${pending.length} attached` : ""}</span>
+              <span className="upload-status">{uploading ? transferProgress || "Starting upload..." : pending.length ? `${readyPending.length} ready · ${pending.length - readyPending.length} pending` : ""}</span>
               {uploading && <button type="button" className="voice-button" onClick={() => uploadController.current?.abort()}>Cancel upload</button>}
             </div>
             <div className="send-group">{draft.length > 7000 && <small>{draft.length}/{LIMITS.inputCharacters}</small>}
@@ -741,8 +808,8 @@ export function ChatApp() {
       <div className="settings-account"><span className="avatar">{user.name.slice(0, 1).toUpperCase()}</span><div><strong>{user.name}</strong><p>{user.email}</p></div></div>
       <div className="settings-section"><h3><ShieldCheck size={16} /> {access.tunnelMode ? "Temporary remote access" : "Personal, local-only"}</h3><p>{access.tunnelMode ? "A temporary Cloudflare HTTPS tunnel is active. Anyone with the link can create an email/password account without OTP. This link uses the app's password login, not Cloudflare Access. Cloudflare relays the traffic. Stop the tunnel when finished." : "This app listens on 127.0.0.1 only. Use only the app's explicit temporary-tunnel mode for remote access; do not otherwise expose it through a proxy, LAN or the internet."} App accounts have separate histories and files, but all use the host owner&apos;s Copilot account and usage limits.</p><p>Histories and original files stay in this app&apos;s local SQLite database. Prompts, chat context and extracted file text go to GitHub Copilot when you send. These are not end-to-end encrypted; people with access to your Windows account or backups can read local data.</p></div>
       <div className="settings-section"><h3><span className={`status-dot ${connectionError ? "offline" : ""}`} /> Copilot connection</h3><p>{connectionError || `${models.length} models discovered from the Copilot SDK. Availability may differ from the desktop app and can change with your plan.`}</p><p>Already signed-in CLI credentials are reused through supported SDK authentication. If sign-in is needed, run this from the app folder:</p><code className="command">npm run copilot:login</code><button className="secondary-button" onClick={() => void refreshModels()} disabled={modelLoading}><RefreshCw size={14} /> Refresh connection</button></div>
-      <div className="settings-section"><h3><FileText size={16} /> A few thoughtful limits</h3><p>TXT, Markdown, CSV, JSON, LOG, YAML and XML (UTF-8), PDF, DOCX and XLSX; also native PNG/JPEG/WebP/static GIF image input. Documents/images: 5 MB each. Audio/video: 25 MB and 3 minutes each. Up to 30,000 extracted characters per file; 4 files per message, 8 files and 60,000 file characters per chat; 50 MB of originals and generated frames per account.</p><p>Images: up to 16 megapixels and 8192 pixels per dimension, with the selected model&apos;s vision limits enforced. Video frames are sampled, not continuous motion; videos require a vision-capable model. Saved images/frames are resent in later turns. Incompatible models fail explicitly.</p><p>PDF: selectable text, up to 100 pages; no scanned-PDF OCR. Office: text and cached spreadsheet values only; no macros, password protection, charts or embedded files. Workbooks: 20 sheets / 10,000 cells. Files are never executed.</p><p>Sent files remain available in later turns. Download originals from their message chips and inspect extracted text with the eye icon. Remove unsent files with X; delete a chat to remove its history and files. Up to 100 chats / 100 turns per chat. Context is bounded without silently discarding old messages.</p></div>
-      <div className="settings-section"><h3><Mic size={16} /> Local audio/video processing</h3><p>{mediaInfo?.message || "Checking local media configuration..."} {mediaInfo?.ready && <>Whisper model: {mediaInfo.model}, running on this computer&apos;s CPU.</>}</p><p>MP3, WAV, M4A, AAC, FLAC, OGG, OPUS, MP4, MOV, WEBM, MKV and AVI are accepted when their streams are decodable. Speech becomes a machine transcript; video also supplies up to four still frames. Copilot receives those extracted inputs when you press Send, not native audio/video. Transcription can be imperfect, and unsampled visual events may be missed.</p><p>One recording is processed at a time, for up to 90 seconds. Shorter clips work best. Transcription uses installed local packages and cached weights; no speech API key is needed. Public-link uploads still pass through Cloudflare.</p></div>
+      <div className="settings-section"><h3><FileText size={16} /> Files and model context</h3><p>TXT, Markdown, CSV, JSON, LOG, YAML and XML (UTF-8), PDF, DOCX, XLSX, PNG/JPEG/WebP/static GIF, and the audio/video formats below. There is no preset total file-size or account-storage quota. Uploads use small transport parts; actual free disk space is checked. Processing happens after storage, independently of the chat UI, with status, cancellation and retry.</p><p>Full extracted text is indexed and available through the paged eye-icon preview. A model request includes up to 4 ready new files and a shared 60,000-character file-context budget. For longer files it receives explicitly labeled relevant or representative excerpts, not every word. Pending/failed files are not presented as read. Original files and full extracted text are retained.</p><p>Safe decoder budgets still apply: images up to 16 megapixels/8192 pixels per dimension, video frames up to 4096 pixels, bounded archive expansion and isolated document-parser memory. Images are normalized for model input. PDF needs selectable text; no scanned-PDF OCR. Office extracts text/cached values, not macros, charts or embedded files. Unsupported or unsafe files report an error; nothing is executed.</p><p>Sent files remain available in later turns. Download originals from their message chips and inspect extracted text with the eye icon. Remove unsent files with X; delete a chat to remove its history and files. Up to 100 chats / 100 turns per chat. Model context remains finite without silently discarding saved messages.</p></div>
+      <div className="settings-section"><h3><Mic size={16} /> Local audio/video processing</h3><p>{mediaInfo?.message || "Checking local media configuration..."} {mediaInfo?.ready && <>Whisper model: {mediaInfo.model}, running on this computer&apos;s CPU.</>}</p><p>MP3, WAV, M4A, AAC, FLAC, OGG, OPUS, MP4, MOV, WEBM, MKV and AVI are accepted when their streams are decodable. Speech becomes a machine transcript; video also supplies up to four still frames. Copilot receives those extracted inputs when you press Send, not native audio/video. Transcription can be imperfect, and unsampled visual events may be missed.</p><p>One recording and one document can process at a time; others wait in a durable queue. No media-duration or overall-processing deadline is imposed. Long recordings are decoded/transcribed in bounded-memory windows, and processing may take a long time. Closing the browser does not discard accepted uploads. Interrupted jobs resume from the beginning after a server restart. Administrator-created delegated jobs stop if that administrator loses access or signs out. Transcription uses installed local packages/cached weights, without a speech API key. Public-link uploads pass through Cloudflare.</p></div>
       <div className="settings-section"><h3><ShieldCheck size={16} /> Administrator access</h3><p>The app superuser can view users&apos; chat sessions and files and act as a user to send messages or modify chats. An audit log records the real actor, effective user, action, object IDs, time and outcome—not prompt/file contents or credentials. {acting && <>You are still signed in as {actor?.email}; signing out ends that real login session.</>}</p></div>
       <div className="settings-section"><h3><Mic size={16} /> Voice, without the surprises</h3><p>Dictation uses browser speech recognition, not a realtime audio model. Your browser may send microphone audio to its speech provider. Read-aloud uses your browser&apos;s voices, which may also use an online service. Text works without either feature.</p><p>No email verification, password reset, or recovery service is configured. Use a unique password and keep a local backup. A temporary shared preview is not production hosting.</p></div>
       <button className="secondary-button logout" onClick={() => void logout()} disabled={uploading || demoLoading}><LogOut size={16} /> Sign out{busy ? " and stop reply" : ""}</button>
@@ -751,7 +818,7 @@ export function ChatApp() {
     {deleteChat && <Dialog title="Delete this conversation?" onClose={() => setDeleteChat(null)}><p><strong>{deleteChat.title}</strong> and its messages and files will be removed from this app. This cannot be undone. Existing backups are not erased.</p><div className="dialog-actions"><button className="secondary-button" onClick={() => setDeleteChat(null)}>Keep it</button><button className="danger-button" onClick={() => void confirmDelete()}>Delete conversation</button></div></Dialog>}
     {voiceDialog && <Dialog title="A quick note about dictation" onClose={() => setVoiceDialog(false)}><p>Your browser may send audio to its speech-recognition service. Dictation is not processed locally by this app or by the selected chat model. Review and edit the transcript before sending.</p><div className="dialog-actions"><button className="secondary-button" onClick={() => setVoiceDialog(false)}>Keep typing</button><button className="primary-button" onClick={() => { setVoiceConsent(true); setVoiceDialog(false); setNotice("Dictation enabled for this sign-in. Click Dictate to start the microphone."); }}>I understand</button></div></Dialog>}
     {navigation}
-    {filePreview && <Dialog title={filePreview.name} onClose={() => setFilePreview(null)}><p>{filePreview.notes}</p><pre className="extracted-text">{filePreview.text}</pre></Dialog>}
+    {filePreview && <Dialog title={filePreview.name} onClose={() => setFilePreview(null)}><p>{filePreview.notes}</p><pre className="extracted-text">{filePreview.text}</pre><div className="dialog-actions"><button className="secondary-button" disabled={filePreview.cursor === 0} onClick={() => void previewFile(filePreview.file, Math.max(0, filePreview.cursor - 8))}>Previous text page</button><button className="secondary-button" disabled={filePreview.nextCursor === null} onClick={() => { if (filePreview.nextCursor !== null) void previewFile(filePreview.file, filePreview.nextCursor); }}>Next text page</button></div></Dialog>}
     {admin && actor?.appRole === "superuser" && !acting && <Dialog title="Users & audit" onClose={() => setAdmin(false)}><AdminPanel request={api} actorId={actor.id} busy={locked} onAct={actAs} /></Dialog>}
   </div>;
 }

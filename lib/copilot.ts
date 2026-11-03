@@ -61,6 +61,11 @@ const catalogState = globalThis as typeof globalThis & {
   modelChatCatalog?: { models: ModelInfo[]; at: number };
   modelChatCatalogPending?: Promise<ModelInfo[]>;
 };
+export function modelPromptTokens(limits: ModelInfo["capabilities"]["limits"]): number | undefined {
+  const reported = [limits.max_prompt_tokens, limits.max_context_window_tokens]
+    .filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
+  return reported.length ? Math.min(...reported) : undefined;
+}
 export async function listModels(refresh = false): Promise<ModelInfo[]> {
   if (!refresh && catalogState.modelChatCatalog && Date.now() - catalogState.modelChatCatalog.at < 60_000) return catalogState.modelChatCatalog.models;
   if (catalogState.modelChatCatalogPending) return catalogState.modelChatCatalogPending;
@@ -69,8 +74,10 @@ export async function listModels(refresh = false): Promise<ModelInfo[]> {
     try {
       const auth = await deadline(client.getAuthStatus(), 15_000);
       if (!auth.isAuthenticated) throw new AppError(503, "No usable Copilot sign-in was found in this app's isolated runtime. Run npm run copilot:login on this machine, then refresh the connection.");
-      const models = (await deadline(client.listModels(), 30_000)).filter(m => m.policy?.state !== "disabled");
-      if (!models.length) throw new AppError(503, "Your Copilot account did not return any usable models. Check your subscription and organization policy.");
+      const allowed = (await deadline(client.listModels(), 30_000)).filter(m => m.policy?.state !== "disabled");
+      const models = allowed.filter(model => (modelPromptTokens(model.capabilities.limits) ?? 0) > 8192);
+      if (models.length !== allowed.length) console.warn("[model-chat] Omitted catalog entries without a usable advertised context limit:", allowed.length - models.length);
+      if (!models.length) throw new AppError(503, "Copilot did not return any allowed models with a usable advertised context limit. Check your subscription, policy and runtime.");
       catalogState.modelChatCatalog = { models, at: Date.now() };
       return models;
     } finally { await closeClient(client); }

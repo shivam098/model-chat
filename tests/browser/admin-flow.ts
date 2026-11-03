@@ -58,6 +58,7 @@ export async function runAdminFlow(page: Page, bob: Page, adminEmail: string, bo
       .composite([{ input: Buffer.from('<svg width="280" height="180"><text x="40" y="130" font-size="100" fill="black">A7</text></svg>') }]).png().toBuffer();
     await page.locator('input[type="file"]').setInputFiles({ name: "native-image.png", mimeType: "image/png", buffer: image });
     await expect(page.locator(".file-chip").filter({ hasText: "native-image.png" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Preview extracted text for native-image.png", exact: true })).toBeEnabled();
     if (process.env.MODEL_CHAT_ADMIN_LIVE_TEST === "1") {
       const vision = available.find(item => item.vision);
       expect(vision).toBeTruthy();

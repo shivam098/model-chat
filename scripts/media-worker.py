@@ -8,10 +8,9 @@ import os
 from pathlib import Path
 import sys
 
-MAX_SECONDS = 180
-MAX_TEXT = 30_000
 MAX_FRAMES = 4
 MAX_FRAME_BYTES = 512 * 1024
+PROGRESS_ENABLED = True
 FORMATS = {
     "wav": "wav", "mp3": "mp3", "m4a": "mov", "aac": "aac",
     "flac": "flac", "ogg": "ogg", "opus": "ogg",
@@ -73,33 +72,44 @@ def clock(seconds):
     return f"{int(seconds // 60):02d}:{seconds % 60:06.3f}"
 
 
-def decode_audio(file, extension):
+def progress(stage, seconds=0, duration=None):
+    if PROGRESS_ENABLED:
+        print(json.dumps({"event": "progress", "stage": stage, "seconds": seconds, "duration": duration}), flush=True)
+
+
+def audio_chunks(file, extension):
     import av
     import numpy as np
-    chunks = []
-    samples = 0
+    window_size = 30 * 16000
+    overlap = 8000
+    window = np.empty(window_size, dtype=np.float32)
+    filled = 0
+    offset = 0
     with open_media(file, extension) as container:
         if not container.streams.audio:
-            return None
+            return
         stream = container.streams.audio[0]
         stream.codec_context.thread_count = 2
         resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
-        for frame in container.decode(stream):
-            for converted in resampler.resample(frame):
-                values = converted.to_ndarray().reshape(-1)
-                samples += len(values)
-                if samples > MAX_SECONDS * 16000:
-                    raise MediaError("Media is limited to 3 minutes. Trim the recording before uploading.")
-                chunks.append(values)
-        for converted in resampler.resample(None):
-            values = converted.to_ndarray().reshape(-1)
-            samples += len(values)
-            if samples > MAX_SECONDS * 16000:
-                raise MediaError("Media is limited to 3 minutes. Trim the recording before uploading.")
-            chunks.append(values)
-    if not samples:
-        return np.zeros(0, dtype=np.float32)
-    return np.concatenate(chunks).astype(np.float32) / 32768.0
+        def converted_frames():
+            for frame in container.decode(stream):
+                yield from resampler.resample(frame)
+            yield from resampler.resample(None)
+        for converted in converted_frames():
+            values = converted.to_ndarray().reshape(-1).astype(np.float32) / 32768.0
+            position = 0
+            while position < len(values):
+                take = min(window_size - filled, len(values) - position)
+                window[filled:filled + take] = values[position:position + take]
+                filled += take
+                position += take
+                if filled == window_size:
+                    yield offset / 16000, window.copy()
+                    window[:overlap] = window[-overlap:]
+                    offset += window_size - overlap
+                    filled = overlap
+    if filled > overlap or (offset == 0 and filled):
+        yield offset / 16000, window[:filled].copy()
 
 
 def extract_frames(file, extension, duration):
@@ -122,16 +132,14 @@ def extract_frames(file, extension, duration):
             container.seek(int(target / float(stream.time_base)), stream=stream, backward=True, any_frame=False)
             chosen = None
             for index, frame in enumerate(container.decode(stream)):
-                if index >= 300:
-                    raise MediaError("Video keyframes are too far apart for bounded sampling. Re-export a shorter standard MP4.")
+                if index % 100 == 0:
+                    progress("sampling_frames", target, duration)
                 chosen = frame
                 if frame.time is None or frame.time >= target:
                     break
             if chosen is None:
                 continue
             timestamp = max(0, float(chosen.time if chosen.time is not None else target))
-            if timestamp > MAX_SECONDS + 0.5:
-                raise MediaError("Media is limited to 3 minutes.")
             identity = chosen.pts if chosen.pts is not None else round(timestamp, 3)
             if identity in seen:
                 continue
@@ -149,7 +157,7 @@ def extract_frames(file, extension, duration):
     return frames
 
 
-def process(file, model_path, model_name):
+def process(file, model_path, model_name, output_directory):
     import av
     from faster_whisper import WhisperModel
     av.logging.set_level(av.logging.ERROR)
@@ -160,49 +168,58 @@ def process(file, model_path, model_name):
         verify_signature(source.read(32), extension)
     with open_media(file, extension) as container:
         duration = float(container.duration / av.time_base) if container.duration is not None else None
-        if duration is not None and duration > MAX_SECONDS:
-            raise MediaError("Media is limited to 3 minutes. Trim the recording before uploading.")
         has_video = any(not int(stream.disposition) & 0x400 for stream in container.streams.video)
         has_audio = bool(container.streams.audio)
         if not has_video and not has_audio:
             raise MediaError("No supported audio or video stream was found.")
+    progress("sampling_frames" if has_video else "starting_transcription", 0, duration)
     frames = extract_frames(file, extension, duration) if has_video else []
-    audio = decode_audio(file, extension) if has_audio else None
-    lines = []
-    if audio is not None and len(audio):
-        duration = max(duration or 0, len(audio) / 16000)
-        model = WhisperModel(str(model_path), device="cpu", compute_type="int8", cpu_threads=4, num_workers=1, local_files_only=True)
-        segments, info = model.transcribe(audio, beam_size=1, vad_filter=True, condition_on_previous_text=False)
-        for segment in segments:
-            text = segment.text.strip()
-            if text:
-                lines.append(f"[{clock(segment.start)} - {clock(segment.end)}] {text}")
-                if sum(len(line) + 1 for line in lines) > MAX_TEXT - 1500:
-                    raise MediaError("The transcript exceeds 30,000 characters. Upload a shorter excerpt.")
-        language = info.language
-    else:
-        language = None
+    language = None
+    model = None
+    line_count = 0
+    last_end = -1
+    last_text = ""
     summary = f"[{'Video' if has_video else 'Audio'}: approximately {(duration or 0):.1f} seconds]"
-    transcript = "\n".join(lines) if lines else ("No speech detected in the audio track." if has_audio else "No audio track.")
-    text = summary + "\n[Local machine transcript; timestamps refer to the decoded audio timeline. Verify against the original.]\n" + transcript
-    if frames:
-        text += "\n[Visual sampling only: " + ", ".join(clock(frame["seconds"]) for frame in frames) + ". Unsampled motion/events are not available to the model.]"
+    with (output_directory / "text.txt").open("w", encoding="utf-8") as output:
+        output.write(summary + "\n[Local machine transcript; timestamps refer to the decoded audio timeline. Verify against the original.]\n")
+        if has_audio:
+            for offset, audio in audio_chunks(file, extension):
+                progress("transcribing", offset, duration)
+                if model is None:
+                    model = WhisperModel(str(model_path), device="cpu", compute_type="int8", cpu_threads=4, num_workers=1, local_files_only=True)
+                segments, info = model.transcribe(audio, beam_size=1, vad_filter=True, condition_on_previous_text=False)
+                language = info.language
+                for segment in segments:
+                    text = segment.text.strip()
+                    start, end = offset + segment.start, offset + segment.end
+                    if text and end > last_end + 0.05 and not (text == last_text and start < last_end + 0.5):
+                        output.write(f"[{clock(start)} - {clock(end)}] {text}\n")
+                        line_count += 1
+                        last_end, last_text = end, text
+                output.flush()
+                progress("transcribing", offset + len(audio) / 16000, duration)
+        if not line_count:
+            output.write("No speech detected in the audio track.\n" if has_audio else "No audio track.\n")
+        if frames:
+            output.write("[Visual sampling only: " + ", ".join(clock(frame["seconds"]) for frame in frames) + ". Unsampled motion/events are not available to the model.]\n")
     mime = ("video/" + ("webm" if extension == "webm" else "x-matroska" if extension == "mkv" else "x-msvideo" if extension == "avi" else "mp4")) if has_video else (
         "audio/mpeg" if extension == "mp3" else "audio/wav" if extension == "wav" else "audio/flac" if extension == "flac" else "audio/ogg" if extension in ("ogg", "opus") else "audio/aac" if extension == "aac" else "audio/webm" if extension == "webm" else "audio/x-matroska" if extension == "mkv" else "video/x-msvideo" if extension == "avi" else "audio/mp4"
     )
     return {
-        "text": text,
+        "textFile": "text.txt",
         "notes": f"Processed locally with Whisper {model_name}; {language or 'no detected speech'}; approximately {(duration or 0):.1f}s; {len(frames)} sampled video frames. Transcription can be imperfect; this is not full-fidelity audio/motion understanding.",
         "mimeType": mime, "frames": frames,
     }
 
 
 def main():
+    global PROGRESS_ENABLED
     parser = argparse.ArgumentParser()
     parser.add_argument("--probe", action="store_true")
     parser.add_argument("--model", default="large-v3-turbo")
     parser.add_argument("--model-name", default="large-v3-turbo")
     parser.add_argument("--input")
+    parser.add_argument("--output")
     args = parser.parse_args()
     os.environ["HF_HUB_OFFLINE"] = "1"
     if args.probe:
@@ -210,7 +227,16 @@ def main():
     else:
         if not args.input or not Path(args.model).is_dir():
             raise MediaError("Local media processing is not configured. Run npm run setup:media.")
-        result = process(Path(args.input), Path(args.model), args.model_name)
+        if args.output:
+            result = process(Path(args.input), Path(args.model), args.model_name, Path(args.output))
+        else:
+            # Compatibility for an already-running backend during a source update.
+            import tempfile
+            PROGRESS_ENABLED = False
+            with tempfile.TemporaryDirectory(dir=Path(args.input).parent) as temporary:
+                result = process(Path(args.input), Path(args.model), args.model_name, Path(temporary))
+                result["text"] = (Path(temporary) / "text.txt").read_text(encoding="utf-8")
+                del result["textFile"]
     print(json.dumps({"ok": True, **result}, ensure_ascii=True))
 
 
@@ -220,5 +246,5 @@ except MediaError as error:
     print(json.dumps({"ok": False, "error": str(error)}))
     sys.exit(1)
 except Exception as error:
-    print(json.dumps({"ok": False, "error": "The local media processor could not decode or transcribe this file. Check setup and try a shorter standard recording.", "kind": type(error).__name__}))
+    print(json.dumps({"ok": False, "error": "The local media processor could not decode or transcribe this file. Check setup or retry a standard encoding; the original is retained.", "kind": type(error).__name__}))
     sys.exit(1)

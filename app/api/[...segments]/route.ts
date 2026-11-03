@@ -4,9 +4,9 @@ import { getStore } from "@/lib/store";
 import { AccessService, type AccessContext } from "@/lib/access";
 import { AppError, errorResponse } from "@/lib/errors";
 import { assertLocalRequest, readBytes, readJson, requireAccess } from "@/lib/http";
-import { LIMITS, isMediaExtension, uploadByteLimit } from "@/lib/contracts";
-import { extractFile, validateFileName } from "@/lib/files";
-import { listModels, runCopilotReply } from "@/lib/copilot";
+import { LIMITS } from "@/lib/contracts";
+import { validateFileName } from "@/lib/files";
+import { listModels, modelPromptTokens, runCopilotReply } from "@/lib/copilot";
 import { buildPrompt } from "@/lib/context";
 import { createChatStream, stopReply, stopSessionReplies, hasSessionReply } from "@/lib/stream";
 import { tunnelMode } from "@/lib/config";
@@ -14,13 +14,15 @@ import { signupSchema } from "@/lib/signup";
 import { DEMO_IDS } from "@/lib/demos";
 import { createDemoChat } from "@/lib/demo-storage";
 import { nativeImages } from "@/lib/native-images";
-import { mediaStatus, processMedia, type MediaFrame } from "@/lib/media";
+import { mediaStatus } from "@/lib/media";
+import { UploadStore } from "@/lib/upload-store";
+import { receiveUpload, rejectExecutableHeader, requireDiskCapacity, UPLOAD_PART_BYTES } from "@/lib/upload-io";
+import { startFileJobs } from "@/lib/file-jobs";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 const parsingState = globalThis as typeof globalThis & { modelChatParsing?: Set<string> };
 const parsing = parsingState.modelChatParsing ||= new Set();
-const mediaState = globalThis as typeof globalThis & { modelChatMediaBusy?: boolean };
 type RouteContext = { params: Promise<{ segments: string[] }> };
 const accountId = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
 const draftSchema = z.object({
@@ -40,6 +42,7 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
     if (s.length === 1 && s[0] === "health" && method === "GET") return Response.json({ ok: true });
     if (s.length === 1 && s[0] === "access" && method === "GET") return Response.json({ registrationAllowed: true, tunnelMode });
     const store = getStore();
+    const uploads = new UploadStore(store);
     security = new AccessService(store);
     if (s[0] === "auth") {
       const endpoint = s.slice(1).join("/");
@@ -163,14 +166,18 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
       }).strict());
       if (new Set(body.fileIds).size !== body.fileIds.length) throw new AppError(400, "Repeated file IDs are not allowed.");
       store.assertIdle(user.id, chatId);
-      const files = store.contextFiles(user.id, chatId, body.fileIds);
+      store.contextFiles(user.id, chatId, body.fileIds);
       const models = await listModels();
       guard.check(ctx);
       const model = models.find(m => m.id === body.model);
       if (!model) throw new AppError(400, "That model is no longer available. Refresh the model list and select another.");
+      const promptTokens = modelPromptTokens(model.capabilities.limits);
+      if (promptTokens === undefined) throw new AppError(503, "The selected model did not publish a usable context limit. Refresh the model list and select another.");
       const images = nativeImages(store.contextImages(user.id, chatId, body.fileIds), model);
-      const prompt = buildPrompt(store.messages(user.id, chatId), files, body.content,
-        (model.capabilities.limits.max_prompt_tokens ?? model.capabilities.limits.max_context_window_tokens) - images.length * 4096);
+      const excerpts = store.contextFiles(user.id, chatId, body.fileIds, body.content);
+      const unavailable = store.attachments(user.id, chatId).filter(file => !file.messageId && file.processingStatus && file.processingStatus !== "ready").map(file => ({ name: file.name, status: file.processingStatus }));
+      const prompt = buildPrompt(store.messages(user.id, chatId), excerpts, body.content,
+        promptTokens - images.length * 4096, unavailable);
       return createChatStream(store, user.id, chatId, body.content, body.model, body.fileIds, prompt, runCopilotReply, request.signal, {
         actorId: ctx.actor.id, sessionId: ctx.sessionId, check: () => { guard.check(ctx); },
         accepted: (userMessageId, assistantId) => {
@@ -181,45 +188,91 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
       }, images);
     }
     if (s.length === 3 && s[2] === "files" && method === "POST") {
-      store.assertIdle(user.id, chatId);
-      if (parsing.size >= 2 || parsing.has(user.id)) throw new AppError(429, "Another file is being processed. Wait a moment and try again.");
+      if (parsing.size >= 2 || parsing.has(user.id)) throw new AppError(429, "Another file transfer is active. Try again when it has finished uploading.");
       parsing.add(user.id);
-      let media = false;
-      let mediaSlot = false;
+      let fileId: string | undefined;
       try {
         let name: string;
         try { name = decodeURIComponent(request.headers.get("x-file-name") || ""); }
         catch { throw new AppError(400, "Invalid file name."); }
         const extension = validateFileName(name);
-        media = isMediaExtension(extension);
-        if (media && mediaState.modelChatMediaBusy) throw new AppError(429, "Another audio/video file is being processed. Wait for it to finish and try again.");
-        if (media) { mediaState.modelChatMediaBusy = true; mediaSlot = true; }
-        const bytes = await readBytes(request, uploadByteLimit(name));
-        const result: { text: string; notes: string; mimeType?: string; frames?: MediaFrame[] } = media
-          ? await processMedia(extension, bytes, request.signal, () => { guard.check(ctx); })
-          : await extractFile(name, bytes);
-        request.signal.throwIfAborted();
-        const frames = result.frames ?? [];
-        const attachment = run("file.upload", null, () => store.addFile(user.id, chatId, name, bytes, result.text, result.notes, result.mimeType, frames), file => file.id);
-        return Response.json({ attachment }, { status: 201 });
-      } finally { parsing.delete(user.id); if (mediaSlot) mediaState.modelChatMediaBusy = false; }
+        const expected = Number(request.headers.get("content-length") || 0);
+        if (!Number.isSafeInteger(expected) || expected < 0) throw new AppError(400, "Invalid upload length.");
+        await requireDiskCapacity(expected);
+        fileId = run("file.upload.begin", null, () => uploads.create(ctx, chatId, name, extension, expected), id => id);
+        await receiveUpload(request, uploads, fileId, () => { guard.check(ctx); });
+        run("file.upload", fileId, () => {});
+        startFileJobs(store).tick();
+        return Response.json({ attachment: store.attachments(user.id, chatId).find(file => file.id === fileId) }, { status: 202 });
+      } catch (error) { if (fileId) uploads.discardIncomplete(fileId); throw error; }
+      finally { parsing.delete(user.id); }
+    }
+    if (s.length === 3 && s[2] === "files" && method === "GET") {
+      return Response.json(run("file.list", chatId, () => ({ attachments: store.attachments(user.id, chatId) })));
+    }
+    if (s.length === 4 && s[2] === "files" && s[3] === "start" && method === "POST") {
+      const input = await readJson(request, z.object({ name: z.string().max(160), size: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).strict());
+      const extension = validateFileName(input.name);
+      await requireDiskCapacity(input.size);
+      const fileId = run("file.upload.begin", null, () => uploads.create(ctx, chatId, input.name, extension, input.size), id => id);
+      return Response.json({ fileId, partBytes: UPLOAD_PART_BYTES }, { status: 201 });
+    }
+    if (s.length === 6 && s[2] === "files" && s[4] === "parts" && method === "POST") {
+      if (parsing.size >= 2 || parsing.has(user.id)) throw new AppError(429, "Another file transfer is active. Try again after this part finishes.");
+      parsing.add(user.id);
+      try {
+        const fileId = z.uuid().parse(s[3]);
+        store.fileText(user.id, chatId, fileId);
+        uploads.assertUploader(ctx, fileId);
+        const position = z.coerce.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).parse(s[5]);
+        const bytes = await readBytes(request, UPLOAD_PART_BYTES);
+        if (!bytes.length) throw new AppError(400, "Upload parts cannot be empty.");
+        if (!position) rejectExecutableHeader(bytes);
+        await requireDiskCapacity(bytes.length);
+        run("file.upload.part", fileId, () => { uploads.assertUploader(ctx, fileId); uploads.append(fileId, position, bytes); });
+        return Response.json({ received: true });
+      } finally { parsing.delete(user.id); }
+    }
+    if (s.length === 5 && s[2] === "files" && ["complete", "retry", "cancel"].includes(s[4]) && method === "POST") {
+      const fileId = z.uuid().parse(s[3]);
+      store.fileText(user.id, chatId, fileId);
+      run(`file.${s[4]}`, fileId, () => {
+        if (s[4] === "complete") { uploads.assertUploader(ctx, fileId); uploads.enqueue(fileId); }
+        else if (s[4] === "retry") uploads.retry(ctx, chatId, fileId);
+        else uploads.cancel(ctx, chatId, fileId);
+      });
+      startFileJobs(store).tick();
+      return Response.json({ attachment: store.attachments(user.id, chatId).find(file => file.id === fileId) }, { status: 202 });
     }
     if (s.length === 4 && s[2] === "files") {
       const file = store.file(user.id, chatId, s[3]);
-      if (method === "GET") return run("file.download", file.id, () => new Response(new Uint8Array(file.bytes), { headers: {
+      if (method === "GET") return run("file.download", file.id, () => {
+        if (uploads.job(file.id)?.completeUpload === 0) throw new AppError(409, "The original upload is incomplete.");
+        const original = uploads.rawChunks(file.id);
+        return new Response(new ReadableStream<Uint8Array>({
+          pull(controller) {
+            try { guard.check(ctx); const part = original.next(); if (part.done) controller.close(); else controller.enqueue(new Uint8Array(part.value)); }
+            catch (error) { controller.error(error); original.return?.(); }
+          },
+          cancel() { original.return?.(); },
+        }), { headers: {
         "Content-Type": "application/octet-stream",
         "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(file.name).replace(/'/g, "%27")}`,
         "Content-Length": String(file.size),
         "X-Content-Type-Options": "nosniff",
-      } }));
+      } });
+      });
       if (method === "DELETE") {
         run("file.delete", file.id, () => store.deleteFile(user.id, chatId, s[3]));
         return Response.json({ ok: true });
       }
     }
     if (s.length === 5 && s[2] === "files" && s[4] === "extracted" && method === "GET") {
-      const file = store.fileText(user.id, chatId, s[3]);
-      return Response.json(run("file.text.read", file.id, () => ({ name: file.name, text: file.text, notes: file.notes })));
+      const job = uploads.job(s[3]);
+      if (job && job.status !== "ready") { store.fileText(user.id, chatId, s[3]); throw new AppError(409, "This file is not ready. Processing continues in the background."); }
+      const cursor = z.coerce.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).parse(new URL(request.url).searchParams.get("cursor") || 0);
+      const file = store.fileText(user.id, chatId, s[3], cursor);
+      return Response.json(run("file.text.read", file.id, () => ({ name: file.name, text: file.text, notes: file.notes, nextCursor: file.nextCursor, chunkCount: file.chunkCount })));
     }
     throw new AppError(404, "Endpoint not found.");
   } catch (error) {

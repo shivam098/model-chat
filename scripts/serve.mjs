@@ -14,9 +14,9 @@ process.env.MODEL_CHAT_SERVER_INSTANCE = String(process.pid);
 const policy = networkPolicy(port, process.env.MODEL_CHAT_TUNNEL_ORIGIN);
 process.env.MODEL_CHAT_ORIGIN = policy.origin;
 const data = path.resolve(process.env.MODEL_CHAT_DATA_DIR || ".local");
-for (const name of ["public", ".next"]) {
+for (const name of ["public", ".next", ".next-candidate"]) {
   const webDirectory = path.resolve(name);
-  if (data === webDirectory || data.startsWith(webDirectory + path.sep)) throw new Error("MODEL_CHAT_DATA_DIR must be outside public/ and .next/.");
+  if (data === webDirectory || data.startsWith(webDirectory + path.sep)) throw new Error("MODEL_CHAT_DATA_DIR must be outside public/ and build directories.");
 }
 mkdirSync(data, { recursive: true, mode: 0o700 });
 const lock = path.join(data, "server.lock");
@@ -71,11 +71,13 @@ const server = createServer((req, res) => {
   if (policy.tunnelMode) res.setHeader("Strict-Transport-Security", "max-age=86400");
   handler(req, res);
 });
-server.requestTimeout = 30_000;
+server.requestTimeout = 0;
+server.setTimeout(120_000, socket => socket.destroy());
 server.headersTimeout = 15_000;
 server.on("error", error => { console.error(error.message); process.exit(1); });
 server.listen(port, "127.0.0.1", () => console.log(`Model Chat ready: ${process.env.MODEL_CHAT_ORIGIN}`));
 for (const signal of ["SIGINT", "SIGTERM"]) process.once(signal, () => {
+  globalThis.modelChatStopFileQueue?.();
   server.close();
   app.close().then(() => process.exit(0), error => { console.error(error.message); process.exit(1); });
   setTimeout(() => process.exit(0), 3000).unref();

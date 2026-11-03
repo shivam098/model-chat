@@ -75,10 +75,24 @@ try {
   assert.equal(modelRequests, 0, "Loading a demo must not generate an answer.");
   await first.reload();
   await expect(first.getByLabel("Message", { exact: true })).toHaveValue(/Using sample-budget.csv/);
+  const backgroundText = Buffer.from("Synthetic background material.\n".repeat(9000) + "\nVerification code: ORCHID-734.\n");
+  const accepted = first.waitForResponse(response => response.url().endsWith("/complete") && response.request().method() === "POST");
+  await first.locator('input[type="file"]').setInputFiles({ name: "background-notes.txt", mimeType: "text/plain", buffer: backgroundText });
+  const queued = await accepted;
+  assert.equal(queued.status(), 202);
+  const backgroundFile = (await queued.json()).attachment;
+  await expect(first.getByRole("button", { name: "Preview extracted text for background-notes.txt", exact: true })).toBeEnabled({ timeout: 45_000 });
+  const originalBytes = await first.request.get(`/api/chats/${sampleId}/files/${backgroundFile.id}`);
+  assert.deepEqual(await originalBytes.body(), backgroundText);
+  await first.getByLabel("Message", { exact: true }).fill("Using sample-budget.csv, give the planned and actual totals. Also find the verification code in background-notes.txt and include it. Keep your answer short.");
   await expect(first.getByRole("button", { name: "Send message", exact: true })).toBeEnabled({ timeout: 45_000 });
+  const sending = first.waitForResponse(response => response.url().endsWith("/messages") && response.request().method() === "POST");
   await first.getByRole("button", { name: "Send message", exact: true }).click();
+  const sent = await sending;
+  assert.equal(sent.status(), 200, sent.status() === 200 ? undefined : await sent.text());
   await expect(first.locator(".message.assistant").last()).toContainText("620", { timeout: 120_000 });
   await expect(first.locator(".message.assistant").last()).toContainText("645", { timeout: 120_000 });
+  await expect(first.locator(".message.assistant").last()).toContainText("ORCHID-734", { timeout: 120_000 });
   await expect(first.getByRole("button", { name: "Stop reply", exact: true })).toHaveCount(0, { timeout: 120_000 });
   assert.equal(modelRequests, 1, "Exactly one explicit Send should make one model request.");
   await first.screenshot({ path: "test-results/public-budget-answer.png", fullPage: true, animations: "disabled" });
@@ -86,6 +100,9 @@ try {
   const second = await register(`modelchat-public-${randomUUID()}@example.test`);
   assert.equal((await second.request.get(`/api/chats/${sampleId}`)).status(), 404);
   assert.equal((await second.request.get(`/api/chats/${sampleId}/files/${sample.attachments[0].id}`)).status(), 404);
+  assert.equal((await second.request.get(`/api/chats/${sampleId}/files/${backgroundFile.id}/extracted`)).status(), 404);
+  assert.equal((await second.request.post(`/api/chats/${sampleId}/files/${backgroundFile.id}/retry`, { headers: { origin } })).status(), 404);
+  assert.equal((await second.request.get("/api/admin/users")).status(), 403);
   assert.equal((await second.request.post("/api/demos", { headers: { origin }, data: { demoId: "writing", previous: { chatId: old.id, draft: "overwrite" } } })).status(), 404);
   await second.setViewportSize({ width: 390, height: 844 });
   await demoMenu(second);
@@ -112,7 +129,7 @@ try {
   await expect(second.getByRole("heading", { name: "What's on your mind?" })).toBeVisible();
   assert.equal((await second.request.get(`/api/chats/${secondChat}`)).status(), 200);
   assert.deepEqual(pageErrors, []);
-  console.log("Public HTTPS signup (including Gmail), no-OTP session, login/logout, validation errors, two-account isolation, desktop/mobile demos and one real file-grounded reply passed.");
+  console.log("Public HTTPS signup, login/logout, two-account/admin isolation, desktop/mobile demos, background upload/indexing/download and one real reply using a retrieved large-file excerpt passed.");
 } finally {
   for (const context of contexts) {
     try { await context.request.post("/api/auth/sign-out", { headers: { origin }, data: {} }); }

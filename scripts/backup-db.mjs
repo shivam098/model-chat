@@ -8,10 +8,10 @@ env.loadEnvConfig(process.cwd());
 const data = path.resolve(process.env.MODEL_CHAT_DATA_DIR || ".local");
 const database = path.join(data, "model-chat.db");
 const quote = name => `"${name.replaceAll('"', '""')}"`;
-function fingerprint(db, table, columns) {
+function fingerprint(db, table, columns, orderBy = ["rowid"]) {
   const hash = createHash("sha256");
   let count = 0;
-  for (const row of db.prepare(`SELECT ${columns.map(quote).join(",")} FROM ${quote(table)} ORDER BY rowid`).raw().iterate()) {
+  for (const row of db.prepare(`SELECT ${columns.map(quote).join(",")} FROM ${quote(table)} ORDER BY ${orderBy.map(quote).join(",")}`).raw().iterate()) {
     const serialized = JSON.stringify(row);
     hash.update(String(Buffer.byteLength(serialized))).update(":").update(serialized);
     count++;
@@ -25,7 +25,7 @@ if (verify >= 0) {
   try {
     let matches = true;
     for (const table of manifest.tables) {
-      const current = fingerprint(db, table.name, table.columns);
+      const current = fingerprint(db, table.name, table.columns, table.orderBy);
       const match = current.count === table.count && current.sha256 === table.sha256;
       matches &&= match;
       console.log(JSON.stringify({ table: table.name, rows: current.count, preserved: match }));
@@ -42,8 +42,11 @@ if (verify >= 0) {
   try {
     snapshot.pragma("journal_mode = DELETE");
     const tables = snapshot.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(({ name }) => {
-      const columns = snapshot.pragma(`table_info(${quote(name)})`).map(column => column.name);
-      return { name, columns, ...fingerprint(snapshot, name, columns) };
+      const info = snapshot.pragma(`table_info(${quote(name)})`);
+      const columns = info.map(column => column.name);
+      const primary = info.filter(column => column.pk).sort((a, b) => a.pk - b.pk).map(column => column.name);
+      const orderBy = primary.length ? primary : ["rowid"];
+      return { name, columns, orderBy, ...fingerprint(snapshot, name, columns, orderBy) };
     });
     const manifestPath = path.join(directory, "preservation.json");
     writeFileSync(manifestPath, JSON.stringify({ createdAt: new Date().toISOString(), backupPath, tables }, null, 2), { mode: 0o600 });

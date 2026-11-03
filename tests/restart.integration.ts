@@ -7,6 +7,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { Store } from "../lib/store";
+import { AccessService } from "../lib/access";
+import { UploadStore } from "../lib/upload-store";
 
 test("full server restart retains auth sessions, isolated histories, files and interrupted reply", { timeout: 90_000 }, async () => {
   const directory = await mkdtemp(path.resolve(".local", "restart-test-"));
@@ -53,8 +55,13 @@ test("full server restart retains auth sessions, isolated histories, files and i
     const file = await fetch(origin + `/api/chats/${chat.id}/files`, {
       method: "POST", headers: { origin, cookie, "X-File-Name": "persist.txt" }, body: "Persistent file content.",
     });
-    assert.equal(file.status, 201);
+    assert.equal(file.status, 202);
     const attachment = (await file.json()).attachment;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const result = await (await request(`/api/chats/${chat.id}/files`, cookie)).json();
+      if (result.attachments[0].processingStatus === "ready") break;
+      await delay(100);
+    }
     await stop();
     const db = new Database(path.join(directory, "model-chat.db"));
     const store = new Store(db);
@@ -62,8 +69,23 @@ test("full server restart retains auth sessions, isolated histories, files and i
     store.saveReply(account.user.id, chat.id, turn.assistant.id, "Interrupted partial answer", "streaming");
     const hash = (db.prepare("SELECT password FROM account WHERE userId=?").get(account.user.id) as { password: string }).password;
     assert.ok(hash && hash !== password && !hash.includes(password));
+    const session = db.prepare("SELECT id FROM session WHERE userId=?").get(account.user.id) as { id: string };
+    const uploads = new UploadStore(store);
+    const context = new AccessService(store).resolve(account.user.id, session.id);
+    const pending = uploads.create(context, chat.id, "interrupted.txt", "txt", 32);
+    uploads.append(pending, 0, Buffer.from("Process this file after restart."));
+    uploads.enqueue(pending);
+    assert.equal(uploads.claim(false)?.fileId, pending);
     db.close();
     await start();
+    const observer = new Database(path.join(directory, "model-chat.db"), { readonly: true });
+    try {
+      const jobStatus = () => (observer.prepare("SELECT status FROM app_file_job WHERE fileId=?").get(pending) as { status: string }).status;
+      for (let attempt = 0; attempt < 100 && jobStatus() !== "ready"; attempt++) await delay(100);
+      assert.equal(jobStatus(), "ready", "Restarted processing must finish without a browser or authenticated request");
+      const chunks = observer.prepare("SELECT content FROM app_text_chunk WHERE fileId=? ORDER BY position").all(pending) as { content: string }[];
+      assert.equal(chunks.map(chunk => chunk.content).join(""), "Process this file after restart.");
+    } finally { observer.close(); }
     assert.equal((await request("/api/account", cookie)).status, 200, "Server-side session survives restart");
     const restored = await (await request(`/api/chats/${chat.id}`, cookie)).json();
     assert.equal(restored.messages[0].content, "Saved user question");

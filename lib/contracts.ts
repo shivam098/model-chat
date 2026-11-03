@@ -1,11 +1,7 @@
 export const LIMITS = {
   fileBytes: 5 * 1024 * 1024,
-  mediaBytes: 25 * 1024 * 1024,
-  mediaSeconds: 180,
   videoFrames: 4,
   videoFrameBytes: 512 * 1024,
-  userFileBytes: 50 * 1024 * 1024,
-  filesPerChat: 8,
   filesPerMessage: 4,
   fileCharacters: 30_000,
   chatFileCharacters: 60_000,
@@ -17,7 +13,6 @@ export const LIMITS = {
 };
 export const MEDIA_EXTENSIONS = ["mp3", "wav", "m4a", "aac", "flac", "ogg", "opus", "mp4", "mov", "webm", "mkv", "avi"];
 export function isMediaExtension(extension: string) { return MEDIA_EXTENSIONS.includes(extension.toLowerCase()); }
-export function uploadByteLimit(name: string) { return isMediaExtension(name.split(".").at(-1) || "") ? LIMITS.mediaBytes : LIMITS.fileBytes; }
 export const FILE_ACCEPT = ".txt,.md,.csv,.json,.log,.yaml,.yml,.xml,.pdf,.docx,.xlsx,.png,.jpg,.jpeg,.webp,.gif,.mp3,.wav,.m4a,.aac,.flac,.ogg,.opus,.mp4,.mov,.webm,.mkv,.avi";
 export interface NativeImage { type: "blob"; data: string; mimeType: string; displayName: string }
 export type MessageStatus = "complete" | "streaming" | "cancelled" | "error";
@@ -50,6 +45,11 @@ export interface Attachment {
   createdAt: number;
   mimeType?: string;
   frameCount?: number;
+  processingStatus?: "uploading" | "queued" | "processing" | "ready" | "failed" | "cancelled";
+  processingStage?: string | null;
+  processingProgress?: number | null;
+  processingError?: string | null;
+  uploadComplete?: number;
 }
 export interface ChatDetail {
   chat: Chat;

@@ -6,7 +6,7 @@ import path from "node:path";
 import { Store } from "../lib/store";
 import { buildPrompt } from "../lib/context";
 import { createChatStream, stopReply } from "../lib/stream";
-import { safeSessionConfig } from "../lib/copilot";
+import { modelPromptTokens, safeSessionConfig } from "../lib/copilot";
 import { assertLocalRequest, readBytes } from "../lib/http";
 import { runtimeEnvironment } from "../lib/runtime-env.mjs";
 import { dictationConstructor, voiceError } from "../lib/voice";
@@ -60,14 +60,17 @@ test("reopen and model switch retain exact owned context and sent files", () => 
     assert.equal((reopened.prepare("SELECT count(*) n FROM app_file").get() as { n: number }).n, 0);
   } finally { reopened.close(); rmSync(directory, { recursive: true, force: true }); }
 });
-test("context and per-chat file budgets reject overflow rather than dropping data", () => {
+test("model context stays bounded while stored file contents are not capped or discarded", () => {
   assert.throws(() => buildPrompt([], [{ id: "x", name: "huge", text: "x".repeat(LIMITS.promptBytes) }], "question"), /budget/);
   assert.throws(() => buildPrompt([], [], "hi", 100), /budget/);
   const { db, store, chat } = fixture();
   try {
     store.addFile("alice", chat.id, "one.txt", Buffer.from("1"), "x".repeat(30_000), "");
     store.addFile("alice", chat.id, "two.txt", Buffer.from("2"), "x".repeat(30_000), "");
-    assert.throws(() => store.addFile("alice", chat.id, "three.txt", Buffer.from("3"), "x", ""), /60,000/);
+    const third = store.addFile("alice", chat.id, "three.txt", Buffer.from("3"), "x".repeat(90_000), "");
+    assert.equal(store.file("alice", chat.id, third.id).text.length, 90_000);
+    assert.match(store.contextFiles("alice", chat.id, [third.id])[0].text, /Selected excerpts/);
+    assert.ok(store.contextFiles("alice", chat.id, [third.id])[0].text.length <= LIMITS.chatFileCharacters);
     const turn = store.beginTurn("alice", chat.id, "hello", "m", []);
     assert.throws(() => store.beginTurn("alice", chat.id, "race", "m", []), /in progress/);
     assert.throws(() => store.deleteChat("alice", chat.id), /in progress/);
@@ -120,6 +123,12 @@ test("output limit and empty replies are explicit saved states", async () => {
     await createChatStream(store, "alice", chat.id, "Empty", "m", [], "", async () => {}, new AbortController().signal).text();
     assert.equal(store.messages("alice", chat.id).at(-1)?.status, "error");
   } finally { db.close(); }
+});
+test("model context metadata uses positive reported limits, never a zero placeholder or an invented capacity", () => {
+  assert.equal(modelPromptTokens({ max_context_window_tokens: 0 }), undefined);
+  assert.equal(modelPromptTokens({ max_context_window_tokens: 128000, max_prompt_tokens: 0 }), 128000);
+  assert.equal(modelPromptTokens({ max_context_window_tokens: 128000, max_prompt_tokens: 100000 }), 100000);
+  assert.equal(modelPromptTokens({ max_context_window_tokens: 128000, max_prompt_tokens: NaN }), 128000);
 });
 test("runtime config explicitly disables tools, discovery, skills and cross-session state", async () => {
   const config = safeSessionConfig("live-model-id", path.resolve(".local", "test"), "test");

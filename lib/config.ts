@@ -4,10 +4,10 @@ import path from "node:path";
 import { networkPolicy } from "./network-policy.mjs";
 
 export const dataDirectory = path.resolve(process.env.MODEL_CHAT_DATA_DIR || ".local");
-for (const name of ["public", ".next"]) {
+for (const name of ["public", ".next", ".next-candidate"]) {
   const webDirectory = path.resolve(name);
   if (dataDirectory === webDirectory || dataDirectory.startsWith(webDirectory + path.sep)) {
-    throw new Error("MODEL_CHAT_DATA_DIR must be outside public/ and .next/.");
+    throw new Error("MODEL_CHAT_DATA_DIR must be outside public/ and build directories.");
   }
 }
 export const { origin, tunnelMode } = networkPolicy(process.env.PORT || 3210, process.env.MODEL_CHAT_TUNNEL_ORIGIN);

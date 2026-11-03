@@ -1,6 +1,7 @@
 import type { NextConfig } from "next";
 
 const config: NextConfig = {
+  distDir: process.env.MODEL_CHAT_CANDIDATE_BUILD === "1" ? ".next-candidate" : ".next",
   poweredByHeader: false,
   serverExternalPackages: ["@github/copilot-sdk", "better-sqlite3"],
   async headers() {

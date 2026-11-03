@@ -18,7 +18,7 @@ async function signUp(page: Page, address: string) {
   await expect(page.getByRole("heading", { name: "What's on your mind?" })).toBeVisible();
 }
 test("accounts, ownership, files, histories, password validation and responsive UI", async ({ page, browser }) => {
-  if (process.env.MODEL_CHAT_MEDIA_TEST === "1") test.setTimeout(300_000);
+  if (process.env.MODEL_CHAT_MEDIA_TEST === "1") test.setTimeout(600_000);
   const errors: string[] = [];
   page.on("pageerror", error => errors.push(error.message));
   await signUp(page, email);
@@ -74,11 +74,17 @@ test("accounts, ownership, files, histories, password validation and responsive 
   expect((await page.request.get("/api/chats", { headers: { "sec-fetch-site": "cross-site" } })).status()).toBe(403);
   expect((await page.request.get("/", { headers: { "sec-fetch-site": "cross-site", "sec-fetch-mode": "navigate" } })).status()).toBe(200);
   const binary = await page.request.post(`/api/chats/${chatId}/files`, { headers: { origin, "x-file-name": "bad.txt" }, data: Buffer.from([0, 1, 2]) });
-  expect(binary.status()).toBe(422);
+  expect(binary.status()).toBe(202);
+  const badId = (await binary.json()).attachment.id;
+  await expect.poll(async () => (await (await page.request.get(`/api/chats/${chatId}/files`)).json()).attachments.find((file: { id: string }) => file.id === badId).processingStatus).toBe("failed");
+  expect((await page.request.delete(`/api/chats/${chatId}/files/${badId}`, { headers: { origin } })).status()).toBe(200);
   const executable = await page.request.post(`/api/chats/${chatId}/files`, { headers: { origin, "x-file-name": "run.exe" }, data: "exe" });
   expect(executable.status()).toBe(415);
-  const tooLarge = await page.request.post(`/api/chats/${chatId}/files`, { headers: { origin, "x-file-name": "large.txt" }, data: Buffer.alloc(5 * 1024 * 1024 + 1) });
-  expect(tooLarge.status()).toBe(413);
+  const large = await page.request.post(`/api/chats/${chatId}/files`, { headers: { origin, "x-file-name": "large.txt" }, data: Buffer.alloc(5 * 1024 * 1024 + 1, "a") });
+  expect(large.status()).toBe(202);
+  const largeId = (await large.json()).attachment.id;
+  await expect.poll(async () => (await (await page.request.get(`/api/chats/${chatId}/files`)).json()).attachments.find((file: { id: string }) => file.id === largeId).processingStatus).toBe("ready");
+  expect((await page.request.delete(`/api/chats/${chatId}/files/${largeId}`, { headers: { origin } })).status()).toBe(200);
   let modelRequests = 0;
   page.on("request", request => { if (/\/messages$/.test(new URL(request.url()).pathname)) modelRequests++; });
   await page.getByLabel("Message", { exact: true }).fill("Keep this draft and the attached file.");
@@ -212,6 +218,7 @@ test("live Copilot streaming and switched-model file context", async ({ page }) 
   await page.getByRole("combobox", { name: "Select model" }).selectOption(choices[0].id);
   await page.locator('input[type="file"]').setInputFiles({ name: "sample.txt", mimeType: "text/plain", buffer: Buffer.from("The project's code word is BIRCH42.") });
   await expect(page.locator(".file-chip").filter({ hasText: "sample.txt" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Preview extracted text for sample.txt", exact: true })).toBeEnabled();
   await page.getByLabel("Message", { exact: true }).fill("What is the code word in the file? Answer in one short sentence.");
   await page.getByRole("button", { name: "Send message" }).click();
   await expect(page.getByRole("button", { name: "Stop reply" })).toBeVisible();
