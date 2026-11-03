@@ -2,10 +2,10 @@ import type { ModelInfo } from "@github/copilot-sdk";
 import { z } from "zod";
 import { AppError } from "./errors";
 import { LIMITS, type ImageSource } from "./contracts";
-import { analysisExcerpt, buildPrompt, promptByteBudget, SYSTEM_INSTRUCTION, type ImageContext } from "./context";
+import { analysisExcerpt, buildPrompt, promptByteBudget, SYSTEM_INSTRUCTION, TOOL_INSTRUCTION_RESERVE, type ImageContext } from "./context";
 import { modelPromptTokens, type ReplyInput, type ReplyRunner } from "./copilot";
 import { nativeImages } from "./native-images";
-import type { Store } from "./store";
+import { GENERATED_CONTEXT_FILES, generatedFileSummary, type Store } from "./store";
 
 type AnalysisAudit = (imageId: string, outcome: "allowed" | "denied" | "error", reason: string) => void;
 const analysisResult = z.object({
@@ -41,6 +41,8 @@ export function prepareImageTurn(store: Store, userId: string, chatId: string, c
   const messages = store.messages(userId, chatId);
   const attachments = store.attachments(userId, chatId);
   const selected = attachments.filter(file => file.messageId || fileIds.includes(file.id));
+  const userFiles = selected.filter(file => file.messageRole !== "assistant");
+  const generatedFiles = selected.filter(file => file.messageRole === "assistant").slice(-GENERATED_CONTEXT_FILES);
   const unavailable = attachments.filter(file => !file.messageId && !fileIds.includes(file.id))
     .map(file => ({ name: file.name, status: file.processingStatus === "ready" ? "not_selected" : file.processingStatus }));
   const sources = store.imageSources(userId, chatId, fileIds);
@@ -68,13 +70,16 @@ export function prepareImageTurn(store: Store, userId: string, chatId: string, c
       };
     });
     const promptTokens = tokens - direct.length * 4096;
-    const skeleton = buildPrompt(messages, selected.map(file => ({ id: file.id, name: file.name, text: "" })), content, promptTokens, unavailable,
+    const skeleton = buildPrompt(messages, [
+      ...userFiles.map(file => ({ id: file.id, name: file.name, text: "" })),
+      ...generatedFiles.map(file => ({ id: file.id, name: file.name, text: generatedFileSummary(file) })),
+    ], content, promptTokens, unavailable,
       imageContext.map(image => image.analysis ? { ...image, analysis: "" } : image));
-    const available = Math.min(LIMITS.chatFileCharacters, promptByteBudget(promptTokens) - Buffer.byteLength(SYSTEM_INSTRUCTION) - Buffer.byteLength(skeleton) - 1024);
-    const count = selected.length + imageContext.filter(image => image.analysis).length;
+    const available = Math.min(LIMITS.chatFileCharacters, promptByteBudget(promptTokens) - Buffer.byteLength(SYSTEM_INSTRUCTION) - TOOL_INSTRUCTION_RESERVE - Buffer.byteLength(skeleton) - 1024);
+    const count = userFiles.length + imageContext.filter(image => image.analysis).length;
     const perText = Math.floor(available / Math.max(1, count));
     if (count && perText < 256) throw new AppError(400, "This conversation leaves too little context for every attached file. Start another chat or select a larger-context model; no files were discarded.");
-    const files = store.contextFiles(userId, chatId, accepted ? [] : fileIds, content, perText * Math.max(1, selected.length));
+    const files = store.contextFiles(userId, chatId, accepted ? [] : fileIds, content, perText * Math.max(1, userFiles.length));
     return buildPrompt(messages, files, content, promptTokens, unavailable, imageContext.map(image =>
       image.analysis ? { ...image, analysis: analysisExcerpt(image.analysis, perText) } : image));
   };
@@ -92,7 +97,7 @@ Return only JSON matching {"images":[{"id":"exact supplied image id","analysis":
       const analysisPrompt = buildPrompt([], batch.map(source => ({ id: source.id, name: source.name, text: "Supplied image pixels; use this exact id in the JSON response." })), task, tokens - images.length * 4096);
       try {
         for (const source of batch) audit?.(source.id, "allowed", "request_started");
-        const result = await collectAnalysis(runner, { ...input, prompt: analysisPrompt, images });
+        const result = await collectAnalysis(runner, { ...input, tools: undefined, toolInstruction: undefined, prompt: analysisPrompt, images });
         if (result.length !== batch.length || new Set(result.map(item => item.id)).size !== batch.length || result.some(item => !batch.some(source => source.id === item.id))) {
           throw new AppError(502, "Copilot did not analyze every requested image. All attachments are saved, but no combined answer was generated.");
         }

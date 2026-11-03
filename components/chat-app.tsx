@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { ArrowDown, ArrowUp, BookOpen, Check, ChevronDown, Eye, FileText, Leaf, LoaderCircle, LogOut, Menu, MessageSquare, Mic, PanelLeft, Paperclip, Pencil, Plus, RefreshCw, Settings2, ShieldCheck, Square, Trash2, Volume2, X } from "lucide-react";
+import { ArrowDown, ArrowUp, BookOpen, Check, ChevronDown, Code2, Eye, FileText, Leaf, LoaderCircle, LogOut, Menu, MessageSquare, Mic, PanelLeft, Paperclip, Pencil, Plus, RefreshCw, Settings2, ShieldCheck, Square, Trash2, Volume2, X } from "lucide-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { FILE_ACCEPT, LIMITS, type Attachment, type Chat, type ChatDetail, type Model, type StreamEvent } from "@/lib/contracts";
@@ -46,6 +46,7 @@ export function ChatApp() {
   const [transfers, setTransfers] = useState<Transfer[]>([]);
   const [streamStage, setStreamStage] = useState("Thinking");
   const [mediaInfo, setMediaInfo] = useState<{ ready: boolean; model: string | null; message: string } | null>(null);
+  const [sandboxInfo, setSandboxInfo] = useState<{ ready: boolean; message: string; libraries: string[]; limits: { wallSeconds: number; memoryBytes: number; workBytes: number; outputFiles: number; cpus: number } | null } | null>(null);
   const [filePreview, setFilePreview] = useState<{ name: string; text: string; notes: string; nextCursor: number | null; cursor: number; file: Attachment } | null>(null);
   const [draft, setDraft] = useState("");
   const [sidebar, setSidebar] = useState(false);
@@ -190,6 +191,9 @@ export function ChatApp() {
     api<{ ready: boolean; model: string | null; message: string }>("/api/media-status")
       .then(result => { if (alive) setMediaInfo(result); })
       .catch(error => { if (alive) setMediaInfo({ ready: false, model: null, message: message(error) }); });
+    api<NonNullable<typeof sandboxInfo>>("/api/sandbox-status")
+      .then(result => { if (alive) setSandboxInfo(result); })
+      .catch(error => { if (alive) setSandboxInfo({ ready: false, message: message(error), libraries: [], limits: null }); });
     return () => { alive = false; };
     // Account changes reset and reload this account's data only.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -465,6 +469,12 @@ export function ChatApp() {
           }));
         } else if (item.type === "progress") {
           setStreamStage(item.stage);
+        } else if (item.type === "attachments") {
+          const chatForFiles = chatId;
+          void api<{ attachments: Attachment[] }>(`/api/chats/${chatForFiles}/files`).then(result => {
+            if (userRef.current?.id !== ownerId || workspaceEpoch.current !== epoch) return;
+            setDetail(previous => previous && previous.chat.id === chatForFiles ? { ...previous, attachments: result.attachments } : previous);
+          }).catch(report);
         } else if (item.type === "delta" || item.type === "replace") {
           setDetail(previous => previous && ({ ...previous, messages: previous.messages.map((m, index) => index === previous.messages.length - 1 ?
             { ...m, content: item.type === "delta" ? m.content + item.text : item.text } : m) }));
@@ -726,6 +736,7 @@ export function ChatApp() {
           <li>Sign in, choose an available Copilot model, and write a question or load an example below.</li>
           <li>Press Send for a real streamed answer. Stop keeps any partial reply. Ordinary accounts have separate chats; the app superuser can view chats/files and act as users, with an audit log.</li>
           <li>Attach supported documents to ask questions about them. Reopen chats or switch models without losing their saved context.</li>
+          <li>Ask for a PDF, chart, GIF/MP4 animation or Word/Excel/PowerPoint file. The model runs Python in an offline, disposable sandbox on the host and attaches the results; it cannot browse the internet or install software. See Files &amp; privacy for its libraries and limits.</li>
         </ol>
         <p>All accounts use the host owner&apos;s Copilot quota. Prompts and extracted file text are sent to Copilot; availability and usage limits apply.</p>
       </div>
@@ -795,6 +806,7 @@ export function ChatApp() {
               <button onClick={() => { setDraft("Help me think through an idea. Ask me one useful question to get started."); setDraftState("saving"); composer.current?.focus(); }}><MessageSquare size={20} /><strong>Think it through</strong><span>Find a new perspective</span></button>
               <button onClick={() => fileInput.current?.click()} disabled={locked}><FileText size={20} /><strong>Explore a document</strong><span>Turn information into insight</span></button>
               <button onClick={() => { setDraft("Help me write something clear and concise. Ask what I want to communicate."); setDraftState("saving"); composer.current?.focus(); }}><Pencil size={20} /><strong>Find the right words</strong><span>Bring a first draft to life</span></button>
+              {sandboxInfo?.ready && <button onClick={() => { setDraft("Create a one-page PDF report and a matching bar-chart PNG for these sample figures: Q1 = 12, Q2 = 18, Q3 = 15, Q4 = 22. Include a short summary in the PDF."); setDraftState("saving"); composer.current?.focus(); }}><Code2 size={20} /><strong>Make a file</strong><span>PDF, chart, GIF/MP4 or Office</span></button>}
             </div>}
           </div> : <div className="message-list">
             {detail.messages.map(item => <article key={item.id} className={`message ${item.role}`} aria-label={`${item.role === "user" ? "Your" : "Assistant"} message`}>
@@ -807,7 +819,16 @@ export function ChatApp() {
                   a: ({ href, children }) => <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>,
                 }}>{item.content}</Markdown> : item.status === "streaming" ? <span className="thinking"><i /><i /><i />{busy ? streamStage : "Processing attachments or generating reply"}</span> : <p className="muted">No answer was generated.</p>}
               </div> : <div className="user-text">{item.content}</div>}
-              {detail.attachments.filter(f => f.messageId === item.id).map(file => <span key={file.id}><a className="file-chip sent" title={file.notes} href={`/api/chats/${file.chatId}/files/${file.id}`}><FileText size={14} /><span>{file.name}</span><ArrowDown size={13} /></a><IconButton label={`Preview extracted text for ${file.name}`} onClick={() => void previewFile(file)}><Eye size={14} /></IconButton></span>)}
+              {item.status === "streaming" && busy && item.content && <div className="tool-stage" role="status"><LoaderCircle className="spin" size={13} />{streamStage}</div>}
+              {detail.attachments.filter(f => f.messageId === item.id && f.preview && f.preview !== "pdf").map(file => {
+                const source = `/api/chats/${file.chatId}/files/${file.id}/preview`;
+                return file.preview === "image"
+                  ? <img key={`preview-${file.id}`} className="generated-preview" src={source} alt={`Generated ${file.name}`} loading="lazy" />
+                  : <video key={`preview-${file.id}`} className="generated-preview" src={source} controls preload="metadata" aria-label={`Generated ${file.name}`} />;
+              })}
+              {detail.attachments.filter(f => f.messageId === item.id).map(file => <span key={file.id}><a className="file-chip sent" title={file.notes} href={`/api/chats/${file.chatId}/files/${file.id}`}><FileText size={14} /><span>{file.name}</span><ArrowDown size={13} /></a>
+                {file.preview === "pdf" ? <a className="icon-button" aria-label={`Open PDF preview of ${file.name}`} title="Open PDF preview" href={`/api/chats/${file.chatId}/files/${file.id}/preview`} target="_blank" rel="noopener noreferrer"><Eye size={14} /></a>
+                  : <IconButton label={`Preview extracted text for ${file.name}`} onClick={() => void previewFile(file)}><Eye size={14} /></IconButton>}</span>)}
               {item.error && <div className={`message-status ${item.status}`} role="status">{item.error}</div>}
               {item.role === "assistant" && item.content && item.status !== "streaming" && <button className={`read-aloud ${speaking === item.id ? "active" : ""}`} disabled={!speechAvailable} onClick={() => readAloud(item.id, item.content)}><Volume2 size={14} />{speaking === item.id ? "Stop reading" : "Read aloud"}</button>}
             </article>)}
@@ -883,6 +904,7 @@ export function ChatApp() {
         <p>TXT, Markdown, CSV, JSON, LOG, YAML/XML, selectable-text PDF, DOCX, XLSX, PNG/JPEG/WebP/static GIF, and the listed audio/video formats remain supported. There is no preset total file-size or storage quota; disk reserves and decoder safeguards still apply. Images are normalized for model input (16 MP/8192-pixel source limit); video frames have a 4096-pixel limit. No scanned-PDF OCR, macros or executable uploads. Context and model output remain finite; original files and saved prompts are not truncated.</p>
         <p>Download originals from message chips. X removes unsent files; deleting a chat removes its files and saved image analyses. Histories and drafts survive user/chat switches. Up to 100 chats and 100 turns per chat remain.</p>
       </div>
+      <div className="settings-section"><h3><Code2 size={16} /> Code runner (files, charts, animations)</h3><p>{sandboxInfo?.message || "Checking the code runner..."}</p>{sandboxInfo?.ready && <><p>Ask for a PDF report, chart, GIF/MP4 animation, or Word/Excel/PowerPoint file. The model writes Python that runs in a disposable Linux sandbox on this computer (WSL). Each run has <strong>no internet or network access</strong>, cannot install packages, cannot see Windows, other chats or other users, and is deleted afterwards. Only files from this chat that the model selects are copied in.{sandboxInfo.limits && <> Limits per run: about {sandboxInfo.limits.wallSeconds} seconds, {sandboxInfo.limits.cpus} CPUs, {Math.round(sandboxInfo.limits.memoryBytes / 1024 ** 3)} GB memory, {Math.round(sandboxInfo.limits.workBytes / 1024 ** 2)} MB scratch space and {sandboxInfo.limits.outputFiles} output files; up to 8 runs per reply.</>}</p><p>Available libraries: {sandboxInfo.libraries.join(", ")}. Only the host owner can add libraries, using a command on this computer; they cannot be installed from chat.</p><p>Results are attached to the reply as downloads. PNG/JPEG/GIF/WebP images, MP4/WebM videos and PDFs also get previews; other types such as HTML or SVG are download-only. Generated code can be wrong; check important results. Runs use the host owner&apos;s Copilot quota like any message.</p></>}</div>
       <div className="settings-section"><h3><Mic size={16} /> Local audio/video processing</h3><p>{mediaInfo?.message || "Checking local media configuration..."} {mediaInfo?.ready && <>Whisper model: {mediaInfo.model}, running on this computer&apos;s CPU.</>}</p><p>MP3, WAV, M4A, AAC, FLAC, OGG, OPUS, MP4, MOV, WEBM, MKV and AVI are accepted when their streams are decodable. Speech becomes a machine transcript; video also supplies up to four still frames. Copilot receives those extracted inputs when you press Send, not native audio/video. Transcription can be imperfect, and unsampled visual events may be missed.</p><p>One recording and one document can process at a time; others wait in a durable queue. No media-duration or overall-processing deadline is imposed. Long recordings are decoded/transcribed in bounded-memory windows, and processing may take a long time. Closing the browser does not discard accepted uploads. Interrupted jobs resume from the beginning after a server restart. Administrator-created delegated jobs stop if that administrator loses access or signs out. Transcription uses installed local packages/cached weights, without a speech API key. Public-link uploads pass through Cloudflare.</p></div>
       <div className="settings-section"><h3><ShieldCheck size={16} /> Administrator access</h3><p>The app superuser can view users&apos; chat sessions and files and act as a user to send messages or modify chats. An audit log records the real actor, effective user, action, object IDs, time and outcome—not prompt/file contents or credentials. {acting && <>You are still signed in as {actor?.email}; signing out ends that real login session.</>}</p></div>
       <div className="settings-section"><h3><Mic size={16} /> Voice, without the surprises</h3><p>Dictation uses browser speech recognition, not a realtime audio model. Your browser may send microphone audio to its speech provider. Read-aloud uses your browser&apos;s voices, which may also use an online service. Text works without either feature.</p><p>No email verification, password reset, or recovery service is configured. Use a unique password and keep a local backup. A temporary shared preview is not production hosting.</p></div>

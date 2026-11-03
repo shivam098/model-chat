@@ -8,10 +8,14 @@ import { AccessService } from "../../lib/access";
 import { setTimeout as delay } from "node:timers/promises";
 
 test("multiple mixed attachments transfer concurrently, survive reload, remove cleanly and submit together", async ({ page, browser }) => {
-  test.setTimeout(120000);
+  test.setTimeout(240000);
   const origin = "http://127.0.0.1:3211";
   const email = `multi-${randomUUID()}@example.test`;
-  const response = await page.request.post("/api/auth/sign-up/email", { headers: { origin }, data: { email, password: "Synthetic test-only pass! 5678" } });
+  let response = await page.request.post("/api/auth/sign-up/email", { headers: { origin }, data: { email, password: "Synthetic test-only pass! 5678" } });
+  if (response.status() === 429) {
+    await delay(61000); // The shared test server keeps the real five-signups-per-minute guard.
+    response = await page.request.post("/api/auth/sign-up/email", { headers: { origin }, data: { email, password: "Synthetic test-only pass! 5678" } });
+  }
   expect(response.status()).toBe(200);
   const owner = (await response.json()).user;
   await page.goto("/");

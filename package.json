@@ -16,12 +16,15 @@
     "test:tunnel": "tsx --test tests/tunnel.integration.ts",
     "test:public": "tsx tests/public-preview.integration.ts",
     "test:multifile:public": "tsx tests/multi-file-public.integration.ts",
+    "test:runner:public": "tsx tests/code-runner-public.integration.ts",
     "test:media": "tsx --test tests/media.integration.ts",
     "admin:role": "tsx scripts/account-role.ts",
     "backup": "node scripts/backup-db.mjs",
     "check:copilot": "tsx scripts/check-copilot.ts",
     "copilot:login": "node scripts/copilot-login.mjs",
-    "setup:media": "node scripts/setup-media.mjs"
+    "setup:media": "node scripts/setup-media.mjs",
+    "setup:sandbox": "node scripts/setup-sandbox.mjs",
+    "test:sandbox": "tsx --test tests/sandbox.integration.ts"
   },
   "dependencies": {
     "@github/copilot-sdk": "1.0.28",

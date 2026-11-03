@@ -6,8 +6,10 @@ import { AppError, errorResponse } from "@/lib/errors";
 import { assertLocalRequest, readBytes, readJson, requireAccess } from "@/lib/http";
 import { LIMITS } from "@/lib/contracts";
 import { validateFileName } from "@/lib/files";
-import { listModels, runCopilotReply } from "@/lib/copilot";
+import { listModels, runCopilotReply, type ReplyRunner } from "@/lib/copilot";
 import { prepareImageTurn } from "@/lib/image-turn";
+import { codeToolInstruction, createCodeTool, previewMatches } from "@/lib/code-tool";
+import { sandboxConfig, sandboxStatus } from "@/lib/sandbox";
 import { createChatStream, stopReply, stopSessionReplies, hasSessionReply } from "@/lib/stream";
 import { tunnelMode } from "@/lib/config";
 import { signupSchema } from "@/lib/signup";
@@ -94,6 +96,9 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
     if (s.length === 1 && s[0] === "media-status" && method === "GET") {
       return Response.json(run("media.status", null, () => mediaStatus()));
     }
+    if (s.length === 1 && s[0] === "sandbox-status" && method === "GET") {
+      return Response.json(run("sandbox.status", null, () => sandboxStatus()));
+    }
     if (s[0] === "admin") {
       if (s.length === 2 && s[1] === "acting" && method === "POST") {
         guard.requireAdmin(ctx);
@@ -179,7 +184,17 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
       if (!model) throw new AppError(400, "That model is no longer available. Refresh the model list and select another.");
       const turn = prepareImageTurn(store, user.id, chatId, body.content, body.fileIds, model, runCopilotReply,
         (id, outcome, reason) => guard.record(ctx, "image.analysis", id, outcome, reason, true));
-      return createChatStream(store, user.id, chatId, body.content, body.model, body.fileIds, turn.prompt, turn.runner, request.signal, {
+      const sandbox = sandboxConfig();
+      const runner: ReplyRunner = sandbox ? input => turn.runner({
+        ...input,
+        toolInstruction: codeToolInstruction(sandbox),
+        tools: [createCodeTool({
+          store, access: ctx, chatId, assistantMessageId: input.assistantMessageId!, signal: input.signal,
+          authorize: () => { guard.check(ctx); }, onProgress: input.onProgress, onActivity: input.onRequestStart, onAttachments: input.onAttachments,
+          audit: (action, objectId, outcome, reason) => guard.record(ctx, action, objectId, outcome, reason, true),
+        })],
+      }) : turn.runner;
+      return createChatStream(store, user.id, chatId, body.content, body.model, body.fileIds, turn.prompt, runner, request.signal, {
         actorId: ctx.actor.id, sessionId: ctx.sessionId, check: () => { guard.check(ctx); },
         accepted: (userMessageId, assistantId) => {
           guard.record(ctx, "message.send", userMessageId, "allowed");
@@ -265,6 +280,44 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
         run("file.delete", file.id, () => store.deleteFile(user.id, chatId, s[3]));
         return Response.json({ ok: true });
       }
+    }
+    if (s.length === 5 && s[2] === "files" && s[4] === "preview" && method === "GET") {
+      const fileId = z.uuid().parse(s[3]);
+      const file = store.attachments(user.id, chatId).find(item => item.id === fileId);
+      if (!file) throw new AppError(404, "File not found.");
+      return run("file.preview", file.id, () => {
+        const head = Buffer.concat([...uploads.rangeChunks(file.id, 0, 15)]);
+        if (!file.preview || !file.mimeType || !previewMatches(file.mimeType, head)) throw new AppError(415, "A preview is not available for this file. Download it instead.");
+        let start = 0, end = file.size - 1, status = 200;
+        const range = request.headers.get("range");
+        if (range) {
+          const match = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
+          if (match && (match[1] || match[2])) {
+            start = match[1] ? Number(match[1]) : Math.max(0, file.size - Number(match[2]));
+            end = match[1] && match[2] ? Math.min(Number(match[2]), file.size - 1) : file.size - 1;
+          }
+          if (!match || !Number.isSafeInteger(start) || start > end || start >= file.size) {
+            return new Response(null, { status: 416, headers: { "Content-Range": `bytes */${file.size}` } });
+          }
+          status = 206;
+        }
+        const parts = uploads.rangeChunks(file.id, start, end);
+        return new Response(new ReadableStream<Uint8Array>({
+          pull(controller) {
+            try { guard.check(ctx); const part = parts.next(); if (part.done) controller.close(); else controller.enqueue(new Uint8Array(part.value)); }
+            catch (error) { controller.error(error); parts.return?.(); }
+          },
+          cancel() { parts.return?.(); },
+        }), { status, headers: {
+          "Content-Type": file.mimeType,
+          "Content-Disposition": `inline; filename*=UTF-8''${encodeURIComponent(file.name).replace(/'/g, "%27")}`,
+          "Content-Length": String(end - start + 1),
+          "Accept-Ranges": "bytes",
+          ...(status === 206 ? { "Content-Range": `bytes ${start}-${end}/${file.size}` } : {}),
+          "X-Content-Type-Options": "nosniff",
+          "Cross-Origin-Resource-Policy": "same-origin",
+        } });
+      });
     }
     if (s.length === 5 && s[2] === "files" && s[4] === "extracted" && method === "GET") {
       const job = uploads.job(s[3]);

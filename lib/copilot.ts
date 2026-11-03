@@ -1,10 +1,10 @@
-import { CopilotClient, type SessionConfig, type CopilotSession, type ModelInfo } from "@github/copilot-sdk";
+import { CopilotClient, type SessionConfig, type CopilotSession, type ModelInfo, type Tool } from "@github/copilot-sdk";
 import { mkdir, rm } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { dataDirectory } from "./config";
 import { AppError } from "./errors";
-import { SYSTEM_INSTRUCTION } from "./context";
+import { systemInstruction } from "./context";
 import { runtimeEnvironment } from "./runtime-env.mjs";
 import type { NativeImage } from "./contracts";
 
@@ -84,14 +84,16 @@ export async function listModels(refresh = false): Promise<ModelInfo[]> {
   })().catch(error => { throw copilotError(error); }).finally(() => { catalogState.modelChatCatalogPending = undefined; });
   return catalogState.modelChatCatalogPending;
 }
-export function safeSessionConfig(model: string, directory: string, sessionId: string): SessionConfig {
+export function safeSessionConfig(model: string, directory: string, sessionId: string, tools: Tool[] = [], toolInstruction?: string): SessionConfig {
+  const allowed = new Set(tools.map(tool => tool.name));
   return {
     sessionId,
     model,
     clientName: "Model Chat",
-    availableTools: [],
-    excludedTools: ["builtin:*", "mcp:*", "custom:*"],
-    tools: [],
+    // Only app-defined tools are allow-listed; built-in, MCP and every other custom tool stays excluded.
+    availableTools: tools.map(tool => `custom:${tool.name}`),
+    excludedTools: tools.length ? ["builtin:*", "mcp:*"] : ["builtin:*", "mcp:*", "custom:*"],
+    tools,
     mcpServers: {},
     customAgents: [],
     includedBuiltinSkills: [],
@@ -115,8 +117,10 @@ export function safeSessionConfig(model: string, directory: string, sessionId: s
     workingDirectory: directory,
     configDirectory: copilotHome,
     streaming: true,
-    systemMessage: { mode: "replace", content: SYSTEM_INSTRUCTION },
-    onPermissionRequest: () => ({ kind: "reject", feedback: "Model Chat is data-only. All tool and filesystem operations are denied." }),
+    systemMessage: { mode: "replace", content: systemInstruction(tools.length ? toolInstruction : undefined) },
+    onPermissionRequest: request => request.kind === "custom-tool" && allowed.has(request.toolName)
+      ? { kind: "approved" }
+      : { kind: "reject", feedback: "Model Chat denies every built-in, filesystem, shell, URL, MCP and unknown tool request." },
   };
 }
 export interface ReplyInput {
@@ -129,9 +133,32 @@ export interface ReplyInput {
   authorize?: () => void;
   onProgress?: (stage: string) => void;
   onRequestStart?: () => void;
+  assistantMessageId?: string;
+  onAttachments?: () => void;
+  tools?: Tool[];
+  toolInstruction?: string;
 }
 export type ReplyRunner = (input: ReplyInput) => Promise<void>;
-export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDelta, onReplace, images, authorize, onRequestStart }) => {
+export function verifyToolMetadata(tools: { name: string; mcpServerName?: string; deferLoading?: boolean }[] | null | undefined, expected: string[]) {
+  const names = (tools || []).map(tool => tool.name).sort();
+  if (!tools || names.join("\n") !== [...expected].sort().join("\n") || tools.some(tool => tool.mcpServerName || tool.deferLoading)) {
+    throw new AppError(503, expected.length
+      ? "The runtime did not confirm that only the app's sandboxed code tool is active. Generation was blocked for safety."
+      : "The runtime did not confirm a tool-free session. Generation was blocked for safety.");
+  }
+}
+export function createMessageAccumulator(onDelta: (text: string) => void, onReplace: (text: string) => void) {
+  const parts = new Map<string, string>();
+  let sent = "";
+  return (messageId: string, text: string, complete: boolean) => {
+    parts.set(messageId, complete ? text : (parts.get(messageId) || "") + text);
+    const full = [...parts.values()].filter(part => part.trim()).join("\n\n");
+    if (full.startsWith(sent)) { if (full.length > sent.length) onDelta(full.slice(sent.length)); }
+    else onReplace(full);
+    sent = full;
+  };
+}
+export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDelta, onReplace, images, authorize, onRequestStart, tools = [], toolInstruction }) => {
   onRequestStart?.();
   const sessionId = `modelchat-${randomUUID()}`;
   const directory = path.join(copilotHome, "requests", sessionId);
@@ -145,15 +172,17 @@ export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDe
     authorize?.();
     client = await createClient();
     signal.throwIfAborted();
-    session = await deadline(client.createSession(safeSessionConfig(model, directory, sessionId)), 30_000);
+    session = await deadline(client.createSession(safeSessionConfig(model, directory, sessionId, tools, toolInstruction)), 30_000);
     signal.throwIfAborted();
     await deadline(session.rpc.tools.initializeAndValidate(), 15_000);
     const metadata = await deadline(session.rpc.tools.getCurrentMetadata(), 15_000);
-    if (!metadata.tools || metadata.tools.length !== 0) throw new AppError(503, "The runtime did not confirm a tool-free session. Generation was blocked for safety.");
+    verifyToolMetadata(metadata.tools, tools.map(tool => tool.name));
     signal.throwIfAborted();
     authorize?.();
-    unsubscribe.push(session.on("assistant.message_delta", event => onDelta(event.data.deltaContent)));
-    unsubscribe.push(session.on("assistant.message", event => onReplace(event.data.content)));
+    // A tool-using turn can contain several assistant messages; keep all of them in one saved reply.
+    const accumulate = createMessageAccumulator(onDelta, onReplace);
+    unsubscribe.push(session.on("assistant.message_delta", event => accumulate(event.data.messageId, event.data.deltaContent, false)));
+    unsubscribe.push(session.on("assistant.message", event => accumulate(event.data.messageId, event.data.content || "", true)));
     let sessionError: string | undefined;
     unsubscribe.push(session.on("session.error", event => { sessionError = event.data.message; }));
     const aborted = new Promise<never>((_, reject) => {
@@ -166,7 +195,7 @@ export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDe
     });
     signal.throwIfAborted();
     authorize?.();
-    await Promise.race([session.sendAndWait({ prompt, attachments: images }, 180_000), aborted]);
+    await Promise.race([session.sendAndWait({ prompt, attachments: images }, tools.length ? 45 * 60_000 : 180_000), aborted]);
     if (sessionError) throw new Error(sessionError);
   } catch (error) {
     if (signal.aborted) throw new DOMException("Reply cancelled", "AbortError");

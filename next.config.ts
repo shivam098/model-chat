@@ -14,6 +14,10 @@ const config: NextConfig = {
         { key: "Permissions-Policy", value: "camera=(), geolocation=(), microphone=(self)" },
         { key: "Content-Security-Policy", value: `default-src 'self'; script-src 'self' 'unsafe-inline'${process.env.NODE_ENV === "development" ? " 'unsafe-eval'" : ""}; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'` }
       ],
+    }, {
+      // Verified code-runner previews (images, video, PDF only) get a stricter, script-free policy.
+      source: "/api/chats/:chat/files/:file/preview",
+      headers: [{ key: "Content-Security-Policy", value: "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'; form-action 'none'; base-uri 'none'; sandbox" }],
     }];
   },
 };

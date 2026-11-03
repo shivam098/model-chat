@@ -96,7 +96,8 @@ export function createChatStream(store: Store, userId: string, chatId: string, c
         const heartbeat = setInterval(() => { if (checkAccess()) send({ type: "progress", stage }); }, 15_000);
         const authorizationTimer = security ? setInterval(checkAccess, 500) : undefined;
         try {
-          await runner({ model, prompt, images, authorize: security?.check, signal: controller.signal,
+          await runner({ model, prompt, images, authorize: security?.check, signal: controller.signal, assistantMessageId: turn.assistant.id,
+            onAttachments: () => { if (checkAccess()) send({ type: "attachments" }); },
             onRequestStart: requestStarted, onProgress: value => { stage = value; if (checkAccess()) send({ type: "progress", stage }); },
             onDelta: text => accept(text, false), onReplace: text => accept(text, true) });
           if (controller.signal.aborted) throw new DOMException("Reply cancelled", "AbortError");

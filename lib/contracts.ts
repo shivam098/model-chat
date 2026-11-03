@@ -53,7 +53,13 @@ export interface Attachment {
   processingProgress?: number | null;
   processingError?: string | null;
   uploadComplete?: number;
+  messageRole?: "user" | "assistant" | null;
+  preview?: "image" | "video" | "pdf" | null;
 }
+export const PREVIEW_TYPES: Record<string, "image" | "video" | "pdf"> = {
+  "image/png": "image", "image/jpeg": "image", "image/gif": "image", "image/webp": "image",
+  "video/mp4": "video", "video/webm": "video", "application/pdf": "pdf",
+};
 export interface ChatDetail {
   chat: Chat;
   messages: Message[];
@@ -71,5 +77,6 @@ export type StreamEvent =
   | { type: "delta"; text: string }
   | { type: "replace"; text: string }
   | { type: "progress"; stage: string }
+  | { type: "attachments" }
   | { type: "done"; message: Message }
   | { type: "error"; error: string };
