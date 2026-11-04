@@ -1,9 +1,10 @@
 import { createServer } from "node:http";
-import { mkdirSync, openSync, closeSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, openSync, closeSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import next from "next";
 import env from "@next/env";
 import { networkPolicy } from "../lib/network-policy.mjs";
+import { readTunnelState } from "../lib/process-tools.mjs";
 
 env.loadEnvConfig(process.cwd());
 const portIndex = process.argv.indexOf("--port");
@@ -11,9 +12,15 @@ const port = Number(portIndex < 0 ? process.env.PORT || 3210 : process.argv[port
 if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("Port must be between 1024 and 65535.");
 process.env.PORT = String(port);
 process.env.MODEL_CHAT_SERVER_INSTANCE = String(process.pid);
+const data = path.resolve(process.env.MODEL_CHAT_DATA_DIR || ".local");
+if (process.argv.includes("--tunnel")) {
+  // Adopt the separately running Quick Tunnel so the public origin survives app restarts.
+  const tunnel = readTunnelState(path.join(data, "tunnel.json"), port);
+  if (!tunnel) throw new Error("No running app-owned Cloudflare tunnel was found for this port. Run npm run tunnel.");
+  process.env.MODEL_CHAT_TUNNEL_ORIGIN = tunnel.url;
+}
 const policy = networkPolicy(port, process.env.MODEL_CHAT_TUNNEL_ORIGIN);
 process.env.MODEL_CHAT_ORIGIN = policy.origin;
-const data = path.resolve(process.env.MODEL_CHAT_DATA_DIR || ".local");
 for (const name of ["public", ".next", ".next-candidate"]) {
   const webDirectory = path.resolve(name);
   if (data === webDirectory || data.startsWith(webDirectory + path.sep)) throw new Error("MODEL_CHAT_DATA_DIR must be outside public/ and build directories.");
@@ -75,10 +82,31 @@ server.requestTimeout = 0;
 server.setTimeout(120_000, socket => socket.destroy());
 server.headersTimeout = 15_000;
 server.on("error", error => { console.error(error.message); process.exit(1); });
-server.listen(port, "127.0.0.1", () => console.log(`Model Chat ready: ${process.env.MODEL_CHAT_ORIGIN}`));
-for (const signal of ["SIGINT", "SIGTERM"]) process.once(signal, () => {
+const statePath = path.join(data, "app-state.json");
+const stopPath = path.join(data, "app-stop.json");
+let startedAt = "";
+server.listen(port, "127.0.0.1", () => {
+  startedAt = new Date().toISOString();
+  writeFileSync(statePath, JSON.stringify({ pid: process.pid, port, origin: policy.origin, tunnel: policy.tunnelMode, startedAt }, null, 2), { mode: 0o600 });
+  console.log(`Model Chat ready: ${process.env.MODEL_CHAT_ORIGIN}`);
+});
+process.once("exit", () => {
+  try { if (JSON.parse(readFileSync(statePath, "utf8")).pid === process.pid) unlinkSync(statePath); }
+  catch (error) { if (error.code !== "ENOENT") console.error("Could not remove app state:", error.message); }
+});
+let stopping = false;
+function shutdown() {
+  if (stopping) return;
+  stopping = true;
   globalThis.modelChatStopFileQueue?.();
   server.close();
   app.close().then(() => process.exit(0), error => { console.error(error.message); process.exit(1); });
   setTimeout(() => process.exit(0), 3000).unref();
-});
+}
+for (const signal of ["SIGINT", "SIGTERM"]) process.once(signal, shutdown);
+// Windows cannot deliver SIGTERM to a detached process, so the owner commands request a graceful stop by file.
+setInterval(() => {
+  if (!startedAt || !existsSync(stopPath)) return;
+  try { const request = JSON.parse(readFileSync(stopPath, "utf8")); if (request.pid === process.pid && request.startedAt === startedAt) shutdown(); }
+  catch { /* Ignore a partially written or foreign stop request. */ }
+}, 1000).unref();

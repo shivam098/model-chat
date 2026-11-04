@@ -106,7 +106,7 @@ export class Store {
     return this.chat(userId, chatId);
   }
   saveDraft(userId: string, chatId: string, draft: string, model?: string) {
-    this.assertIdle(userId, chatId);
+    // Drafts may change while a reply streams; they belong to the next turn and never to the in-flight one.
     if (draft.length > LIMITS.inputCharacters) throw new AppError(400, "The draft exceeds the message length limit.");
     const chat = this.chat(userId, chatId);
     if (chat.draft === draft && (model === undefined || chat.model === model)) return;
@@ -140,7 +140,7 @@ export class Store {
   }
   addFile(userId: string, chatId: string, name: string, bytes: Buffer, text: string, notes: string, mimeType = "text/plain", frames: MediaFrame[] = []) {
     return this.db.transaction(() => {
-      this.assertIdle(userId, chatId);
+      this.chat(userId, chatId);
       if (frames.length > LIMITS.videoFrames || frames.some(frame => frame.bytes.length > LIMITS.videoFrameBytes || frame.seconds < 0 || !Number.isFinite(frame.seconds))) throw new AppError(400, "Sampled video frames exceed the model-input safety limits.");
       const id = randomUUID();
       this.db.prepare("INSERT INTO app_file(id,chatId,messageId,name,size,characters,notes,text,bytes,createdAt,mimeType) VALUES (?,?,NULL,?,?,?,?,?,?,?,?)").run(id, chatId, name, bytes.length, text.length, notes, text, bytes, Date.now(), mimeType);
@@ -150,10 +150,10 @@ export class Store {
     })();
   }
   deleteFile(userId: string, chatId: string, fileId: string) {
-    this.assertIdle(userId, chatId);
+    // Unsent files may be removed mid-reply; files bound to any turn (including the streaming one) stay protected.
     const file = this.file(userId, chatId, fileId);
     if (file.messageId) throw new AppError(409, "Files already sent are part of saved context. Delete the chat to remove them.");
-    this.db.prepare("DELETE FROM app_file WHERE chatId=? AND id=?").run(chatId, fileId);
+    this.db.prepare("DELETE FROM app_file WHERE chatId=? AND id=? AND messageId IS NULL").run(chatId, fileId);
   }
   contextFiles(userId: string, chatId: string, pendingIds: string[], query = "", totalBudget: number = LIMITS.chatFileCharacters) {
     const attachments = this.attachments(userId, chatId);
@@ -237,8 +237,10 @@ export class Store {
       insert.run(user);
       insert.run(assistant);
       for (const id of fileIds) this.db.prepare("UPDATE app_file SET messageId=? WHERE chatId=? AND id=?").run(user.id, chatId, id);
-      this.db.prepare("UPDATE app_chat SET model=?,updatedAt=?,draft='',title=CASE WHEN title='New chat' THEN ? ELSE title END WHERE id=? AND userId=?")
-        .run(model, now, content.slice(0, 64) || "File analysis", chatId, userId);
+      // Keep a draft typed after this message was sent; clear it only when it is the text being sent.
+      const draft = this.chat(userId, chatId).draft || "";
+      this.db.prepare("UPDATE app_chat SET model=?,updatedAt=?,draft=?,title=CASE WHEN title='New chat' THEN ? ELSE title END WHERE id=? AND userId=?")
+        .run(model, now, draft.trim() === content.trim() ? "" : draft, content.slice(0, 64) || "File analysis", chatId, userId);
       return { user, assistant };
     })();
   }

@@ -83,6 +83,7 @@ export function ChatApp() {
   const modelRef = useRef(selectedModel);
   const busyRef = useRef(busy);
   const draftWrite = useRef<Promise<void> | null>(null);
+  const chatCreation = useRef<{ owner?: string; epoch: number; promise: Promise<Chat> } | null>(null);
   const draftSaved = useRef<{ userId: string; chatId?: string; draft: string; model: string } | null>(null);
   userRef.current = user;
   detailRef.current = detail;
@@ -94,6 +95,10 @@ export function ChatApp() {
   const processing = detail?.attachments.some(file => ["uploading", "queued", "processing"].includes(file.processingStatus || "")) || false;
   const remoteBusy = Boolean(detail?.messages.some(m => m.status === "streaming"));
   const locked = busy || uploading || loadingChat || remoteBusy || demoLoading || switching;
+  // The composer stays usable while a reply streams; only sending (and workspace switches) wait for it.
+  const composeLocked = loadingChat || demoLoading || switching;
+  const uploadLocked = uploading || composeLocked;
+  const replyRunning = busy || remoteBusy;
   const acting = Boolean(actor && user && actor.id !== user.id);
   const modelAvailable = models.some(m => m.id === selectedModel);
   const newImageCount = readyPending.reduce((count, file) => count + (file.mimeType?.startsWith("image/") ? 1 : file.frameCount || 0), 0);
@@ -149,17 +154,17 @@ export function ChatApp() {
   }, [user?.id, actor?.appRole, acting]);
 
   useEffect(() => {
-    if (!user || locked) return;
+    if (!user || composeLocked) return;
     const timer = setTimeout(() => { void flushDraft().catch(report); }, 500);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [draft, selectedModel, user?.id, detail?.chat.id, locked]);
+  }, [draft, selectedModel, user?.id, detail?.chat.id, composeLocked]);
 
   useEffect(() => {
     const saveOnLeave = () => {
       const owner = userRef.current;
       const current = detailRef.current;
-      if (!owner || !current || busyRef.current) return;
+      if (!owner || !current) return;
       void fetch("/api/drafts", {
         method: "POST", keepalive: true,
         headers: { "Content-Type": "application/json", "x-model-chat-subject": owner.id },
@@ -290,21 +295,36 @@ export function ChatApp() {
     } catch (error) { if (request === selection.current) report(error); }
     finally { if (request === selection.current) setLoadingChat(false); }
   }
-  async function ensureChat() {
+  function pendingChatCreation() {
+    const creating = chatCreation.current;
+    return creating && creating.owner === userRef.current?.id && creating.epoch === workspaceEpoch.current ? creating.promise : null;
+  }
+  // Single-flight: Send, uploads and draft autosave during the first round trip of a new chat share one chat.
+  async function ensureChat(): Promise<Chat> {
+    if (!detailRef.current && draftWrite.current) { try { await draftWrite.current; } catch { /* Reported by the draft save. */ } }
     if (detailRef.current) return detailRef.current.chat;
+    const existing = pendingChatCreation();
+    if (existing) return existing;
     const owner = userRef.current?.id;
     const epoch = workspaceEpoch.current;
-    const { chat } = await api<{ chat: Chat }>("/api/chats", { method: "POST" });
-    if (owner !== userRef.current?.id || epoch !== workspaceEpoch.current) throw new RequestError("The active workspace changed.", 409, "workspace-changed");
-    const next = { chat, messages: [], attachments: [] };
-    detailRef.current = next;
-    setDetail(next); setChats(previous => [chat, ...previous]);
-    window.history.replaceState(null, "", `?chat=${chat.id}`);
-    return chat;
+    const promise = (async () => {
+      const { chat } = await api<{ chat: Chat }>("/api/chats", { method: "POST" });
+      if (owner !== userRef.current?.id || epoch !== workspaceEpoch.current) throw new RequestError("The active workspace changed.", 409, "workspace-changed");
+      if (detailRef.current) return detailRef.current.chat;
+      const next = { chat, messages: [], attachments: [] };
+      detailRef.current = next;
+      setDetail(next); setChats(previous => [chat, ...previous]);
+      window.history.replaceState(null, "", `?chat=${chat.id}`);
+      return chat;
+    })();
+    chatCreation.current = { owner, epoch, promise };
+    try { return await promise; } finally { if (chatCreation.current?.promise === promise) chatCreation.current = null; }
   }
-  async function flushDraft(force = false): Promise<void> {
-    if (!userRef.current || (!force && busyRef.current)) return;
-    if (draftWrite.current) { await draftWrite.current; return flushDraft(force); }
+  async function flushDraft(_force = false): Promise<void> {
+    if (!userRef.current) return;
+    if (draftWrite.current) { await draftWrite.current; return flushDraft(_force); }
+    const creating = detailRef.current ? null : pendingChatCreation();
+    if (creating) { try { await creating; } catch { /* Reported by the chat creator. */ } return flushDraft(_force); }
     const owner = userRef.current.id;
     const epoch = workspaceEpoch.current;
     const chatId = detailRef.current?.chat.id;
@@ -328,7 +348,8 @@ export function ChatApp() {
             window.history.replaceState(null, "", `?chat=${chat.id}`);
           } else if (detailRef.current.chat.id === chat.id) {
             detailRef.current = { ...detailRef.current, chat };
-            setDetail(detailRef.current);
+            // Functional update so a draft save never overwrites streamed reply text queued in the same render.
+            setDetail(previous => previous && previous.chat.id === chat.id ? { ...previous, chat } : previous);
           }
           setChats(previous => previous.some(item => item.id === chat.id) ? previous.map(item => item.id === chat.id ? chat : item) : [chat, ...previous]);
           draftSaved.current = { userId: owner, chatId: chat.id, draft: text, model };
@@ -433,6 +454,8 @@ export function ChatApp() {
     const content = draft.trim();
     const ownerId = userRef.current?.id;
     const epoch = workspaceEpoch.current;
+    // Clear the composer now so anything typed while this reply streams becomes the next draft, not this turn.
+    draftRef.current = ""; setDraft(""); setDraftState("saving");
     setBusy(true); setNotice(""); setStreamStage("Preparing attachments"); follow.current = true;
     const controller = new AbortController();
     generation.current = controller;
@@ -462,11 +485,11 @@ export function ChatApp() {
         if (userRef.current?.id !== ownerId || workspaceEpoch.current !== epoch) return;
         if (item.type === "error") throw new Error(item.error);
         if (item.type === "start") {
-          accepted = true; draftRef.current = ""; setDraft("");
-          setDetail(previous => previous && ({ ...previous,
+          accepted = true;
+          setDetail(previous => previous && previous.chat.id === chatId ? ({ ...previous,
             messages: [...previous.messages, item.user, item.assistant],
             attachments: previous.attachments.map(f => selectedFiles.some(p => p.id === f.id) ? { ...f, messageId: item.user.id } : f),
-          }));
+          }) : previous);
         } else if (item.type === "progress") {
           setStreamStage(item.stage);
         } else if (item.type === "attachments") {
@@ -476,11 +499,11 @@ export function ChatApp() {
             setDetail(previous => previous && previous.chat.id === chatForFiles ? { ...previous, attachments: result.attachments } : previous);
           }).catch(report);
         } else if (item.type === "delta" || item.type === "replace") {
-          setDetail(previous => previous && ({ ...previous, messages: previous.messages.map((m, index) => index === previous.messages.length - 1 ?
-            { ...m, content: item.type === "delta" ? m.content + item.text : item.text } : m) }));
+          setDetail(previous => previous && previous.chat.id === chatId ? ({ ...previous, messages: previous.messages.map((m, index) => index === previous.messages.length - 1 ?
+            { ...m, content: item.type === "delta" ? m.content + item.text : item.text } : m) }) : previous);
         } else if (item.type === "done") {
           done = true;
-          setDetail(previous => previous && ({ ...previous, messages: previous.messages.map(m => m.id === item.message.id ? item.message : m) }));
+          setDetail(previous => previous && previous.chat.id === chatId ? ({ ...previous, messages: previous.messages.map(m => m.id === item.message.id ? item.message : m) }) : previous);
         }
       };
       try {
@@ -498,7 +521,11 @@ export function ChatApp() {
     } catch (error) {
       if (userRef.current?.id === ownerId && workspaceEpoch.current === epoch) {
         report(error);
-        if (!accepted) setDraft(content);
+        if (!accepted) {
+          // Restore the unsent message without discarding anything typed since Send.
+          const restored = draftRef.current.trim() ? `${content}\n\n${draftRef.current}` : content;
+          draftRef.current = restored; setDraft(restored); setDraftState("saving");
+        }
       }
     } finally {
       if (chatId && userRef.current?.id === ownerId && workspaceEpoch.current === epoch) {
@@ -515,7 +542,7 @@ export function ChatApp() {
   }
   async function upload(files: FileList | File[] | null) {
     if (!files?.length) return;
-    if (locked) { setNotice("Finish the current transfer or reply before adding another selection of files."); return; }
+    if (uploadLocked) { setNotice("Finish the current file transfer before adding another selection of files."); return; }
     const selected = Array.from(files).map(file => ({ file, id: crypto.randomUUID() }));
     for (const item of selected) transferControllers.current.set(item.id, new AbortController());
     setUploading(true); setNotice("");
@@ -605,7 +632,11 @@ export function ChatApp() {
     finally {
       for (const item of selected) transferControllers.current.delete(item.id);
       if (chatId && workspaceEpoch.current === uploadEpoch && detailRef.current?.chat.id === chatId && userRef.current) {
-        try { await refreshChat(chatId); } catch (error) { report(error); }
+        // Refresh attachments only, so a streaming reply in this chat is never overwritten by a server snapshot.
+        try {
+          const latest = await api<{ attachments: Attachment[] }>(`/api/chats/${chatId}/files`);
+          if (workspaceEpoch.current === uploadEpoch) setDetail(previous => previous && previous.chat.id === chatId ? { ...previous, attachments: latest.attachments } : previous);
+        } catch (error) { report(error); }
       }
       if (uploadController.current === controller) {
         setUploading(false); uploadController.current = null;
@@ -657,7 +688,7 @@ export function ChatApp() {
   async function logout() {
     try {
       stopDictation();
-      if (!busyRef.current) await flushDraft(true);
+      await flushDraft(true);
       await api("/api/auth/sign-out", { method: "POST", body: "{}" });
       clearAccount();
     } catch (error) { report(error); }
@@ -780,13 +811,13 @@ export function ChatApp() {
         <div className="topbar-title"><IconButton label="Open sidebar" onClick={() => setSidebar(true)}><PanelLeft size={20} /></IconButton><button className="menu-button" onClick={() => setMenu(true)}><Menu size={18} /><span>Menu</span></button><span>{detail?.chat.title || "A fresh conversation"}</span></div>
         <div className="model-control">
           <span className={`status-dot ${connectionError ? "offline" : ""}`} />
-          <select aria-label="Select model" value={selectedModel} disabled={locked || modelLoading || !models.length} onChange={event => { setSelectedModel(event.target.value); setDraftState("saving"); }}>
+          <select aria-label="Select model" value={selectedModel} disabled={composeLocked || modelLoading || !models.length} onChange={event => { setSelectedModel(event.target.value); setDraftState("saving"); }}>
             {!selectedModel && <option value="">{modelLoading ? "Connecting..." : "No models available"}</option>}
             {selectedModel && !modelAvailable && <option value={selectedModel}>{selectedModel} (unavailable)</option>}
             {models.map(model => <option value={model.id} key={model.id}>{model.name}{model.vision ? " · vision" : ""}{model.multiplier !== undefined ? ` · ${model.multiplier}x` : ""}</option>)}
           </select>
           <ChevronDown size={14} aria-hidden="true" />
-          <IconButton label="Refresh Copilot connection" onClick={() => void refreshModels()} disabled={locked || modelLoading}><RefreshCw size={15} className={modelLoading ? "spin" : ""} /></IconButton>
+          <IconButton label="Refresh Copilot connection" onClick={() => void refreshModels()} disabled={composeLocked || modelLoading}><RefreshCw size={15} className={modelLoading ? "spin" : ""} /></IconButton>
         </div>
       </header>
       {acting && <div className="acting-banner" role="status"><div><strong>Acting as {user.name}</strong><span>{user.email} · Signed in as {actor?.email}. Actions are audited.</span></div><button onClick={() => void returnToSelf()} disabled={locked}>Return to my workspace</button>{(busy || remoteBusy) && <small>Stop the current reply before returning.</small>}</div>}
@@ -804,7 +835,7 @@ export function ChatApp() {
             <p>{pending.length ? <>{processing ? "Your files are processing in the background." : readyPending.length ? "Your processed files are ready." : "Your uploads need attention."}<br />You can keep chatting while files are processed.</> : <>Start with a thought, a question, or a file.<br />Pick a model. Make room for an idea.</>}</p>
             {pending.length === 0 && <div className="suggestions">
               <button onClick={() => { setDraft("Help me think through an idea. Ask me one useful question to get started."); setDraftState("saving"); composer.current?.focus(); }}><MessageSquare size={20} /><strong>Think it through</strong><span>Find a new perspective</span></button>
-              <button onClick={() => fileInput.current?.click()} disabled={locked}><FileText size={20} /><strong>Explore a document</strong><span>Turn information into insight</span></button>
+              <button onClick={() => fileInput.current?.click()} disabled={uploadLocked}><FileText size={20} /><strong>Explore a document</strong><span>Turn information into insight</span></button>
               <button onClick={() => { setDraft("Help me write something clear and concise. Ask what I want to communicate."); setDraftState("saving"); composer.current?.focus(); }}><Pencil size={20} /><strong>Find the right words</strong><span>Bring a first draft to life</span></button>
               {sandboxInfo?.ready && <button onClick={() => { setDraft("Create a one-page PDF report and a matching bar-chart PNG for these sample figures: Q1 = 12, Q2 = 18, Q3 = 15, Q4 = 22. Include a short summary in the PDF."); setDraftState("saving"); composer.current?.focus(); }}><Code2 size={20} /><strong>Make a file</strong><span>PDF, chart, GIF/MP4 or Office</span></button>}
             </div>}
@@ -858,22 +889,22 @@ export function ChatApp() {
               {file.uploadComplete !== 0 && <a className="icon-button" aria-label={`Download original ${file.name}`} href={`/api/chats/${file.chatId}/files/${file.id}`}><ArrowDown size={14} /></a>}
               {(running || status === "uploading") && <IconButton label={`Cancel processing ${file.name}`} onClick={() => void controlFile(file, "cancel")}><Square size={14} /></IconButton>}
               {file.uploadComplete !== 0 && ["failed", "cancelled"].includes(status) && <IconButton label={`Retry processing ${file.name}`} onClick={() => void controlFile(file, "retry")}><RefreshCw size={14} /></IconButton>}
-              <IconButton label={`Remove ${file.name}`} disabled={busy || remoteBusy || switching || demoLoading} onClick={() => void removeFile(file)}><X size={14} /></IconButton>
+              <IconButton label={`Remove ${file.name}`} disabled={switching || demoLoading} onClick={() => void removeFile(file)}><X size={14} /></IconButton>
             </div>;
           })}</div>}
           {pending.some(file => file.processingStatus && file.processingStatus !== "ready") && <p className="file-guidance">Send will include every attached file once ready. Wait or retry/remove unfinished files, or choose Send text only to leave them for later.</p>}
           {extraImageRequests > 0 && <p className="file-guidance" role="status">These images/frames need up to {extraImageRequests} additional Copilot {extraImageRequests === 1 ? "request" : "requests"} with this model, using extra quota. Each is analyzed separately at its supplied detail; one reply combines the results. Analyses are saved for later turns.</p>}
           <label className="sr-only" htmlFor="message">Message</label>
           <textarea id="message" ref={composer} rows={2} placeholder={listening ? "Listening... your words will appear here" : "Ask anything, or bring a file into the conversation..."} value={draft}
-            onChange={event => { draftRef.current = event.target.value; setDraft(event.target.value); setDraftState("saving"); }} maxLength={LIMITS.inputCharacters} disabled={busy || loadingChat || remoteBusy || demoLoading || switching}
+            onChange={event => { draftRef.current = event.target.value; setDraft(event.target.value); setDraftState("saving"); }} maxLength={LIMITS.inputCharacters} disabled={composeLocked}
             onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send(); } }}
             onPaste={event => { if (event.clipboardData.files.length) { event.preventDefault(); void upload(event.clipboardData.files); } }} />
           {interim && <div className="interim" aria-live="polite">{interim}</div>}
           <div className="composer-tools">
             <div className="tool-group">
               <input type="file" accept={FILE_ACCEPT} multiple ref={fileInput} className="sr-only" tabIndex={-1} onChange={event => void upload(event.target.files)} />
-              <IconButton label="Attach files" onClick={() => fileInput.current?.click()} disabled={locked}>{uploading ? <LoaderCircle className="spin" size={19} /> : <Paperclip size={19} />}</IconButton>
-              <button type="button" className={`voice-button ${listening ? "active" : ""}`} disabled={locked || !dictationAvailable}
+              <IconButton label="Attach files" onClick={() => fileInput.current?.click()} disabled={uploadLocked}>{uploading ? <LoaderCircle className="spin" size={19} /> : <Paperclip size={19} />}</IconButton>
+              <button type="button" className={`voice-button ${listening ? "active" : ""}`} disabled={composeLocked || !dictationAvailable}
                 title={!dictationAvailable ? "Dictation unavailable in this browser; text chat works." : "Dictate with your browser's speech service"}
                 onClick={() => listening ? recognition.current?.stop() : startDictation()}><Mic size={18} /><span>{listening ? "Stop dictation" : "Dictate"}</span></button>
               <span className="upload-status">{uploading ? `${transfers.filter(item => item.active).length} uploading` : pending.length ? `${readyPending.length} ready · ${pending.length - readyPending.length} pending` : ""}</span>
@@ -889,7 +920,7 @@ export function ChatApp() {
             {(pending.length > 0 || transfers.some(transfer => transfer.error)) && <button type="button" className="voice-button" disabled={!draft.trim() || locked || !modelAvailable} onClick={() => void send(undefined, true)}>Send text only</button>}
           </div>
         </form>
-        <div className="composer-caption"><span>{draftState === "saving" ? "Saving draft..." : draftState === "error" ? "Draft not saved — retry before leaving" : "Draft saved"} · {dictationAvailable ? "Enter to send · Shift + Enter for a new line" : "Text chat is ready"}</span><button onClick={() => setSettings(true)}>Files & privacy <ShieldCheck size={12} /></button></div>
+        <div className="composer-caption"><span>{draftState === "saving" ? "Saving draft..." : draftState === "error" ? "Draft not saved — retry before leaving" : "Draft saved"} · {replyRunning ? "Reply in progress — keep writing; Send is available when it finishes or you press Stop" : dictationAvailable ? "Enter to send · Shift + Enter for a new line" : "Text chat is ready"}</span><button onClick={() => setSettings(true)}>Files & privacy <ShieldCheck size={12} /></button></div>
         <div className="disclaimer">AI can make mistakes. Your prompts and file text are sent to GitHub Copilot.</div>
       </div>
     </main>

@@ -23,20 +23,32 @@ Open **http://127.0.0.1:3210** in Edge or Chrome. Create an account with an emai
 
 ### Temporary Cloudflare link
 
-For temporary remote access without a domain or Cloudflare account, install the official `cloudflared` CLI and stop the local app server. Then:
+For temporary remote access without a domain or Cloudflare account, install the official `cloudflared` CLI and stop any local-only app server (`npm start`). Then:
 
 ```powershell
 npm run build
-npm run tunnel
+npm run tunnel          # start the link (or reuse the running one) and the app behind it
+npm run tunnel:status   # show the current link, process IDs and whether the public site responds
 ```
 
-This starts both the app and a Cloudflare Quick Tunnel, verifies its remote access policy, and prints an `https://....trycloudflare.com` link. Anyone who opens the link can sign up with an email and password or sign in to an existing account. **Public signup is intentionally open, without OTP. Every account's model requests use the host owner's Copilot entitlement and quota.** HTTPS redirects, Secure cookies, HSTS, and exact public Host/Origin checks remain enabled; the backend still binds only to loopback.
+`npm run tunnel` starts a Cloudflare Quick Tunnel and the app as **two separate background processes**, verifies the remote access policy, and prints an `https://....trycloudflare.com` link. You can close the terminal afterwards. Anyone who opens the link can sign up with an email and password or sign in to an existing account. **Public signup is intentionally open, without OTP. Every account's model requests use the host owner's Copilot entitlement and quota.** HTTPS redirects, Secure cookies, HSTS, and exact public Host/Origin checks remain enabled; the backend still binds only to loopback.
 
 This is an internet-facing signup/login page protected by **app passwords**, not Cloudflare Access. Use a strong unique password, not your Gmail password. Sharing the link permits others to create accounts and consume the owner's Copilot quota and local disk space. Signup/login rate limits, transfer/processing concurrency guards, and generation concurrency limits remain, but there is no per-account file-storage quota or guaranteed billing cap. Cloudflare relays and terminates HTTPS traffic. No password recovery service is configured.
 
-Keep the computer awake and the command running. **Ctrl+C** stops both the app and link. Run `npm start` afterwards to return to local-only mode. Each tunnel launch creates a different URL; Quick Tunnels have no uptime guarantee and are for temporary use, not production hosting. The app uses NDJSON rather than SSE for reply streaming; buffering can still depend on the connection.
+**Keeping the same link across app updates.** After changing code, rebuild and restart only the app; the tunnel keeps running, so the link stays the same:
 
-The launcher uses an app-owned minimal Cloudflare config instead of modifying any existing global tunnel configuration, and disables auto-updates. `.local/tunnel.json` records the active URL; the launcher removes it on normal shutdown. A forced shutdown can leave stale status, so use the live process/output as the source of truth.
+```powershell
+npm run app:update      # waits for streaming replies, stops the app, builds, and starts it behind the same link
+npm run app:restart     # the same without rebuilding
+```
+
+Both wait for streaming replies to finish (up to 10 minutes); add `-- --force` to interrupt them (partial text is kept). The site is unavailable while the app restarts or builds (typically 1–2 minutes for a build), but the link does not change. Do not run `npm run build` by itself while the app is running: it replaces the files the running server uses. To check a build first without touching the running app, build a candidate (see Verification). If an update's build fails, the app stays stopped and the tunnel keeps the same link; fix the error and run `npm run app:update` again.
+
+`npm run tunnel` also never replaces a running tunnel: it creates a new one only when none is alive. **The link still changes if the tunnel process stops**, for example after a PC restart, sign-out, a cloudflared crash, or Cloudflare dropping the Quick Tunnel; run `npm run tunnel` again to get a new link. Quick Tunnels have no uptime guarantee and are for temporary use, not production hosting. Keep the computer awake. The app uses NDJSON rather than SSE for reply streaming; buffering can still depend on the connection.
+
+`npm run tunnel:stop` stops the app and the tunnel (the link becomes invalid). Run `npm start` afterwards to return to local-only mode. Logs are in `.local/cloudflared.log` and `.local/app.log`.
+
+The launcher uses an app-owned minimal Cloudflare config instead of modifying any existing global tunnel configuration, and disables auto-updates. `.local/tunnel.json` records the active link and its cloudflared process; the app trusts it only while that process is still running, and adopts the link at startup as its exact public origin (`scripts/serve.mjs --tunnel`). Restarts use a graceful stop request (`.local/app-stop.json`) so file processing and streams are checkpointed; a server that does not stop within 45 seconds is ended, and interrupted work is recovered on the next start.
 
 ### Copilot sign-in
 
@@ -61,6 +73,8 @@ This launches the installed `copilot login` command with an app-specific `COPILO
 ## Using it
 
 Choose a model, type a message, and press Enter (Shift+Enter inserts a line break). Replies stream into the chat; **Stop reply** keeps any received text as an explicitly partial answer. Disconnecting or signing out also cancels the active reply. If the server restarts, unfinished replies are marked interrupted on the next startup.
+
+While a reply streams you can keep writing the **next** message: type, attach, drop or paste files, dictate, and change the model. Send (and Enter) stays unavailable in that chat until the reply finishes or you press **Stop reply**; the new draft and files are saved and never join the reply in progress. They are sent together with your next message.
 
 Use the sidebar to start, reopen, rename, or delete conversations. Refreshing, signing out/in, and restarting keep histories in SQLite. Switching models creates a fresh, isolated SDK session (with no tools other than the optional sandboxed code runner below) and sends the same chat's saved context and previously sent file text. No old messages are silently dropped: if the bounded context will not fit, the app asks you to start another chat or choose a larger-context model.
 
@@ -216,7 +230,7 @@ To build and validate without replacing an active server's bundles, set `$env:MO
 
 Focused tests cover ownership on guessed IDs, persistence/reopen/model context, restart-interrupted state, file formats and rejection limits, stream success/cancel/error/output caps, origin checks, and voice feature detection. The restart integration test launches and stops a real production server on port 3212, checks server-side cookies and password login across a restart, checks stored passwords are not plaintext, and verifies file/history recovery. It requires a prior build and cleans up its own temporary data directory.
 
-The tunnel integration test uses port 3213 and synthetic accounts to verify new signup without OTP, existing-account login/logout, invalid credentials, two-account demo isolation, Secure cookies, origin rejection, and local-to-HTTPS redirects. It does not create a real external tunnel or send credentials to Cloudflare.
+The tunnel integration test uses port 3213 and synthetic accounts to verify new signup without OTP, existing-account login/logout, invalid credentials, two-account demo isolation, Secure cookies, origin rejection, and local-to-HTTPS redirects. It also checks that the app refuses a stale, forged, old-format or other-port tunnel status file. It does not create a real external tunnel or send credentials to Cloudflare.
 
 `npm run test:media` uses the configured local Whisper runtime and Windows' installed speech synthesizer to generate and transcribe synthetic WAV/MP3/video fixtures. It checks real words, silent video sampling, limits, cancellation, revoked access, owned storage and reopen behavior. It does not call Copilot or use user uploads. To add real media upload/preview/cancellation checks to the browser flow:
 
@@ -230,7 +244,7 @@ Additionally setting `MODEL_CHAT_MEDIA_LIVE_TEST=1` makes one explicit Copilot r
 
 Browser tests use installed **Microsoft Edge**, create test accounts in a unique `.local/browser-test-<id>` directory, and launch their own loopback server on port 3211. They exercise the two-field signup form, real Better Auth, server ownership, uploads/downloads, chat CRUD, logout/login, desktop/mobile demo menus, draft preservation, separate demo chats, no hidden demo generation, and simulated unsupported/denied microphone behavior. Tests do not make model calls by default.
 
-The same browser flow also checks superuser search, acting/return, original-history preservation, per-user drafts, auditing, native image uploads, and role revocation. Set `MODEL_CHAT_ADMIN_LIVE_TEST=1` and run `npm run test:browser -- --grep "accounts, ownership"` to additionally make **one real native-image request while acting as a user** and verify the reply stays in that user's chat. Synthetic roles exist only in the isolated test database.
+The same browser flow also checks superuser search, acting/return, original-history preservation, per-user drafts, auditing, native image uploads, and role revocation. A separate browser test seeds a streaming reply in the isolated test database (no model call) and checks, on desktop and mobile and while a superuser acts as the user, that typing, picker/paste/drop uploads, removal, dictation and model choice keep working, Enter and Send do not send mid-reply, the draft and files survive a reload, and the next Send contains only the new files. Set `MODEL_CHAT_ADMIN_LIVE_TEST=1` and run `npm run test:browser -- --grep "accounts, ownership"` to additionally make **one real native-image request while acting as a user** and verify the reply stays in that user's chat. Synthetic roles exist only in the isolated test database.
 
 To include **two small real Copilot requests** (file-grounded streaming, reload, and switching models):
 
@@ -248,9 +262,11 @@ For an explicit end-to-end check of the **currently running public tunnel**, `np
 
 `npm run test:sandbox` runs real jobs in the WSL sandbox and makes no model calls. It runs these escape and abuse tests: TCP/UDP/DNS/curl network access, `/mnt/c` and WSL host mounts, executing `cmd.exe`/`powershell.exe` (inside and outside the jail), other runs' files and processes, symlink/hardlink/FIFO/device outputs, fork bombs, memory exhaustion, CPU and wall-clock loops, oversized files, full scratch space, too many outputs, and pip/apt installs. It also checks cancellation process-tree cleanup and real PDF/PNG/GIF/MP4/DOCX/XLSX/PPTX generation. The browser suite renders real sandbox outputs as previews on desktop/mobile and checks headers, the PDF viewer, HTML/SVG download-only handling, Range requests and privacy. `npm run test:runner:public` is opt-in and makes **two real Copilot turns** through the running HTTPS link. The owner turn generates all seven formats; the second turn is made by a superuser acting as that owner. Set `MODEL_CHAT_RUNNER_PART=acting` to run only the superuser-acting turn (one Copilot turn). It checks previews, cross-account denial and content-free actor/subject audit entries, then deletes only its synthetic accounts.
 
+`npm run test:composer:public` is opt-in and makes **two real Copilot replies** through the running HTTPS link with the lowest-cost listed models. It starts a long reply; while it streams (on a mobile-sized window) it types, presses Enter, attaches a file, changes the model and tries dictation, checks Send is unavailable, then presses **Stop reply**. It then sends the queued draft and checks the reply uses the mid-reply file, which belongs only to the new turn, and that another account cannot read it. It deletes only its synthetic accounts.
+
 ## Source map
 
-`components/chat-app.tsx` and `app/globals.css` implement the interface. `app/api/[...segments]/route.ts` handles the API. `lib/auth.ts` owns Better Auth; `lib/signup.ts` validates the short signup payload. `lib/demos.ts` contains synthetic samples and `lib/demo-storage.ts` creates owned, transactional demo chats. `lib/store.ts` owns SQLite and ownership, `lib/context.ts` builds bounded context, `lib/copilot.ts` owns runtime isolation, and `lib/stream.ts` handles durable streaming. `scripts/extract-file.mjs` is the document/image worker; `lib/media.ts` and `scripts/media-worker.py` handle local recordings. `sandbox/run-job.py` is the root-owned WSL runner, `scripts/setup-sandbox.mjs` the owner-only setup, `lib/sandbox.ts` the framed bridge and `lib/code-tool.ts` the `run_python` tool. `scripts/serve.mjs` is the loopback-bound launcher.
+`components/chat-app.tsx` and `app/globals.css` implement the interface. `app/api/[...segments]/route.ts` handles the API. `lib/auth.ts` owns Better Auth; `lib/signup.ts` validates the short signup payload. `lib/demos.ts` contains synthetic samples and `lib/demo-storage.ts` creates owned, transactional demo chats. `lib/store.ts` owns SQLite and ownership, `lib/context.ts` builds bounded context, `lib/copilot.ts` owns runtime isolation, and `lib/stream.ts` handles durable streaming. `scripts/extract-file.mjs` is the document/image worker; `lib/media.ts` and `scripts/media-worker.py` handle local recordings. `sandbox/run-job.py` is the root-owned WSL runner, `scripts/setup-sandbox.mjs` the owner-only setup, `lib/sandbox.ts` the framed bridge and `lib/code-tool.ts` the `run_python` tool. `scripts/serve.mjs` is the loopback-bound launcher; `scripts/tunnel.mjs` manages the separate Quick Tunnel and app processes.
 
 Official references used for this implementation:
 

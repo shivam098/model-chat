@@ -1,10 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { networkPolicy } from "../lib/network-policy.mjs";
+import { readTunnelState, sameProcess } from "../lib/process-tools.mjs";
 import http from "node:http";
 
 function directRequest(url: string, init: { method?: string; headers?: Record<string, string>; body?: string } = {}): Promise<Response> {
@@ -29,6 +31,58 @@ test("tunnel origins must be explicit, exact HTTPS Quick Tunnel origins", () => 
   assert.equal(networkPolicy(3210, "https://example-name.trycloudflare.com").tunnelMode, true);
   for (const invalid of ["http://example.trycloudflare.com", "https://evil.test", "https://foo.trycloudflare.com.evil.test", "https://foo.trycloudflare.com/path", "https://user@foo.trycloudflare.com", "https://foo.trycloudflare.com:444"]) {
     assert.throws(() => networkPolicy(3210, invalid));
+  }
+});
+test("the app adopts only a live app-owned tunnel and refuses a stale or forged status file", async () => {
+  const directory = await mkdtemp(path.resolve(".local", "tunnel-state-test-"));
+  const file = path.join(directory, "tunnel.json");
+  try {
+    const now = new Date().toISOString();
+    for (const state of [
+      { version: 2, url: "https://stale-link.trycloudflare.com", pid: process.pid, port: 3214, createdAt: now },
+      { version: 2, url: "https://api.trycloudflare.com", pid: process.pid, port: 3214, createdAt: now },
+      { version: 2, url: "https://evil.test", pid: process.pid, port: 3214, createdAt: now },
+      { url: "https://old-format.trycloudflare.com", pid: process.pid },
+      { version: 2, url: "https://other-port.trycloudflare.com", pid: process.pid, port: 3999, createdAt: now },
+    ]) {
+      writeFileSync(file, JSON.stringify(state));
+      assert.equal(readTunnelState(file, 3214), null, JSON.stringify(state));
+    }
+    // A live process of another kind, or one created after the record (a reused PID), is never adopted.
+    assert.equal(sameProcess(process.pid, now, ["cloudflared.exe", "cloudflared"]), false);
+    assert.equal(sameProcess(process.pid, Date.now() - 3_600_000, ["node.exe", "node"]), false);
+    assert.equal(sameProcess(process.pid, now, ["node.exe", "node"]), true);
+    writeFileSync(file, JSON.stringify({ version: 2, url: "https://stale-link.trycloudflare.com", pid: process.pid, port: 3214 }));
+    const result = spawnSync(process.execPath, ["scripts/serve.mjs", "--port", "3214", "--tunnel"], { env: { ...process.env, MODEL_CHAT_DATA_DIR: directory }, encoding: "utf8", timeout: 60_000 });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /No running app-owned Cloudflare tunnel/);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+test("a detached server stops gracefully only for a stop request naming this exact instance", { timeout: 120_000 }, async () => {
+  const directory = await mkdtemp(path.resolve(".local", "app-stop-test-"));
+  const child = spawn(process.execPath, ["scripts/serve.mjs", "--port", "3214"], { env: { ...process.env, MODEL_CHAT_DATA_DIR: directory }, stdio: "ignore" });
+  const exited = new Promise<number | null>(resolve => child.once("exit", resolve));
+  const statePath = path.join(directory, "app-state.json");
+  const stopPath = path.join(directory, "app-stop.json");
+  try {
+    let state: { pid: number; startedAt: string; tunnel: boolean; origin: string } | undefined;
+    for (let attempt = 0; attempt < 60 && !state; attempt++) {
+      try { state = JSON.parse(readFileSync(statePath, "utf8")); } catch { await delay(1000); }
+    }
+    assert.ok(state, "The server records its instance after listening");
+    assert.equal(state.pid, child.pid);
+    assert.equal(state.tunnel, false);
+    assert.equal(state.origin, "http://127.0.0.1:3214");
+    writeFileSync(stopPath, JSON.stringify({ pid: child.pid, startedAt: "2000-01-01T00:00:00.000Z" }));
+    await delay(3000);
+    assert.equal(child.exitCode, null, "A stop request for an earlier instance with the same PID is ignored");
+    writeFileSync(stopPath, JSON.stringify({ pid: child.pid, startedAt: state.startedAt }));
+    assert.equal(await Promise.race([exited, delay(30_000).then(() => "timeout")]), 0);
+    assert.equal(existsSync(statePath), false, "The instance record is removed on a graceful stop");
+    assert.equal(existsSync(path.join(directory, "server.lock")), false, "The data-directory lock is released");
+  } finally {
+    if (child.exitCode === null) child.kill();
+    await rm(directory, { recursive: true, force: true });
   }
 });
 test("tunnel mode allows email/password signup without OTP and preserves secure login and origin protections", { timeout: 90_000 }, async () => {
