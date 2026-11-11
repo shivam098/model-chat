@@ -5,6 +5,7 @@ import next from "next";
 import env from "@next/env";
 import { networkPolicy } from "../lib/network-policy.mjs";
 import { readTunnelState } from "../lib/process-tools.mjs";
+import { stableLinkOrigin } from "../lib/stable-link.mjs";
 
 env.loadEnvConfig(process.cwd());
 const portIndex = process.argv.indexOf("--port");
@@ -21,6 +22,7 @@ if (process.argv.includes("--tunnel")) {
 }
 const policy = networkPolicy(port, process.env.MODEL_CHAT_TUNNEL_ORIGIN);
 process.env.MODEL_CHAT_ORIGIN = policy.origin;
+const stableOrigin = stableLinkOrigin();
 for (const name of ["public", ".next", ".next-candidate"]) {
   const webDirectory = path.resolve(name);
   if (data === webDirectory || data.startsWith(webDirectory + path.sep)) throw new Error("MODEL_CHAT_DATA_DIR must be outside public/ and build directories.");
@@ -65,6 +67,14 @@ const server = createServer((req, res) => {
     } else {
       res.writeHead(403, { "Content-Type": "text/plain" }).end("HTTPS is required for remote access.");
     }
+    return;
+  }
+  if (local && policy.tunnelMode && req.method === "GET" && req.url.split("?")[0] === "/api/link-status" && req.headers.host === new URL(policy.origin).host) {
+    // Constant liveness answer for the shareable-link page: no cookies are read and nothing changes.
+    // Only that page's origin may read it cross-origin; every other route keeps the checks below.
+    const headers = { "Content-Type": "application/json", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", Vary: "Origin" };
+    if (stableOrigin && req.headers.origin === stableOrigin) headers["Access-Control-Allow-Origin"] = stableOrigin;
+    res.writeHead(200, headers).end('{"ok":true}');
     return;
   }
   const pageNavigation = req.method === "GET" && req.url.split("?")[0] === "/" && req.headers["sec-fetch-mode"] === "navigate";

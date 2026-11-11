@@ -92,7 +92,7 @@ test("tunnel mode allows email/password signup without OTP and preserves secure 
   let child: ChildProcess | undefined;
   const start = async (tunnelMode: boolean) => {
     child = spawn(process.execPath, ["scripts/serve.mjs", "--port", "3213"], {
-      env: { ...process.env, MODEL_CHAT_DATA_DIR: directory, MODEL_CHAT_TUNNEL_ORIGIN: tunnelMode ? remote : "" },
+      env: { ...process.env, MODEL_CHAT_DATA_DIR: directory, MODEL_CHAT_TUNNEL_ORIGIN: tunnelMode ? remote : "", MODEL_CHAT_PAGES_REPO: "example-owner/model-chat" },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let logs = "";
@@ -157,6 +157,25 @@ test("tunnel mode allows email/password signup without OTP and preserves secure 
     assert.equal(unmodified.user.id, ordinary.user.id, "An invented acting cookie is not an authorization source.");
     assert.equal((await directRequest(local + "/api/chats", { headers })).status, 401);
     assert.equal((await directRequest(local + "/api/chats", { method: "POST", headers: { ...headers, origin: "https://evil.test" } })).status, 403);
+    // The shareable-link page may read only the constant status reply, never other routes.
+    const pagesOrigin = "https://example-owner.github.io";
+    const status = await directRequest(local + "/api/link-status?t=1", { headers: { ...headers, origin: pagesOrigin } });
+    assert.equal(status.status, 200);
+    assert.deepEqual(await status.json(), { ok: true });
+    assert.equal(status.headers.get("access-control-allow-origin"), pagesOrigin);
+    assert.equal(status.headers.get("access-control-allow-credentials"), null);
+    assert.equal(status.headers.get("set-cookie"), null);
+    const otherOrigin = await directRequest(local + "/api/link-status", { headers: { ...headers, origin: "https://evil.test" } });
+    assert.equal(otherOrigin.status, 200);
+    assert.equal(otherOrigin.headers.get("access-control-allow-origin"), null);
+    assert.equal((await directRequest(local + "/api/link-status", { method: "POST", headers: { ...headers, origin: pagesOrigin }, body: "{}" })).status, 403);
+    assert.equal((await directRequest(local + "/api/link-status", { headers: { ...headers, "x-forwarded-proto": "http" } })).status, 308);
+    assert.equal((await directRequest(local + "/api/link-status", { headers: { ...headers, host: "evil.test" } })).status, 403);
+    for (const route of ["/api/access", "/api/health", "/api/chats"]) {
+      const response = await directRequest(local + route, { headers: { ...headers, origin: pagesOrigin } });
+      assert.equal(response.status, 403, `${route} keeps rejecting other origins`);
+      assert.equal(response.headers.get("access-control-allow-origin"), null);
+    }
     const insecure = await directRequest(local + "/", { headers: { ...headers, "x-forwarded-proto": "http" } });
     assert.equal(insecure.status, 308);
     assert.equal(insecure.headers.get("location"), remote + "/");

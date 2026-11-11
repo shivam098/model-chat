@@ -9,6 +9,7 @@ import env from "@next/env";
 import Database from "better-sqlite3";
 import { runtimeEnvironment } from "../lib/runtime-env.mjs";
 import { CLOUDFLARED, NODE, isCloudflared, isNode, processImage, readTunnelState, sameProcess } from "../lib/process-tools.mjs";
+import { publishStableLink, readStableLink, stableLinkConfig } from "../lib/stable-link.mjs";
 
 env.loadEnvConfig(process.cwd());
 const command = process.argv[2] || "start";
@@ -136,6 +137,33 @@ async function verifyPublic(url) {
   }
   throw new Error(`The public link did not respond: ${last}`);
 }
+// Keeps the shareable GitHub Pages link pointing at the current tunnel (or "offline"). A failure here never
+// stops the app or tunnel; the owner can retry with npm run link:publish.
+async function syncStableLink(url, { required = false } = {}) {
+  let config;
+  try { config = stableLinkConfig(); } catch (error) { if (required) throw error; console.warn(`Warning: ${error.message}`); return; }
+  if (!config) {
+    if (required) throw new Error("No shareable link is configured. Set MODEL_CHAT_PAGES_REPO in .env.local (see README).");
+    return;
+  }
+  try {
+    const result = await publishStableLink(url);
+    const target = url ?? "an offline notice";
+    console.log(result.changed ? `Shareable link updated: ${config.address} now opens ${target}. GitHub Pages applies it in about 30 seconds.` : `Shareable link already up to date: ${config.address} opens ${target}.`);
+  } catch (error) {
+    if (required) throw error;
+    console.warn(`Warning: could not update the shareable link ${config.address}: ${error.message}\nThis does not affect the app or tunnel. Retry with: npm run link:publish`);
+  }
+}
+async function stableLinkStatus(tunnel) {
+  let config;
+  try { config = stableLinkConfig(); } catch (error) { return { error: error.message }; }
+  if (!config) return null;
+  try {
+    const published = await readStableLink(config);
+    return { address: config.address, opens: published.online ? published.url : "offline notice", pointsToCurrent: published.online ? published.url === tunnel?.url : !tunnel };
+  } catch (error) { return { address: config.address, opens: `unavailable (${error.message})`, pointsToCurrent: false }; }
+}
 
 if (command === "status") {
   const tunnel = readTunnelState(files.tunnel, port);
@@ -148,6 +176,7 @@ if (command === "status") {
   console.log(JSON.stringify({
     url: tunnel?.url ?? null, tunnel: tunnel ? { pid: tunnel.pid, since: tunnel.createdAt } : null,
     app: app ? { pid: app.pid, origin: app.origin, behindTunnel: Boolean(tunnel && app.origin === tunnel.url) } : null, public: publicStatus,
+    stableLink: await stableLinkStatus(tunnel),
   }, null, 2));
 } else if (command === "start") {
   let tunnel = readTunnelState(files.tunnel, port);
@@ -166,7 +195,9 @@ if (command === "status") {
     console.log(`App started (pid ${await startApp()}).`);
   }
   await verifyPublic(tunnel.url);
-  console.log(`\nYour Model Chat link: ${tunnel.url}\nThe link stays the same when you update the app with npm run app:update (or npm run app:restart). It changes only if the tunnel process stops, for example after a PC restart.\n`);
+  await syncStableLink(tunnel.url);
+  const stable = (() => { try { return stableLinkConfig()?.address; } catch { return null; } })();
+  console.log(`\nYour Model Chat link: ${tunnel.url}${stable ? `\nShareable link (always opens the current one): ${stable}` : ""}\nThe link stays the same when you update the app with npm run app:update (or npm run app:restart). It changes only if the tunnel process stops, for example after a PC restart.\n`);
 } else if (command === "restart-app") {
   const tunnel = readTunnelState(files.tunnel, port);
   if (!tunnel) throw new Error("No tunnel is running. Run npm run tunnel to start one.");
@@ -193,6 +224,11 @@ if (command === "status") {
   if (tunnel) process.kill(tunnel.pid);
   try { unlinkSync(files.tunnel); } catch { /* Already removed. */ }
   console.log(tunnel ? `Stopped the app and the tunnel (${tunnel.url} is no longer valid).` : "Stopped the app; no tunnel was running.");
+  await syncStableLink(null);
+} else if (command === "publish-link") {
+  // Publishes the live tunnel, or "offline" when none is running.
+  const tunnel = readTunnelState(files.tunnel, port);
+  await syncStableLink(tunnel?.url ?? null, { required: true });
 } else {
-  throw new Error("Usage: node scripts/tunnel.mjs [start|restart-app [--build]|status|stop] [--force] [--port N]");
+  throw new Error("Usage: node scripts/tunnel.mjs [start|restart-app [--build]|status|stop|publish-link] [--force] [--port N]");
 }

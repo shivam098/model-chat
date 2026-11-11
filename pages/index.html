@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self' https://*.trycloudflare.com; img-src data:; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex">
+<title>Model Chat</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%233f6b4b'/%3E%3Cpath d='M10 22c0-8 5-12 13-12-1 8-5 12-13 12zm0 0 7-7' stroke='%23fff' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+  :root { color-scheme: light; font-family: "Segoe UI", system-ui, -apple-system, sans-serif; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f6f7f4; color: #26302a; }
+  main { width: min(26rem, calc(100% - 3rem)); text-align: center; }
+  h1 { margin: 0 0 1rem; font-size: 1.6rem; font-weight: 650; letter-spacing: -0.01em; }
+  h1 span { color: #3f6b4b; }
+  p { margin: 0.75rem 0; line-height: 1.5; }
+  #message { font-size: 1.05rem; }
+  .muted { color: #67706a; font-size: 0.92rem; }
+  a { color: #2f5d3b; }
+  button { margin-top: 0.5rem; padding: 0.55rem 1.1rem; border: 1px solid #3f6b4b; border-radius: 0.6rem; background: #3f6b4b; color: #fff; font: inherit; cursor: pointer; }
+  button:hover { background: #355b40; }
+</style>
+<script src="forward.js" defer></script>
+</head>
+<body data-state="loading">
+<main>
+  <h1>model<span>chat</span></h1>
+  <p id="message" role="status" aria-live="polite">Finding the current Model Chat link…</p>
+  <p id="fallback" class="muted" hidden><span id="fallback-text">If nothing happens,</span> <a id="link" href="#" rel="noreferrer">open Model Chat</a>.</p>
+  <p id="actions" hidden><button id="retry" type="button">Check again</button></p>
+  <noscript><p>This page needs JavaScript to find the current Model Chat link.</p></noscript>
+</main>
+</body>
+</html>

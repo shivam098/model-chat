@@ -50,6 +50,28 @@ Both wait for streaming replies to finish (up to 10 minutes); add `-- --force` t
 
 The launcher uses an app-owned minimal Cloudflare config instead of modifying any existing global tunnel configuration, and disables auto-updates. `.local/tunnel.json` records the active link and its cloudflared process; the app trusts it only while that process is still running, and adopts the link at startup as its exact public origin (`scripts/serve.mjs --tunnel`). Restarts use a graceful stop request (`.local/app-stop.json`) so file processing and streams are checkpointed; a server that does not stop within 45 seconds is ended, and interrupted work is recovered on the next start.
 
+### One shareable link (GitHub Pages)
+
+Share **https://shivam098.github.io/model-chat/** instead of the `trycloudflare.com` link. It is a small static page served by GitHub Pages from the `gh-pages` branch of this repository (`main` is not used for it). Each time someone opens it, the page reads the current tunnel link (`link.json`, fetched fresh), checks that Model Chat answers, and forwards them. A plain "open Model Chat" link is shown in case forwarding doesn't happen. If the app can't be reached, the page says so instead of opening a Cloudflare error. It shows the last published link as a fallback and checks again every 15 seconds. After `npm run tunnel:stop` it shows "offline".
+
+- `npm run tunnel` publishes the new link automatically whenever it creates a new tunnel.
+- `npm run tunnel:stop` marks the page offline.
+- `npm run link:publish` publishes the current state by hand, for example after an automatic publish failed.
+- `npm run tunnel:status` shows the shareable address, what it currently opens, and `pointsToCurrent`.
+
+Setup: set `MODEL_CHAT_PAGES_REPO=owner/repository` in `.env.local`; this PC uses `shivam098/model-chat`. Without it, nothing is published.
+
+Publishing uses the GitHub CLI's **stored login of the repository owner** (`gh auth token --user <owner>`, or `MODEL_CHAT_PAGES_ACCOUNT`). The token is held in memory only for the GitHub API calls; it is never passed on a command line or written to disk or output. The active GitHub CLI account is not switched. Commits use the account's noreply address. The first publish creates the `gh-pages` branch and turns on GitHub Pages with HTTPS enforced. A failed automatic publish only prints a warning; the app and tunnel are not affected.
+
+Limitations:
+
+- **A new link takes effect about 20–35 seconds after it is published** (measured 22–33 s), which is how long GitHub Pages takes to deploy. Browser caching does not delay it, because the page fetches `link.json` fresh on every visit.
+- **Users must sign in again after the tunnel link changes.** Sign-in cookies belong to each `trycloudflare.com` address.
+- **The page doesn't work while the PC, tunnel or app is down.** It only forwards; it can't start anything. If the tunnel stops without `tunnel:stop` (PC restart, sign-out, crash), the page keeps the last link but reports "not reachable" until someone runs `npm run tunnel`.
+- The page and the current tunnel address are public: the `gh-pages` branch of a public repository. The page asks search engines not to index it. Anyone who has it can reach the signup page, the same as with the tunnel link.
+- GitHub Pages allows about 10 builds per hour; each new tunnel or stop is one build. The page needs JavaScript.
+- For the reachability check, the app answers one constant, read-only request (`/api/link-status`) that only the Pages site may read from another origin. It reads no cookies; every other route keeps its existing Host/Origin checks.
+
 ### Copilot sign-in
 
 The backend uses the official SDK's **stored CLI / supported GitHub CLI credential fallback**. It never reads, exports, or copies credentials itself. SDK/runtime configuration and sessions are isolated under this app's data directory. Authentication can reuse this machine's existing sign-in; it is not guaranteed that a desktop-app sign-in alone is sufficient.
@@ -230,7 +252,7 @@ To build and validate without replacing an active server's bundles, set `$env:MO
 
 Focused tests cover ownership on guessed IDs, persistence/reopen/model context, restart-interrupted state, file formats and rejection limits, stream success/cancel/error/output caps, origin checks, and voice feature detection. The restart integration test launches and stops a real production server on port 3212, checks server-side cookies and password login across a restart, checks stored passwords are not plaintext, and verifies file/history recovery. It requires a prior build and cleans up its own temporary data directory.
 
-The tunnel integration test uses port 3213 and synthetic accounts to verify new signup without OTP, existing-account login/logout, invalid credentials, two-account demo isolation, Secure cookies, origin rejection, and local-to-HTTPS redirects. It also checks that the app refuses a stale, forged, old-format or other-port tunnel status file. It does not create a real external tunnel or send credentials to Cloudflare.
+The tunnel integration test uses port 3213 and synthetic accounts to verify new signup without OTP, existing-account login/logout, invalid credentials, two-account demo isolation, Secure cookies, origin rejection, and local-to-HTTPS redirects. It also checks that the app refuses a stale, forged, old-format or other-port tunnel status file, and that only the shareable-link page's origin can read the constant `/api/link-status` reply while every other route still rejects it. It does not create a real external tunnel or send credentials to Cloudflare. The browser suite also serves `pages/` locally and checks that the shareable-link page forwards only to an exact `https://<name>.trycloudflare.com` origin, shows "offline" or "not reachable" instead of forwarding to an error, re-checks automatically, and never contacts any other address. `tests/stable-link.test.ts` checks that publishing rejects every other URL before using any GitHub login.
 
 `npm run test:media` uses the configured local Whisper runtime and Windows' installed speech synthesizer to generate and transcribe synthetic WAV/MP3/video fixtures. It checks real words, silent video sampling, limits, cancellation, revoked access, owned storage and reopen behavior. It does not call Copilot or use user uploads. To add real media upload/preview/cancellation checks to the browser flow:
 
@@ -266,7 +288,7 @@ For an explicit end-to-end check of the **currently running public tunnel**, `np
 
 ## Source map
 
-`components/chat-app.tsx` and `app/globals.css` implement the interface. `app/api/[...segments]/route.ts` handles the API. `lib/auth.ts` owns Better Auth; `lib/signup.ts` validates the short signup payload. `lib/demos.ts` contains synthetic samples and `lib/demo-storage.ts` creates owned, transactional demo chats. `lib/store.ts` owns SQLite and ownership, `lib/context.ts` builds bounded context, `lib/copilot.ts` owns runtime isolation, and `lib/stream.ts` handles durable streaming. `scripts/extract-file.mjs` is the document/image worker; `lib/media.ts` and `scripts/media-worker.py` handle local recordings. `sandbox/run-job.py` is the root-owned WSL runner, `scripts/setup-sandbox.mjs` the owner-only setup, `lib/sandbox.ts` the framed bridge and `lib/code-tool.ts` the `run_python` tool. `scripts/serve.mjs` is the loopback-bound launcher; `scripts/tunnel.mjs` manages the separate Quick Tunnel and app processes.
+`components/chat-app.tsx` and `app/globals.css` implement the interface. `app/api/[...segments]/route.ts` handles the API. `lib/auth.ts` owns Better Auth; `lib/signup.ts` validates the short signup payload. `lib/demos.ts` contains synthetic samples and `lib/demo-storage.ts` creates owned, transactional demo chats. `lib/store.ts` owns SQLite and ownership, `lib/context.ts` builds bounded context, `lib/copilot.ts` owns runtime isolation, and `lib/stream.ts` handles durable streaming. `scripts/extract-file.mjs` is the document/image worker; `lib/media.ts` and `scripts/media-worker.py` handle local recordings. `sandbox/run-job.py` is the root-owned WSL runner, `scripts/setup-sandbox.mjs` the owner-only setup, `lib/sandbox.ts` the framed bridge and `lib/code-tool.ts` the `run_python` tool. `scripts/serve.mjs` is the loopback-bound launcher; `scripts/tunnel.mjs` manages the separate Quick Tunnel and app processes. `pages/` is the shareable-link page and `lib/stable-link.mjs` publishes it.
 
 Official references used for this implementation:
 
