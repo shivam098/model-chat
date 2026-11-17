@@ -11,7 +11,7 @@ test.beforeAll(async () => {
   server = createServer((request, response) => {
     const name = new URL(request.url!, pageOrigin).pathname.replace(/^\/model-chat\//, "") || "index.html";
     if (!["index.html", "forward.js"].includes(name)) return void response.writeHead(404).end();
-    response.writeHead(200, { "Content-Type": name.endsWith(".js") ? "text/javascript" : "text/html" }).end(readFileSync(path.resolve("pages", name)));
+    response.writeHead(200, { "Content-Type": name.endsWith(".js") ? "text/javascript" : "text/html" }).end(readFileSync(path.resolve("link-page", name)));
   });
   await new Promise<void>(resolve => server.listen(3216, "127.0.0.1", resolve));
 });

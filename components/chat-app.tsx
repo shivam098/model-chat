@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { ArrowDown, ArrowUp, BookOpen, Check, ChevronDown, Code2, Eye, FileText, Leaf, LoaderCircle, LogOut, Menu, MessageSquare, Mic, PanelLeft, Paperclip, Pencil, Plus, RefreshCw, Settings2, ShieldCheck, Square, Trash2, Volume2, X } from "lucide-react";
+import { ArrowDown, ArrowRight, ArrowUp, BookOpen, ChevronDown, Code2, Eye, FileText, Leaf, LoaderCircle, LogOut, Menu, MessageSquare, Mic, PanelLeft, Paperclip, Pencil, Plus, RefreshCw, Settings2, ShieldCheck, Square, Trash2, Volume2, X } from "lucide-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { FILE_ACCEPT, LIMITS, type Attachment, type Chat, type ChatDetail, type Model, type StreamEvent } from "@/lib/contracts";
@@ -23,7 +23,49 @@ function message(error: unknown) { return error instanceof Error ? error.message
 function IconButton({ label, children, ...props }: React.ButtonHTMLAttributes<HTMLButtonElement> & { label: string }) {
   return <button type="button" className="icon-button" aria-label={label} title={label} {...props}>{children}</button>;
 }
-function Brand() { return <div className="brand"><span className="brand-icon"><Leaf size={22} /></span><span>model<span className="brand-light">chat</span></span></div>; }
+function Brand() { return <div className="brand"><span className="brand-icon" aria-hidden="true"><Leaf size={16} /></span><span>model<span className="brand-light">chat</span></span></div>; }
+function formatSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+const fileKind = (name: string) => (name.includes(".") ? name.split(".").pop()!.toUpperCase() : "File");
+// The sample budget from the built-in demo, drawn as the sign-in preview.
+const PREVIEW_BUDGET = [
+  { category: "Groceries", planned: 320, actual: 355 },
+  { category: "Transport", planned: 120, actual: 95 },
+  { category: "Books", planned: 80, actual: 50 },
+  { category: "Entertainment", planned: 100, actual: 145 },
+];
+function BudgetPreview() {
+  const left = 120;
+  const width = 260;
+  const scale = (value: number) => Math.round(value / 360 * width);
+  return <figure className="auth-preview" aria-label="Example conversation from the sample budget demo">
+    <figcaption className="preview-label">Example · sample budget demo</figcaption>
+    <div className="preview-user"><span className="preview-chip"><FileText size={16} /> sample-budget.csv</span><p>Which category went furthest over budget?</p></div>
+    <div className="preview-reply">
+      <span className="model-tag">Claude Sonnet 5.5</span>
+      <p>Entertainment, by 45 USD. You planned 620 USD and spent 645 USD in total.</p>
+      <div className="exhibit preview-exhibit">
+        <svg viewBox="0 0 430 128" role="img" aria-label="Planned and actual spending for four categories; entertainment is furthest over">
+          {[0, 120, 240, 360].map(value => <line key={value} x1={left + scale(value)} x2={left + scale(value)} y1="4" y2="124" className="preview-grid" />)}
+          {PREVIEW_BUDGET.map((row, index) => {
+            const y = 8 + index * 30;
+            const over = row.category === "Entertainment";
+            return <g key={row.category}>
+              <text x="4" y={y + 14} className="preview-axis">{row.category}</text>
+              <rect x={left} y={y} width={scale(row.planned)} height="8" rx="2" className="bar-planned" />
+              <rect x={left} y={y + 10} width={scale(row.actual)} height="8" rx="2" className={over ? "bar-over" : "bar-actual"} />
+              <text x={left + scale(row.actual) + 8} y={y + 18} className={over ? "preview-value over" : "preview-value"}>{row.actual}</text>
+            </g>;
+          })}
+        </svg>
+        <figcaption><span>budget-chart.png</span><span className="legend"><i className="swatch planned" />Planned<i className="swatch actual" />Actual<i className="swatch over" />Furthest over</span></figcaption>
+      </div>
+    </div>
+  </figure>;
+}
 
 export function ChatApp() {
   const [user, setUser] = useState<User | null>(null);
@@ -755,9 +797,9 @@ export function ChatApp() {
   const navigation = <>
     {menu && <Dialog title="Menu" onClose={() => setMenu(false)}>
       <div className="menu-items">
-        <button onClick={() => { setMenu(false); setHow(true); }}><BookOpen size={20} /><span>How Model Chat works &amp; Demos</span></button>
-        {user && <button onClick={() => { setMenu(false); setSettings(true); }}><Settings2 size={20} /><span>Account &amp; connection</span></button>}
-        {actor?.appRole === "superuser" && !acting && <button onClick={() => { setMenu(false); setAdmin(true); }}><ShieldCheck size={20} /><span>Users &amp; audit</span></button>}
+        <button onClick={() => { setMenu(false); setHow(true); }}><BookOpen size={16} /><span>How Model Chat works &amp; Demos</span></button>
+        {user && <button onClick={() => { setMenu(false); setSettings(true); }}><Settings2 size={16} /><span>Account &amp; connection</span></button>}
+        {actor?.appRole === "superuser" && !acting && <button onClick={() => { setMenu(false); setAdmin(true); }}><ShieldCheck size={16} /><span>Users &amp; audit</span></button>}
       </div>
     </Dialog>}
     {how && <Dialog title="How Model Chat works & Demos" onClose={() => { if (!demoLoading) setHow(false); }}>
@@ -776,8 +818,8 @@ export function ChatApp() {
       {!user && <p className="demo-guidance">Sign in or create an account first to load an example.</p>}
       {user && locked && <p className="demo-guidance" role="status">{demoLoading ? "Opening your example..." : "Finish or stop the current operation before loading an example."}</p>}
       <div className="demo-cards">{DEMOS.map(sample => <button key={sample.id} disabled={!user || locked} onClick={() => void launchDemo(sample.id)} aria-label={`Load ${sample.title}`}>
-        {sample.id === "budget" ? <FileText size={21} /> : sample.id === "writing" ? <Pencil size={21} /> : <MessageSquare size={21} />}
-        <strong>{sample.title}</strong><span>{sample.description}</span><small>Load example draft <ArrowUp size={12} className="arrow-right" /></small>
+        {sample.id === "budget" ? <FileText size={16} /> : sample.id === "writing" ? <Pencil size={16} /> : <MessageSquare size={16} />}
+        <strong>{sample.title}</strong><span>{sample.description}</span><small>Load example draft <ArrowRight size={16} /></small>
       </button>)}</div>
       <div className="settings-section"><h3><Mic size={16} /> Voice and files</h3><p>Dictate uses your browser&apos;s speech service, which may process audio online. Read aloud uses browser voices. Uploaded recordings are different: their speech is transcribed locally with Whisper, and video adds up to four sampled frames. Review extracted text with the eye icon before sending.</p><p>Uploads are saved in parts and processed in the background. There is no preset total upload-size, media-duration, or processing-time cutoff. Keep chatting or switch conversations while processing; cancel or retry from the file card. Available disk space, safe-format/decoder budgets, and model context still apply. Large files use labeled excerpts in model requests; full extracted text is available in pages. Videos and images need a vision model. Sampled frames are not continuous video understanding. No files are executed.</p></div>
     </Dialog>}
@@ -788,27 +830,27 @@ export function ChatApp() {
   return <div className="app-shell">
     {sidebar && <button className="sidebar-backdrop" aria-label="Close sidebar" onClick={() => setSidebar(false)} />}
     <aside className={`sidebar ${sidebar ? "open" : ""}`}>
-      <div className="sidebar-brand"><Brand /><IconButton label="Close sidebar" onClick={() => setSidebar(false)}><X size={18} /></IconButton></div>
-      <button className="new-chat" onClick={() => void newChat()} disabled={locked}><Plus size={18} /> New conversation <span>+</span></button>
-      <div className="sidebar-label">YOUR CONVERSATIONS <span>{chats.length}</span></div>
+      <div className="sidebar-brand"><Brand /><IconButton label="Close sidebar" onClick={() => setSidebar(false)}><X size={16} /></IconButton></div>
+      <button className="new-chat" onClick={() => void newChat()} disabled={locked}><Plus size={16} /> New conversation</button>
+      <div className="sidebar-label">Conversations <span>{chats.length}</span></div>
       <nav className="chat-list" aria-label="Chat history">
-        {chats.length === 0 && <p className="history-empty">A little space for your thoughts.<br />Your conversations will live here.</p>}
+        {chats.length === 0 && <p className="history-empty">No conversations yet</p>}
         {chats.map(chat => <div className={`chat-item ${detail?.chat.id === chat.id ? "selected" : ""}`} key={chat.id}>
-          <button className="chat-select" onClick={() => void openChat(chat)} disabled={locked}><MessageSquare size={15} /><span>{chat.title}</span></button>
+          <button className="chat-select" onClick={() => void openChat(chat)} disabled={locked}><MessageSquare size={16} /><span>{chat.title}</span></button>
           <div className="chat-actions">
-            <IconButton label={`Rename ${chat.title}`} disabled={locked} onClick={() => { setEditingTitle(chat.title); setRename(chat); }}><Pencil size={13} /></IconButton>
-            <IconButton label={`Delete ${chat.title}`} disabled={locked} onClick={() => setDeleteChat(chat)}><Trash2 size={13} /></IconButton>
+            <IconButton label={`Rename ${chat.title}`} disabled={locked} onClick={() => { setEditingTitle(chat.title); setRename(chat); }}><Pencil size={16} /></IconButton>
+            <IconButton label={`Delete ${chat.title}`} disabled={locked} onClick={() => setDeleteChat(chat)}><Trash2 size={16} /></IconButton>
           </div>
         </div>)}
       </nav>
       <div className="sidebar-footer">
-        <div className="local-badge"><span className="status-dot" /> {access.tunnelMode ? "Temporary tunnel" : "Personal & local"} <ShieldCheck size={14} /></div>
-        <button className="account-button" onClick={() => setSettings(true)}><span className="avatar">{user.name.slice(0, 1).toUpperCase()}</span><span className="account-text"><strong>{user.name}</strong><small>Account & connection</small></span><Settings2 size={17} /></button>
+        <div className="local-badge"><span className="status-dot" /> {access.tunnelMode ? "Temporary public link" : "Local only"}</div>
+        <button className="account-button" onClick={() => setSettings(true)}><span className="avatar">{user.name.slice(0, 1).toUpperCase()}</span><span className="account-text"><strong>{user.name}</strong><small>Account & connection</small></span><Settings2 size={16} /></button>
       </div>
     </aside>
     <main className="main-panel">
       <header className="topbar">
-        <div className="topbar-title"><IconButton label="Open sidebar" onClick={() => setSidebar(true)}><PanelLeft size={20} /></IconButton><button className="menu-button" onClick={() => setMenu(true)}><Menu size={18} /><span>Menu</span></button><span>{detail?.chat.title || "A fresh conversation"}</span></div>
+        <div className="topbar-title"><IconButton label="Open sidebar" onClick={() => setSidebar(true)}><PanelLeft size={16} /></IconButton><button className="menu-button" onClick={() => setMenu(true)}><Menu size={16} /><span>Menu</span></button><span>{detail?.chat.title || "New conversation"}</span></div>
         <div className="model-control">
           <span className={`status-dot ${connectionError ? "offline" : ""}`} />
           <select aria-label="Select model" value={selectedModel} disabled={composeLocked || modelLoading || !models.length} onChange={event => { setSelectedModel(event.target.value); setDraftState("saving"); }}>
@@ -816,12 +858,12 @@ export function ChatApp() {
             {selectedModel && !modelAvailable && <option value={selectedModel}>{selectedModel} (unavailable)</option>}
             {models.map(model => <option value={model.id} key={model.id}>{model.name}{model.vision ? " · vision" : ""}{model.multiplier !== undefined ? ` · ${model.multiplier}x` : ""}</option>)}
           </select>
-          <ChevronDown size={14} aria-hidden="true" />
-          <IconButton label="Refresh Copilot connection" onClick={() => void refreshModels()} disabled={composeLocked || modelLoading}><RefreshCw size={15} className={modelLoading ? "spin" : ""} /></IconButton>
+          <ChevronDown size={16} aria-hidden="true" />
+          <IconButton label="Refresh Copilot connection" onClick={() => void refreshModels()} disabled={composeLocked || modelLoading}><RefreshCw size={16} className={modelLoading ? "spin" : ""} /></IconButton>
         </div>
       </header>
       {acting && <div className="acting-banner" role="status"><div><strong>Acting as {user.name}</strong><span>{user.email} · Signed in as {actor?.email}. Actions are audited.</span></div><button onClick={() => void returnToSelf()} disabled={locked}>Return to my workspace</button>{(busy || remoteBusy) && <small>Stop the current reply before returning.</small>}</div>}
-      {connectionError && <div className="connection-banner" role="status"><ShieldCheck size={18} /><span>{connectionError}</span><button onClick={() => setSettings(true)}>Setup</button></div>}
+      {connectionError && <div className="connection-banner" role="status"><ShieldCheck size={16} /><span>{connectionError}</span><button onClick={() => setSettings(true)}>Setup</button></div>}
       {notice && <div className="notice" role="alert"><span>{notice}</span><IconButton label="Dismiss message" onClick={() => setNotice("")}><X size={16} /></IconButton></div>}
       <div className="conversation" ref={scroller} onScroll={() => {
         const node = scroller.current;
@@ -829,39 +871,42 @@ export function ChatApp() {
       }}>
         {loadingChat ? <div className="loading-chat"><LoaderCircle className="spin" /> Opening conversation...</div> :
           !detail?.messages.length ? <div className="welcome">
-            <div className="welcome-mark"><Leaf size={34} strokeWidth={1.4} /></div>
-            <div className="eyebrow">YOUR MODELS. ONE QUIET SPACE.</div>
-            <h1>What&apos;s on your mind?</h1>
-            <p>{pending.length ? <>{processing ? "Your files are processing in the background." : readyPending.length ? "Your processed files are ready." : "Your uploads need attention."}<br />You can keep chatting while files are processed.</> : <>Start with a thought, a question, or a file.<br />Pick a model. Make room for an idea.</>}</p>
+            <h1>Start with a question or a file</h1>
+            <p>{pending.length ? processing ? "Your files are processing. You can keep writing meanwhile." : readyPending.length ? "Your files are ready. Ask about them below." : "Some uploads need attention before you send." : "Pick any of your Copilot models above. You can switch models mid-conversation and it keeps the context."}</p>
             {pending.length === 0 && <div className="suggestions">
-              <button onClick={() => { setDraft("Help me think through an idea. Ask me one useful question to get started."); setDraftState("saving"); composer.current?.focus(); }}><MessageSquare size={20} /><strong>Think it through</strong><span>Find a new perspective</span></button>
-              <button onClick={() => fileInput.current?.click()} disabled={uploadLocked}><FileText size={20} /><strong>Explore a document</strong><span>Turn information into insight</span></button>
-              <button onClick={() => { setDraft("Help me write something clear and concise. Ask what I want to communicate."); setDraftState("saving"); composer.current?.focus(); }}><Pencil size={20} /><strong>Find the right words</strong><span>Bring a first draft to life</span></button>
-              {sandboxInfo?.ready && <button onClick={() => { setDraft("Create a one-page PDF report and a matching bar-chart PNG for these sample figures: Q1 = 12, Q2 = 18, Q3 = 15, Q4 = 22. Include a short summary in the PDF."); setDraftState("saving"); composer.current?.focus(); }}><Code2 size={20} /><strong>Make a file</strong><span>PDF, chart, GIF/MP4 or Office</span></button>}
+              <button onClick={() => { setDraft("Help me think through an idea. Ask me one useful question to get started."); setDraftState("saving"); composer.current?.focus(); }}><MessageSquare size={16} /><strong>Think something through</strong><span>The model starts by asking you one question</span></button>
+              <button onClick={() => fileInput.current?.click()} disabled={uploadLocked}><FileText size={16} /><strong>Explore a document</strong><span>CSV, PDF, Word, Excel, images or recordings</span></button>
+              <button onClick={() => { setDraft("Help me write something clear and concise. Ask what I want to communicate."); setDraftState("saving"); composer.current?.focus(); }}><Pencil size={16} /><strong>Write something</strong><span>The model asks what you want to say first</span></button>
+              {sandboxInfo?.ready && <button onClick={() => { setDraft("Create a one-page PDF report and a matching bar-chart PNG for these sample figures: Q1 = 12, Q2 = 18, Q3 = 15, Q4 = 22. Include a short summary in the PDF."); setDraftState("saving"); composer.current?.focus(); }}><Code2 size={16} /><strong>Make a file</strong><span>PDF, chart, GIF or MP4, Word, Excel or PowerPoint</span></button>}
             </div>}
           </div> : <div className="message-list">
             {detail.messages.map(item => <article key={item.id} className={`message ${item.role}`} aria-label={`${item.role === "user" ? "Your" : "Assistant"} message`}>
-              <div className="message-label">{item.role === "user" ? <span className="mini-avatar">{user.name.slice(0, 1).toUpperCase()}</span> : <Leaf size={17} />}
-                <strong>{item.role === "user" ? "You" : models.find(m => m.id === item.model)?.name || item.model}</strong>
-                <span>{new Date(item.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+              <div className="message-label">{item.role === "user" ? <><span className="mini-avatar">{user.name.slice(0, 1).toUpperCase()}</span><strong>You</strong></> : <span className="model-tag">{models.find(m => m.id === item.model)?.name || item.model}</span>}
+                <time>{new Date(item.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>
               </div>
               {item.role === "assistant" ? <div className="markdown">
                 {item.content ? <Markdown remarkPlugins={[remarkGfm]} skipHtml disallowedElements={["img"]} components={{
                   a: ({ href, children }) => <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>,
                 }}>{item.content}</Markdown> : item.status === "streaming" ? <span className="thinking"><i /><i /><i />{busy ? streamStage : "Processing attachments or generating reply"}</span> : <p className="muted">No answer was generated.</p>}
               </div> : <div className="user-text">{item.content}</div>}
-              {item.status === "streaming" && busy && item.content && <div className="tool-stage" role="status"><LoaderCircle className="spin" size={13} />{streamStage}</div>}
-              {detail.attachments.filter(f => f.messageId === item.id && f.preview && f.preview !== "pdf").map(file => {
+              {item.status === "streaming" && busy && item.content && <div className="tool-stage" role="status"><LoaderCircle className="spin" size={16} />{streamStage}</div>}
+              {detail.attachments.filter(f => f.messageId === item.id && f.preview).map(file => {
                 const source = `/api/chats/${file.chatId}/files/${file.id}/preview`;
-                return file.preview === "image"
-                  ? <img key={`preview-${file.id}`} className="generated-preview" src={source} alt={`Generated ${file.name}`} loading="lazy" />
-                  : <video key={`preview-${file.id}`} className="generated-preview" src={source} controls preload="metadata" aria-label={`Generated ${file.name}`} />;
+                if (file.preview === "pdf") return <a key={`preview-${file.id}`} className="exhibit exhibit-pdf" href={source} target="_blank" rel="noopener noreferrer" aria-label={`Preview ${file.name} in a new tab`}>
+                  <span className="sheet" aria-hidden="true"><span>PDF</span></span><span className="exhibit-text"><strong>{file.name}</strong><small>PDF · {formatSize(file.size)} · opens in a new tab</small></span><ArrowRight size={16} />
+                </a>;
+                return <figure key={`preview-${file.id}`} className="exhibit">
+                  {file.preview === "image"
+                    ? <img className="generated-preview" src={source} alt={`Generated ${file.name}`} loading="lazy" />
+                    : <video className="generated-preview" src={source} controls preload="metadata" aria-label={`Generated ${file.name}`} />}
+                  <figcaption><span>{file.name}</span><span>{fileKind(file.name)} · {formatSize(file.size)}</span></figcaption>
+                </figure>;
               })}
-              {detail.attachments.filter(f => f.messageId === item.id).map(file => <span key={file.id}><a className="file-chip sent" title={file.notes} href={`/api/chats/${file.chatId}/files/${file.id}`}><FileText size={14} /><span>{file.name}</span><ArrowDown size={13} /></a>
-                {file.preview === "pdf" ? <a className="icon-button" aria-label={`Open PDF preview of ${file.name}`} title="Open PDF preview" href={`/api/chats/${file.chatId}/files/${file.id}/preview`} target="_blank" rel="noopener noreferrer"><Eye size={14} /></a>
-                  : <IconButton label={`Preview extracted text for ${file.name}`} onClick={() => void previewFile(file)}><Eye size={14} /></IconButton>}</span>)}
+              {detail.attachments.filter(f => f.messageId === item.id).map(file => <span key={file.id} className="sent-file"><a className="file-chip sent" title={file.notes} href={`/api/chats/${file.chatId}/files/${file.id}`}><FileText size={16} /><span>{file.name}</span><ArrowDown size={16} /></a>
+                {file.preview === "pdf" ? <a className="icon-button" aria-label={`Open PDF preview of ${file.name}`} title="Open PDF preview" href={`/api/chats/${file.chatId}/files/${file.id}/preview`} target="_blank" rel="noopener noreferrer"><Eye size={16} /></a>
+                  : <IconButton label={`Preview extracted text for ${file.name}`} onClick={() => void previewFile(file)}><Eye size={16} /></IconButton>}</span>)}
               {item.error && <div className={`message-status ${item.status}`} role="status">{item.error}</div>}
-              {item.role === "assistant" && item.content && item.status !== "streaming" && <button className={`read-aloud ${speaking === item.id ? "active" : ""}`} disabled={!speechAvailable} onClick={() => readAloud(item.id, item.content)}><Volume2 size={14} />{speaking === item.id ? "Stop reading" : "Read aloud"}</button>}
+              {item.role === "assistant" && item.content && item.status !== "streaming" && <button className={`read-aloud ${speaking === item.id ? "active" : ""}`} disabled={!speechAvailable} onClick={() => readAloud(item.id, item.content)}><Volume2 size={16} />{speaking === item.id ? "Stop reading" : "Read aloud"}</button>}
             </article>)}
           </div>}
         <div ref={bottom} />
@@ -877,25 +922,25 @@ export function ChatApp() {
             <IconButton label={`Remove transfer ${transfer.name}`} onClick={() => {
               transferControllers.current.get(transfer.id)?.abort();
               setTransfers(previous => previous.filter(item => item.id !== transfer.id));
-            }}><X size={14} /></IconButton>
+            }}><X size={16} /></IconButton>
           </div>)}</div>}
           {pending.length > 0 && <div className="pending-files">{pending.filter(file => !transfers.some(transfer => transfer.fileId === file.id && !transfer.error)).map(file => {
             const status = file.processingStatus || "ready";
             const running = ["queued", "processing"].includes(status);
             return <div className={`file-chip file-job ${status}`} title={`${file.notes} ${file.characters.toLocaleString()} characters.`} key={file.id}>
               {running ? <LoaderCircle className="spin" size={16} /> : <FileText size={16} />}
-              <span>{file.name}<small>{(file.size / 1024 / 1024).toFixed(1)} MB · {file.processingStage || status}{file.processingProgress && running ? ` · ${Math.round(file.processingProgress * 100)}%` : ""}{file.frameCount ? ` · ${file.frameCount} frames` : ""}</small>{file.processingError && <small className="file-error">{file.processingError}</small>}</span>
-              <IconButton label={`Preview extracted text for ${file.name}`} disabled={status !== "ready"} onClick={() => void previewFile(file)}><Eye size={14} /></IconButton>
-              {file.uploadComplete !== 0 && <a className="icon-button" aria-label={`Download original ${file.name}`} href={`/api/chats/${file.chatId}/files/${file.id}`}><ArrowDown size={14} /></a>}
-              {(running || status === "uploading") && <IconButton label={`Cancel processing ${file.name}`} onClick={() => void controlFile(file, "cancel")}><Square size={14} /></IconButton>}
-              {file.uploadComplete !== 0 && ["failed", "cancelled"].includes(status) && <IconButton label={`Retry processing ${file.name}`} onClick={() => void controlFile(file, "retry")}><RefreshCw size={14} /></IconButton>}
-              <IconButton label={`Remove ${file.name}`} disabled={switching || demoLoading} onClick={() => void removeFile(file)}><X size={14} /></IconButton>
+              <span>{file.name}<small>{formatSize(file.size)} · {file.processingStage || status}{file.processingProgress && running ? ` · ${Math.round(file.processingProgress * 100)}%` : ""}{file.frameCount ? ` · ${file.frameCount} frames` : ""}</small>{file.processingError && <small className="file-error">{file.processingError}</small>}</span>
+              <IconButton label={`Preview extracted text for ${file.name}`} disabled={status !== "ready"} onClick={() => void previewFile(file)}><Eye size={16} /></IconButton>
+              {file.uploadComplete !== 0 && <a className="icon-button" aria-label={`Download original ${file.name}`} href={`/api/chats/${file.chatId}/files/${file.id}`}><ArrowDown size={16} /></a>}
+              {(running || status === "uploading") && <IconButton label={`Cancel processing ${file.name}`} onClick={() => void controlFile(file, "cancel")}><Square size={16} /></IconButton>}
+              {file.uploadComplete !== 0 && ["failed", "cancelled"].includes(status) && <IconButton label={`Retry processing ${file.name}`} onClick={() => void controlFile(file, "retry")}><RefreshCw size={16} /></IconButton>}
+              <IconButton label={`Remove ${file.name}`} disabled={switching || demoLoading} onClick={() => void removeFile(file)}><X size={16} /></IconButton>
             </div>;
           })}</div>}
           {pending.some(file => file.processingStatus && file.processingStatus !== "ready") && <p className="file-guidance">Send will include every attached file once ready. Wait or retry/remove unfinished files, or choose Send text only to leave them for later.</p>}
           {extraImageRequests > 0 && <p className="file-guidance" role="status">These images/frames need up to {extraImageRequests} additional Copilot {extraImageRequests === 1 ? "request" : "requests"} with this model, using extra quota. Each is analyzed separately at its supplied detail; one reply combines the results. Analyses are saved for later turns.</p>}
           <label className="sr-only" htmlFor="message">Message</label>
-          <textarea id="message" ref={composer} rows={2} placeholder={listening ? "Listening... your words will appear here" : "Ask anything, or bring a file into the conversation..."} value={draft}
+          <textarea id="message" ref={composer} rows={2} placeholder={listening ? "Listening" : "Ask a question or attach a file"} value={draft}
             onChange={event => { draftRef.current = event.target.value; setDraft(event.target.value); setDraftState("saving"); }} maxLength={LIMITS.inputCharacters} disabled={composeLocked}
             onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send(); } }}
             onPaste={event => { if (event.clipboardData.files.length) { event.preventDefault(); void upload(event.clipboardData.files); } }} />
@@ -903,31 +948,31 @@ export function ChatApp() {
           <div className="composer-tools">
             <div className="tool-group">
               <input type="file" accept={FILE_ACCEPT} multiple ref={fileInput} className="sr-only" tabIndex={-1} onChange={event => void upload(event.target.files)} />
-              <IconButton label="Attach files" onClick={() => fileInput.current?.click()} disabled={uploadLocked}>{uploading ? <LoaderCircle className="spin" size={19} /> : <Paperclip size={19} />}</IconButton>
+              <IconButton label="Attach files" onClick={() => fileInput.current?.click()} disabled={uploadLocked}>{uploading ? <LoaderCircle className="spin" size={16} /> : <Paperclip size={16} />}</IconButton>
               <button type="button" className={`voice-button ${listening ? "active" : ""}`} disabled={composeLocked || !dictationAvailable}
                 title={!dictationAvailable ? "Dictation unavailable in this browser; text chat works." : "Dictate with your browser's speech service"}
-                onClick={() => listening ? recognition.current?.stop() : startDictation()}><Mic size={18} /><span>{listening ? "Stop dictation" : "Dictate"}</span></button>
+                onClick={() => listening ? recognition.current?.stop() : startDictation()}><Mic size={16} /><span>{listening ? "Stop dictation" : "Dictate"}</span></button>
               <span className="upload-status">{uploading ? `${transfers.filter(item => item.active).length} uploading` : pending.length ? `${readyPending.length} ready · ${pending.length - readyPending.length} pending` : ""}</span>
               {uploading && <button type="button" className="voice-button" onClick={() => uploadController.current?.abort()}>Cancel upload</button>}
             </div>
             <div className="send-group">{draft.length > 7000 && <small>{draft.length}/{LIMITS.inputCharacters}</small>}
-              {busy || remoteBusy ? <button type="button" className="send-button stop" aria-label="Stop reply" onClick={() => void stop()}><Square size={17} fill="currentColor" /></button> :
-                <button type="submit" className="send-button" aria-label="Send message" disabled={!draft.trim() || locked || !modelAvailable}><ArrowUp size={21} /></button>}
+              {busy || remoteBusy ? <button type="button" className="send-button stop" aria-label="Stop reply" onClick={() => void stop()}><Square size={16} fill="currentColor" /></button> :
+                <button type="submit" className="send-button" aria-label="Send message" disabled={!draft.trim() || locked || !modelAvailable}><ArrowUp size={16} /></button>}
             </div>
           </div>
           <div className="attachment-actions">
-            <p className="attachment-hint">Select multiple files, drop them here, or paste images. Send includes all attached files.</p>
+            <p className="attachment-hint">Attach several files, drop them here or paste images. Send includes all of them</p>
             {(pending.length > 0 || transfers.some(transfer => transfer.error)) && <button type="button" className="voice-button" disabled={!draft.trim() || locked || !modelAvailable} onClick={() => void send(undefined, true)}>Send text only</button>}
           </div>
         </form>
-        <div className="composer-caption"><span>{draftState === "saving" ? "Saving draft..." : draftState === "error" ? "Draft not saved — retry before leaving" : "Draft saved"} · {replyRunning ? "Reply in progress — keep writing; Send is available when it finishes or you press Stop" : dictationAvailable ? "Enter to send · Shift + Enter for a new line" : "Text chat is ready"}</span><button onClick={() => setSettings(true)}>Files & privacy <ShieldCheck size={12} /></button></div>
-        <div className="disclaimer">AI can make mistakes. Your prompts and file text are sent to GitHub Copilot.</div>
+        <div className="composer-caption"><span>{draftState === "saving" ? "Saving draft…" : draftState === "error" ? "Draft not saved, retry before leaving" : "Draft saved"}{replyRunning ? " · Reply in progress. Keep writing; Send returns when it finishes or you press Stop" : dictationAvailable ? <span className="shortcut-hint"> · <kbd>Enter</kbd> to send, <kbd>Shift</kbd> + <kbd>Enter</kbd> for a new line</span> : " · Text chat is ready"}</span><button onClick={() => setSettings(true)}>Files & privacy <ShieldCheck size={16} /></button></div>
+        <div className="disclaimer">Models can make mistakes. Prompts and file text are sent to GitHub Copilot.</div>
       </div>
     </main>
-    {settings && <Dialog title="Your space, your settings" onClose={() => setSettings(false)}>
+    {settings && <Dialog title="Account & connection" onClose={() => setSettings(false)}>
       <div className="settings-account"><span className="avatar">{user.name.slice(0, 1).toUpperCase()}</span><div><strong>{user.name}</strong><p>{user.email}</p></div></div>
       <div className="settings-section"><h3><ShieldCheck size={16} /> {access.tunnelMode ? "Temporary remote access" : "Personal, local-only"}</h3><p>{access.tunnelMode ? "A temporary Cloudflare HTTPS tunnel is active. Anyone with the link can create an email/password account without OTP. This link uses the app's password login, not Cloudflare Access. Cloudflare relays the traffic. Stop the tunnel when finished." : "This app listens on 127.0.0.1 only. Use only the app's explicit temporary-tunnel mode for remote access; do not otherwise expose it through a proxy, LAN or the internet."} App accounts have separate histories and files, but all use the host owner&apos;s Copilot account and usage limits.</p><p>Histories and original files stay in this app&apos;s local SQLite database. Prompts, chat context and extracted file text go to GitHub Copilot when you send. These are not end-to-end encrypted; people with access to your Windows account or backups can read local data.</p></div>
-      <div className="settings-section"><h3><span className={`status-dot ${connectionError ? "offline" : ""}`} /> Copilot connection</h3><p>{connectionError || `${models.length} models discovered from the Copilot SDK. Availability may differ from the desktop app and can change with your plan.`}</p><p>Already signed-in CLI credentials are reused through supported SDK authentication. If sign-in is needed, run this from the app folder:</p><code className="command">npm run copilot:login</code><button className="secondary-button" onClick={() => void refreshModels()} disabled={modelLoading}><RefreshCw size={14} /> Refresh connection</button></div>
+      <div className="settings-section"><h3><span className={`status-dot ${connectionError ? "offline" : ""}`} /> Copilot connection</h3><p>{connectionError || `${models.length} models discovered from the Copilot SDK. Availability may differ from the desktop app and can change with your plan.`}</p><p>Already signed-in CLI credentials are reused through supported SDK authentication. If sign-in is needed, run this from the app folder:</p><code className="command">npm run copilot:login</code><button className="secondary-button" onClick={() => void refreshModels()} disabled={modelLoading}><RefreshCw size={16} /> Refresh connection</button></div>
       <div className="settings-section"><h3><FileText size={16} /> Files and model context</h3>
         <p>Select multiple supported files together, add another selection, drag files onto the composer or paste images. Three files can transfer concurrently per account, six across the app. Each shows progress and can be removed. Processing continues in the background.</p>
         <p>Send includes every attached file, not just the first four. Unfinished or failed attachments must finish or be retried/removed; Send text only explicitly leaves attachments for later. Full extracted text is retained and indexed. Requests use labeled excerpts within a shared context budget adjusted for conversation history, rather than silently dropping files.</p>
@@ -935,10 +980,10 @@ export function ChatApp() {
         <p>TXT, Markdown, CSV, JSON, LOG, YAML/XML, selectable-text PDF, DOCX, XLSX, PNG/JPEG/WebP/static GIF, and the listed audio/video formats remain supported. There is no preset total file-size or storage quota; disk reserves and decoder safeguards still apply. Images are normalized for model input (16 MP/8192-pixel source limit); video frames have a 4096-pixel limit. No scanned-PDF OCR, macros or executable uploads. Context and model output remain finite; original files and saved prompts are not truncated.</p>
         <p>Download originals from message chips. X removes unsent files; deleting a chat removes its files and saved image analyses. Histories and drafts survive user/chat switches. Up to 100 chats and 100 turns per chat remain.</p>
       </div>
-      <div className="settings-section"><h3><Code2 size={16} /> Code runner (files, charts, animations)</h3><p>{sandboxInfo?.message || "Checking the code runner..."}</p>{sandboxInfo?.ready && <><p>Ask for a PDF report, chart, GIF/MP4 animation, or Word/Excel/PowerPoint file. The model writes Python that runs in a disposable Linux sandbox on this computer (WSL). Each run has <strong>no internet or network access</strong>, cannot install packages, cannot see Windows, other chats or other users, and is deleted afterwards. Only files from this chat that the model selects are copied in.{sandboxInfo.limits && <> Limits per run: about {sandboxInfo.limits.wallSeconds} seconds, {sandboxInfo.limits.cpus} CPUs, {Math.round(sandboxInfo.limits.memoryBytes / 1024 ** 3)} GB memory, {Math.round(sandboxInfo.limits.workBytes / 1024 ** 2)} MB scratch space and {sandboxInfo.limits.outputFiles} output files; up to 8 runs per reply.</>}</p><p>Available libraries: {sandboxInfo.libraries.join(", ")}. Only the host owner can add libraries, using a command on this computer; they cannot be installed from chat.</p><p>Results are attached to the reply as downloads. PNG/JPEG/GIF/WebP images, MP4/WebM videos and PDFs also get previews; other types such as HTML or SVG are download-only. Generated code can be wrong; check important results. Runs use the host owner&apos;s Copilot quota like any message.</p></>}</div>
+      <div className="settings-section"><h3><Code2 size={16} /> Code runner</h3><p>{sandboxInfo?.message || "Checking the code runner..."}</p>{sandboxInfo?.ready && <><p>Ask for a PDF report, chart, GIF/MP4 animation, or Word/Excel/PowerPoint file. The model writes Python that runs in a disposable Linux sandbox on this computer (WSL). Each run has <strong>no internet or network access</strong>, cannot install packages, cannot see Windows, other chats or other users, and is deleted afterwards. Only files from this chat that the model selects are copied in.{sandboxInfo.limits && <> Limits per run: about {sandboxInfo.limits.wallSeconds} seconds, {sandboxInfo.limits.cpus} CPUs, {Math.round(sandboxInfo.limits.memoryBytes / 1024 ** 3)} GB memory, {Math.round(sandboxInfo.limits.workBytes / 1024 ** 2)} MB scratch space and {sandboxInfo.limits.outputFiles} output files; up to 8 runs per reply.</>}</p><p>Available libraries: {sandboxInfo.libraries.join(", ")}. Only the host owner can add libraries, using a command on this computer; they cannot be installed from chat.</p><p>Results are attached to the reply as downloads. PNG/JPEG/GIF/WebP images, MP4/WebM videos and PDFs also get previews; other types such as HTML or SVG are download-only. Generated code can be wrong; check important results. Runs use the host owner&apos;s Copilot quota like any message.</p></>}</div>
       <div className="settings-section"><h3><Mic size={16} /> Local audio/video processing</h3><p>{mediaInfo?.message || "Checking local media configuration..."} {mediaInfo?.ready && <>Whisper model: {mediaInfo.model}, running on this computer&apos;s CPU.</>}</p><p>MP3, WAV, M4A, AAC, FLAC, OGG, OPUS, MP4, MOV, WEBM, MKV and AVI are accepted when their streams are decodable. Speech becomes a machine transcript; video also supplies up to four still frames. Copilot receives those extracted inputs when you press Send, not native audio/video. Transcription can be imperfect, and unsampled visual events may be missed.</p><p>One recording and one document can process at a time; others wait in a durable queue. No media-duration or overall-processing deadline is imposed. Long recordings are decoded/transcribed in bounded-memory windows, and processing may take a long time. Closing the browser does not discard accepted uploads. Interrupted jobs resume from the beginning after a server restart. Administrator-created delegated jobs stop if that administrator loses access or signs out. Transcription uses installed local packages/cached weights, without a speech API key. Public-link uploads pass through Cloudflare.</p></div>
       <div className="settings-section"><h3><ShieldCheck size={16} /> Administrator access</h3><p>The app superuser can view users&apos; chat sessions and files and act as a user to send messages or modify chats. An audit log records the real actor, effective user, action, object IDs, time and outcome—not prompt/file contents or credentials. {acting && <>You are still signed in as {actor?.email}; signing out ends that real login session.</>}</p></div>
-      <div className="settings-section"><h3><Mic size={16} /> Voice, without the surprises</h3><p>Dictation uses browser speech recognition, not a realtime audio model. Your browser may send microphone audio to its speech provider. Read-aloud uses your browser&apos;s voices, which may also use an online service. Text works without either feature.</p><p>No email verification, password reset, or recovery service is configured. Use a unique password and keep a local backup. A temporary shared preview is not production hosting.</p></div>
+      <div className="settings-section"><h3><Mic size={16} /> Voice and passwords</h3><p>Dictation uses browser speech recognition, not a realtime audio model. Your browser may send microphone audio to its speech provider. Read-aloud uses your browser&apos;s voices, which may also use an online service. Text works without either feature.</p><p>No email verification, password reset, or recovery service is configured. Use a unique password and keep a local backup. A temporary shared preview is not production hosting.</p></div>
       <button className="secondary-button logout" onClick={() => void logout()} disabled={uploading || demoLoading}><LogOut size={16} /> Sign out{busy ? " and stop reply" : ""}</button>
     </Dialog>}
     {rename && <Dialog title="Rename conversation" onClose={() => setRename(null)}><form onSubmit={saveTitle}><label className="field-label" htmlFor="chat-title">Conversation name</label><input autoFocus id="chat-title" maxLength={80} required value={editingTitle} onChange={event => setEditingTitle(event.target.value)} /><div className="dialog-actions"><button type="button" className="secondary-button" onClick={() => setRename(null)}>Cancel</button><button className="primary-button" disabled={!editingTitle.trim()}>Save name</button></div></form></Dialog>}
@@ -954,7 +999,7 @@ function Dialog({ title, onClose, children }: { title: string; onClose: () => vo
   const dialog = useRef<HTMLDialogElement>(null);
   useEffect(() => { dialog.current?.showModal(); }, []);
   return <dialog ref={dialog} className="dialog" aria-label={title} onCancel={onClose} onClick={event => { if (event.target === dialog.current) onClose(); }}>
-    <div className="dialog-heading"><h2>{title}</h2><IconButton label="Close dialog" onClick={onClose}><X size={19} /></IconButton></div>
+    <div className="dialog-heading"><h2>{title}</h2><IconButton label="Close dialog" onClick={onClose}><X size={16} /></IconButton></div>
     {children}
   </dialog>;
 }
@@ -977,21 +1022,28 @@ function AuthScreen({ onSuccess, notice, access, onMenu }: { onSuccess: (account
     finally { setBusy(false); }
   }
   return <main className="auth-page">
-    <button className="menu-button auth-menu" type="button" onClick={onMenu}><Menu size={18} /><span>Menu</span></button>
-    <section className="auth-story"><Brand /><div><span className="eyebrow">LESS FRICTION. MORE POSSIBILITY.</span><h1>Many models.<br />One conversation<br />at a time.</h1><p>A small, considered space to think out loud,<br />understand your files, and make things clearer.</p><div className="auth-features"><span><Check size={16} /> Your Copilot models</span><span><Check size={16} /> Text, voice & documents</span><span><Check size={16} /> History that stays with you</span></div></div><span className="auth-local"><ShieldCheck size={16} /> Local interface. Connected intelligence.</span></section>
+    <button className="menu-button auth-menu" type="button" onClick={onMenu}><Menu size={16} /><span>Menu</span></button>
+    <section className="auth-story">
+      <Brand />
+      <div className="auth-story-body">
+        <h1>Chat with Copilot models about your files</h1>
+        <p>Ask in plain words, switch models mid-conversation, and get answers, charts and documents back. Chat history is stored on the host computer.</p>
+        <BudgetPreview />
+      </div>
+      <span className="auth-local"><ShieldCheck size={16} /> Runs on the host&apos;s computer. Messages go to GitHub Copilot.</span>
+    </section>
     <section className="auth-side">
       <form className="auth-card" onSubmit={submit}>
         <div className="auth-mobile-brand"><Brand /></div>
-        <div className="eyebrow">WELCOME TO YOUR SPACE</div>
-        <h2>{signup ? "Make yourself at home." : "Good to have you back."}</h2>
-        <p>{signup ? "Quick signup with an email and password. Gmail works too. No OTP or verification email." : "Sign in with your Model Chat email and password. No OTP needed."}</p>
+        <h2>{signup ? "Create an account" : "Sign in"}</h2>
+        <p>{signup ? "Any email address works, including Gmail. No OTP or verification email." : "Use your Model Chat email and password. No OTP or verification email."}</p>
         {(error || notice) && <div className="auth-error" role="alert">{error || notice}</div>}
         <label htmlFor="email">Email</label><input id="email" type="email" autoComplete="email" value={email} onChange={event => setEmail(event.target.value)} required maxLength={254} placeholder="you@example.com" />
         <label htmlFor="password">Password</label><input id="password" type="password" autoComplete={signup ? "new-password" : "current-password"} value={password} onChange={event => setPassword(event.target.value)} required minLength={signup ? 12 : 1} maxLength={128} placeholder={signup ? "At least 12 characters" : "Your password"} />
         {signup && <small className="password-note">Use a unique password, not your Gmail password. This is not Google sign-in. No password recovery is configured.</small>}
-        <button className="primary-button auth-submit" disabled={busy}>{busy ? <LoaderCircle className="spin" size={18} /> : signup ? "Create account" : "Sign in"}{!busy && <ArrowUp size={17} className="arrow-right" />}</button>
-        {access.registrationAllowed && <div className="auth-toggle">{signup ? "Already have a space?" : "First time here?"}<button type="button" onClick={() => { setSignup(!signup); setError(""); setPassword(""); }}>{signup ? "Sign in" : "Create an account"}</button></div>}
-        <div className="auth-boundary"><ShieldCheck size={17} /><span>{access.tunnelMode ? "Public signup is open. All model requests use the host owner's Copilot quota. Cloudflare relays traffic." : "Accounts are local to this app, not GitHub accounts. All share this machine's Copilot entitlement. Loopback access only."} Ordinary accounts have separate histories. The app superuser can view your chats/files and act as you; administrator actions are audited.</span></div>
+        <button className="primary-button auth-submit" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} aria-label={signup ? "Creating account" : "Signing in"} /> : signup ? "Create account" : "Sign in"}</button>
+        {access.registrationAllowed && <div className="auth-toggle">{signup ? "Already have an account?" : "No account yet?"}<button type="button" onClick={() => { setSignup(!signup); setError(""); setPassword(""); }}>{signup ? "Sign in" : "Create an account"}</button></div>}
+        <div className="auth-boundary"><ShieldCheck size={16} /><span>{access.tunnelMode ? "Public signup is open. All model requests use the host owner's Copilot quota. Cloudflare relays traffic." : "Accounts are local to this app, not GitHub accounts. All share this machine's Copilot entitlement. Loopback access only."} Ordinary accounts have separate histories. The app superuser can view your chats and files and act as you; administrator actions are audited.</span></div>
       </form>
     </section>
   </main>;

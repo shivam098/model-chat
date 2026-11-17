@@ -35,7 +35,7 @@ async function register(email: string) {
   const body = await response.json() as { user: { id: string; email: string } };
   assert.equal(body.user.email, email);
   accounts.push(body.user);
-  await expect(page.getByRole("heading", { name: "What's on your mind?" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Start with a question or a file" })).toBeVisible();
   const cookie = (await context.cookies()).find(item => item.name.includes("session_token"));
   assert.ok(cookie?.secure && cookie.httpOnly && cookie.sameSite === "Strict");
   return page;
@@ -126,7 +126,7 @@ try {
   await expect(second.locator(".auth-error")).toBeVisible();
   await second.getByLabel("Password", { exact: true }).fill(password);
   await second.getByRole("button", { name: "Sign in", exact: true }).click();
-  await expect(second.getByRole("heading", { name: "What's on your mind?" })).toBeVisible();
+  await expect(second.getByRole("heading", { name: "Start with a question or a file" })).toBeVisible();
   assert.equal((await second.request.get(`/api/chats/${secondChat}`)).status(), 200);
   assert.deepEqual(pageErrors, []);
   console.log("Public HTTPS signup, login/logout, two-account/admin isolation, desktop/mobile demos, background upload/indexing/download and one real reply using a retrieved large-file excerpt passed.");

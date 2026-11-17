@@ -19,7 +19,7 @@ export async function runMediaFlow(page: Page, other: Page) {
   expect(speech.status, speech.stderr).toBe(0);
   const encoded = spawnSync("python", [path.resolve("tests", "make-media-fixtures.py"), fixtures], { encoding: "utf8", timeout: 30_000 });
   expect(encoded.status, encoded.stderr).toBe(0);
-  await page.getByRole("button", { name: "New conversation +", exact: true }).click();
+  await page.getByRole("button", { name: "New conversation", exact: true }).click();
   const longPath = path.join(fixtures, "long-speech.wav");
   expect(statSync(longPath).size).toBeGreaterThan(25 * 1024 * 1024);
   const accepted = page.waitForResponse(response => response.url().endsWith("/complete") && response.request().method() === "POST");
@@ -30,7 +30,7 @@ export async function runMediaFlow(page: Page, other: Page) {
   expect(["queued", "processing"]).toContain(job.processingStatus);
   await page.getByLabel("Message", { exact: true }).fill("DRAFT WHILE LONG RECORDING PROCESSES");
   await expect(page.getByRole("button", { name: "Send message", exact: true })).toBeEnabled();
-  await page.getByRole("button", { name: "New conversation +", exact: true }).click();
+  await page.getByRole("button", { name: "New conversation", exact: true }).click();
   await page.getByLabel("Message", { exact: true }).fill("SEPARATE CONVERSATION DRAFT");
   await expect(page.locator(".composer-caption")).toContainText("Draft saved");
   const separateId = new URL(page.url()).searchParams.get("chat")!;

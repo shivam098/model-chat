@@ -18,6 +18,7 @@ export function AdminPanel({ request, actorId, busy, onAct }: {
   const [chatOffset, setChatOffset] = useState(0);
   const [chats, setChats] = useState<Chat[]>([]);
   const [moreChats, setMoreChats] = useState(false);
+  const [chatLoad, setChatLoad] = useState(0);
   const [audit, setAudit] = useState<AuditEvent[]>([]);
   const [before, setBefore] = useState(Number.MAX_SAFE_INTEGER);
   const [moreAudit, setMoreAudit] = useState(false);
@@ -53,7 +54,7 @@ export function AdminPanel({ request, actorId, busy, onAct }: {
     }, 200);
     return () => { alive = false; clearTimeout(timer); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected?.id, chatQuery, chatOffset]);
+  }, [selected?.id, chatQuery, chatOffset, chatLoad]);
   return <div className="admin-panel">
     <p>Administration applies only to this app. Acting as a user can read and change their chats and files. The real actor remains your superuser account, and access and changes are audited without logging message or file contents.</p>
     <div className="admin-tabs">
@@ -69,7 +70,7 @@ export function AdminPanel({ request, actorId, busy, onAct }: {
       <div className="admin-users">{users.map(user => <div className="admin-user" key={user.id}>
         <div><strong>{user.name}</strong><span>{user.email}</span><small>{user.appRole} · {user.chatCount} chat sessions</small></div>
         {user.id === actorId ? <small>Your account</small> : user.appRole === "superuser" ? <small>Cannot impersonate a superuser</small> : <div className="admin-row-actions">
-          <button className="secondary-button" onClick={() => { setSelected(user); setChatQuery(""); setChatOffset(0); setChats([]); }}>View sessions</button>
+          <button className="secondary-button" onClick={() => { setSelected(user); setChatQuery(""); setChatOffset(0); setChats([]); setChatLoad(value => value + 1); }}>View sessions</button>
           <button className="primary-button" disabled={busy} onClick={() => void onAct(user.id)}>Act as user</button>
         </div>}
       </div>)}</div>
@@ -89,7 +90,7 @@ export function AdminPanel({ request, actorId, busy, onAct }: {
     </> : <>
       <p>Actor and subject are account IDs, not login tokens. A local role change is labeled “Local operator”.</p>
       <div className="audit-list">{audit.map(event => <article className="audit-event" key={event.id}>
-        <div><strong>{event.action}</strong><span>{event.outcome}</span><time>{new Date(event.at).toLocaleString()}</time></div>
+        <div><strong>{event.action}</strong><span className={`outcome ${event.outcome}`}>{event.outcome}</span><time>{new Date(event.at).toLocaleString()}</time></div>
         <dl><dt>Actor</dt><dd>{event.actorId || (event.reason?.startsWith("local_console:") ? "Local operator" : "Unauthenticated")}</dd>
           <dt>Subject</dt><dd>{event.subjectId || "—"}</dd><dt>Object</dt><dd>{event.objectId || "—"}</dd>
           {event.reason && <><dt>Outcome detail</dt><dd>{event.reason}</dd></>}</dl>

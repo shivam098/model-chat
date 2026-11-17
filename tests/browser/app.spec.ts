@@ -15,7 +15,7 @@ async function signUp(page: Page, address: string) {
   await page.getByLabel("Email", { exact: true }).fill(address);
   await page.getByLabel("Password", { exact: true }).fill(password);
   await page.getByRole("button", { name: "Create account", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "What's on your mind?" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Start with a question or a file" })).toBeVisible();
 }
 test("accounts, ownership, files, histories, password validation and responsive UI", async ({ page, browser }) => {
   if (process.env.MODEL_CHAT_MEDIA_TEST === "1") test.setTimeout(600_000);
@@ -138,7 +138,7 @@ test("accounts, ownership, files, histories, password validation and responsive 
   await expect(page.locator(".auth-error")).toBeVisible();
   await page.getByLabel("Password", { exact: true }).fill(password);
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "What's on your mind?" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Start with a question or a file" })).toBeVisible();
   await page.getByRole("button", { name: "Open sidebar" }).click();
   await page.getByRole("button", { name: "My private workspace", exact: true }).click();
   await expect(page.locator(".file-chip").filter({ hasText: "project-notes.txt" })).toBeVisible();
@@ -195,7 +195,7 @@ test("browser unsupported voice and denied microphone retain fully working text 
     Object.defineProperty(window, "SpeechRecognition", { value: Recognition, configurable: true });
   });
   await page.getByRole("button", { name: "Dictate", exact: true }).click();
-  await page.getByRole("button", { name: "New conversation +", exact: true }).click();
+  await page.getByRole("button", { name: "New conversation", exact: true }).click();
   await expect(page.getByLabel("Message", { exact: true })).toHaveValue("");
   await page.evaluate(() => {
     const inject = (window as Window & { injectLateTranscript?: () => void }).injectLateTranscript;
