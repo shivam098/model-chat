@@ -14,6 +14,8 @@
     "app:restart": "node scripts/tunnel.mjs restart-app",
     "app:update": "node scripts/tunnel.mjs restart-app --build",
     "link:publish": "node scripts/tunnel.mjs publish-link",
+    "autorestart:on": "node scripts/tunnel.mjs autorestart-on",
+    "autorestart:off": "node scripts/tunnel.mjs autorestart-off",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test --test-concurrency=1 tests/*.test.ts",
     "test:browser": "playwright test",
