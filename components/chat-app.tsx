@@ -1,10 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { ArrowDown, ArrowRight, ArrowUp, BookOpen, Brain, ChevronDown, Code2, Eye, FileText, FolderOpen, Leaf, LoaderCircle, LogOut, Menu, MessageSquare, Mic, PanelLeft, PanelRight, Pencil, Plus, RefreshCw, Settings2, ShieldCheck, Square, SquarePen, Trash2, Volume2, X } from "lucide-react";
+import { ArrowDown, ArrowRight, ArrowUp, BookOpen, Brain, ChevronDown, Code2, Eye, FileText, FolderOpen, Globe, Leaf, LoaderCircle, LogOut, Menu, MessageSquare, Mic, PanelLeft, PanelRight, Pencil, Plus, RefreshCw, Settings2, ShieldCheck, Square, SquarePen, Trash2, Volume2, X } from "lucide-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { FILE_ACCEPT, LIMITS, type Attachment, type Chat, type ChatDetail, type Model, type StreamEvent } from "@/lib/contracts";
+import { FILE_ACCEPT, LIMITS, type Attachment, type Chat, type ChatDetail, type Model, type StreamEvent, type WebSource } from "@/lib/contracts";
 import { dictationConstructor, voiceError, type Dictation, type VoiceWindow } from "@/lib/voice";
 import { DEMOS, type DemoId } from "@/lib/demos";
 import type { AccountView, AppUser } from "@/lib/access";
@@ -36,6 +36,22 @@ function Thinking({ text, live, open, onToggle }: { text: string; live: boolean;
       <Brain size={16} /><span>{open ? "Hide thinking" : "Show thinking"}</span>{live && <span className="thinking-live">Thinking</span>}<ChevronDown size={16} />
     </button>
     {open && <div className="reasoning markdown"><Md text={text} /></div>}
+  </div>;
+}
+// Pages web search found for a reply, cited ones first. Only http(s) links are shown; they open in a new tab without a referrer.
+function Sources({ sources }: { sources: WebSource[] }) {
+  const items = sources.flatMap(source => {
+    try {
+      const url = new URL(source.url);
+      return url.protocol === "https:" || url.protocol === "http:" ? [{ ...source, host: url.hostname.replace(/^www\./, "") }] : [];
+    } catch { return []; }
+  });
+  if (!items.length) return null;
+  return <div className="web-sources" role="group" aria-label="Sources">
+    <span className="web-sources-label"><Globe size={14} aria-hidden="true" />Sources</span>
+    {items.map((source, index) => <a key={source.url} className={`source-chip ${source.cited ? "cited" : ""}`} href={source.url} target="_blank" rel="noopener noreferrer nofollow" referrerPolicy="no-referrer" title={source.url}>
+      <span className="source-index">{index + 1}</span><span className="source-title">{source.title || source.host}</span><span className="source-host">{source.host}</span>
+    </a>)}
   </div>;
 }
 function Brand() { return <div className="brand"><span className="brand-icon" aria-hidden="true"><Leaf size={16} /></span><span>model<span className="brand-light">chat</span></span></div>; }
@@ -124,6 +140,7 @@ export function ChatApp() {
   const [rail, setRail] = useState(false);
   const [openThinking, setOpenThinking] = useState<Set<string>>(() => new Set());
   const [codeStatus, setCodeStatus] = useState<CodingStatus | null>(null);
+  const [webInfo, setWebInfo] = useState<{ enabled: boolean; scope: string; reason: string | null } | null>(null);
   const [projectPicker, setProjectPicker] = useState(false);
   const [codePanel, setCodePanel] = useState<PanelTab | null>(null);
   const [deciding, setDeciding] = useState<Set<string>>(() => new Set());
@@ -183,7 +200,7 @@ export function ChatApp() {
     setUser(account.user); setActor(account.actor); setDetail(null); setChats([]); setDraft(""); setSelectedModel("");
     setAdmin(false); setMenu(false); setSidebar(false); setSettings(false); setDraftState("saved");
     setFilePreview(null);
-    setCodeStatus(null); setProjectPicker(false); setCodePanel(null);
+    setCodeStatus(null); setProjectPicker(false); setCodePanel(null); setWebInfo(null);
     setTransfers([]); setStreamStage("Waiting for the model");
     if (chatId !== undefined) window.history.replaceState(null, "", chatId ? `?chat=${chatId}` : "/");
   }
@@ -267,6 +284,9 @@ export function ChatApp() {
     api<NonNullable<typeof sandboxInfo>>("/api/sandbox-status")
       .then(result => { if (alive) setSandboxInfo(result); })
       .catch(error => { if (alive) setSandboxInfo({ ready: false, message: message(error), libraries: [], limits: null }); });
+    api<NonNullable<typeof webInfo>>("/api/web-status")
+      .then(result => { if (alive) setWebInfo(result); })
+      .catch(() => { if (alive) setWebInfo(null); });
     api<CodingStatus>("/api/code/status")
       .then(result => { if (alive) setCodeStatus(result); })
       .catch(() => { if (alive) setCodeStatus(null); });
@@ -343,7 +363,7 @@ export function ChatApp() {
     setDraft(""); setBusy(false); setUploading(false); setTransfers([]); setSettings(false); setSidebar(false);
     setMenu(false); setHow(false); setDemoLoading(false);
     setActor(null); setAdmin(false); setSwitching(false);
-    setCodeStatus(null); setProjectPicker(false); setCodePanel(null);
+    setCodeStatus(null); setProjectPicker(false); setCodePanel(null); setWebInfo(null);
     setFilePreview(null); setStreamStage("Waiting for the model");
     setSpeaking(null); setInterim(""); setVoiceConsent(false); setConnectionError("");
     window.history.replaceState(null, "", "/");
@@ -580,6 +600,9 @@ export function ChatApp() {
             { ...m, reasoning: item.replace ? item.text : (m.reasoning || "") + item.text } : m) }) : previous);
         } else if (item.type === "code") {
           setDetail(previous => previous && previous.chat.id === chatId ? { ...previous, codeLive: true, codeEvents: mergeCodeEvent(previous.codeEvents || [], item.event) } : previous);
+        } else if (item.type === "web") {
+          setDetail(previous => previous && previous.chat.id === chatId ? ({ ...previous, messages: previous.messages.map((m, index) => index === previous.messages.length - 1 ?
+            { ...m, sources: item.sources.length ? item.sources : m.sources } : m) }) : previous);
         } else if (item.type === "done") {
           done = true;
           setDetail(previous => previous && previous.chat.id === chatId ? ({ ...previous, messages: previous.messages.map(m => m.id === item.message.id ? item.message : m) }) : previous);
@@ -875,7 +898,8 @@ export function ChatApp() {
           <li>Sign in, choose an available Copilot model, and write a question or load an example below.</li>
           <li>Press Send for a real streamed answer. Stop keeps any partial reply. Ordinary accounts have separate chats; the app superuser can view chats/files and act as users, with an audit log.</li>
           <li>Attach supported documents to ask questions about them. Reopen chats or switch models without losing their saved context.</li>
-          <li>Ask for a PDF, chart, GIF/MP4 animation or Word/Excel/PowerPoint file. The model runs Python in an offline, disposable sandbox on the host and attaches the results; it cannot browse the internet or install software. See Files &amp; privacy for its libraries and limits.</li>
+          <li>Ask for a PDF, chart, GIF/MP4 animation or Word/Excel/PowerPoint file. The model runs Python in an offline, disposable sandbox on the host and attaches the results; the sandbox has no internet access and can&apos;t install software. See Files &amp; privacy for its libraries and limits.</li>
+          <li>Where the host owner has turned on web search (a <strong>Web</strong> chip shows in the message box), the model can search the web for current information and lists its sources under the reply.</li>
         </ol>
         <p>All accounts use the host owner&apos;s Copilot quota. Prompts and extracted file text are sent to Copilot; availability and usage limits apply.</p>
       </div>
@@ -972,9 +996,10 @@ export function ChatApp() {
                   {codeChat && <div className="code-cards">{(detail!.codeEvents || []).filter(event => event.messageId === item.id).map(event =>
                     <CodeCard key={event.id} event={event} live={Boolean(detail!.codeLive) || streaming} showImages={codeReady} deciding={deciding.has(String((event.data.approval as { id?: string } | undefined)?.id))} onDecide={(id, decision) => void decide(id, decision)} />)}</div>}
                   <div className="markdown">
-                    {item.content ? <Md text={item.content} /> : streaming ? <span className="pending-reply"><i /><i /><i />{busy ? streamStage : "Processing attachments or generating reply"}</span> : <p className="muted">No answer was generated.</p>}
+                    {item.content ? <Md text={item.content} /> : streaming ? <span className="pending-reply">{busy && /web/i.test(streamStage) ? <Globe size={14} className="stage-globe" aria-hidden="true" /> : <><i /><i /><i /></>}{busy ? streamStage : "Processing attachments or generating reply"}</span> : <p className="muted">No answer was generated.</p>}
                   </div>
-                  {streaming && busy && item.content && <div className="tool-stage" role="status"><LoaderCircle className="spin" size={16} />{streamStage}</div>}
+                  {streaming && busy && item.content && <div className="tool-stage" role="status">{/web/i.test(streamStage) ? <Globe size={16} className="stage-globe" aria-hidden="true" /> : <LoaderCircle className="spin" size={16} />}{streamStage}</div>}
+                  {item.sources && item.sources.length > 0 && <Sources sources={item.sources} />}
                   {files.filter(f => f.preview).map(file => {
                     const source = `/api/chats/${file.chatId}/files/${file.id}/preview`;
                     if (file.preview === "pdf") return <a key={`preview-${file.id}`} className="exhibit exhibit-pdf" href={source} target="_blank" rel="noopener noreferrer" aria-label={`Preview ${file.name} in a new tab`}>
@@ -1040,6 +1065,8 @@ export function ChatApp() {
               <button type="button" className={`icon-button tool ${listening ? "active" : ""}`} aria-label={listening ? "Stop dictation" : "Dictate"} disabled={composeLocked || !dictationAvailable}
                 title={!dictationAvailable ? "Dictation unavailable in this browser; text chat works." : listening ? "Stop dictation" : "Dictate with your browser's speech service"}
                 onClick={() => listening ? recognition.current?.stop() : startDictation()}><Mic size={18} /></button>
+              {webInfo?.enabled && !codeChat && <span className="web-chip" title="Web search is on: the model can search the web for current information and cite its sources.">
+                <Globe size={14} aria-hidden="true" /><span>Web</span></span>}
               {codeReady && <div className="mode-switch" role="group" aria-label="Mode">
                 <button type="button" aria-pressed={!codeChat} disabled={composeLocked} title="Ordinary chat: no access to this computer" onClick={() => { if (codeChat) void newChat(); }}>Chat</button>
                 <button type="button" aria-pressed={codeChat} disabled={composeLocked} title="Work on a project folder on this computer, with your approval for each command and change" onClick={() => { if (!codeChat) void chooseCode(); }}>Code</button>
@@ -1074,7 +1101,7 @@ export function ChatApp() {
         </div>}
         <div className="composer-caption">
           {draftState === "error" ? <span className="caption-warning" role="status">Draft not saved, retry before leaving</span> : <span className="sr-only" role="status">{draftState === "saving" ? "Saving draft…" : "Draft saved"}</span>}
-          <span>{replyRunning ? "Reply in progress. Keep writing; Send returns when it finishes or you press Stop." : codeBlocked ? codeStatus?.reason || "Coding mode isn't available here." : codeChat ? "Commands and file changes wait for your approval. Model Chat's data and credentials are off limits." : "Models can make mistakes. Prompts and file text are sent to GitHub Copilot."}</span>
+          <span>{replyRunning ? "Reply in progress. Keep writing; Send returns when it finishes or you press Stop." : codeBlocked ? codeStatus?.reason || "Coding mode isn't available here." : codeChat ? "Commands and file changes wait for your approval. Model Chat's data and credentials are off limits." : webInfo?.enabled ? "Models can make mistakes. Prompts, file text and web searches go to GitHub Copilot." : "Models can make mistakes. Prompts and file text are sent to GitHub Copilot."}</span>
           <button type="button" onClick={() => setSettings(true)}>Files &amp; privacy</button>
         </div>
       </div>
@@ -1097,6 +1124,11 @@ export function ChatApp() {
         <p>Download originals from message chips. X removes unsent files; deleting a chat removes its files and saved image analyses. Histories and drafts survive user/chat switches. Up to 100 chats and 100 turns per chat remain.</p>
       </div>
       <div className="settings-section"><h3><Code2 size={16} /> Code runner</h3><p>{sandboxInfo?.message || "Checking the code runner..."}</p>{sandboxInfo?.ready && <><p>Ask for a PDF report, chart, GIF/MP4 animation, or Word/Excel/PowerPoint file. The model writes Python that runs in a disposable Linux sandbox on this computer (WSL). Each run has <strong>no internet or network access</strong>, cannot install packages, cannot see Windows, other chats or other users, and is deleted afterwards. Only files from this chat that the model selects are copied in.{sandboxInfo.limits && <> Limits per run: about {sandboxInfo.limits.wallSeconds} seconds, {sandboxInfo.limits.cpus} CPUs, {Math.round(sandboxInfo.limits.memoryBytes / 1024 ** 3)} GB memory, {Math.round(sandboxInfo.limits.workBytes / 1024 ** 2)} MB scratch space and {sandboxInfo.limits.outputFiles} output files; up to 8 runs per reply.</>}</p><p>Available libraries: {sandboxInfo.libraries.join(", ")}. Only the host owner can add libraries, using a command on this computer; they cannot be installed from chat.</p><p>Results are attached to the reply as downloads. PNG/JPEG/GIF/WebP images, MP4/WebM videos and PDFs also get previews; other types such as HTML or SVG are download-only. Generated code can be wrong; check important results. Runs use the host owner&apos;s Copilot quota like any message.</p></>}</div>
+      {webInfo && <div className="settings-section"><h3><Globe size={16} /> Web search</h3><p>{webInfo.enabled
+        ? "On for your chats. When a question needs current information, the model can search the web and cite its sources under the reply. Searches run on GitHub's servers through the host owner's Copilot account, not from this computer. Web results can be wrong or out of date; check important facts. The model sees search results, not whole pages, so it can't fully read a link you paste."
+        : `Off for this account. ${webInfo.reason ?? ""} Replies use only the model's training and what you share.`}</p>
+        {actor?.appRole === "superuser" && !acting && <p>Who can use it: {webInfo.scope === "everyone" ? "every account" : webInfo.scope === "off" ? "nobody (turned off)" : "only your own chats"}. Change it on the host with <code>npm run web:search -- owner | everyone --yes | off</code>. It is never offered while acting as another user. Each use is recorded in the audit log, without the search text.</p>}
+      </div>}
       {actor?.appRole === "superuser" && !acting && codeStatus && <div className="settings-section"><h3><FolderOpen size={16} /> Coding mode</h3><p>{codeStatus.available ? <>Available in this browser. Choose Code in the message box to work on a project folder{codeStatus.projectsRoot ? <> (new projects go in <code>{codeStatus.projectsRoot}</code>)</> : null}. The model uses this computer&apos;s own tools; every command, file change and web fetch waits for your approval, and Model Chat&apos;s data, .env files and credentials are always blocked.</> : codeStatus.reason}</p><p>Only the superuser account can use it, never while acting as someone else. It works only from a browser on this computer{codeStatus.remoteEnabled ? "; remote use is turned on and needs two-step verification" : ", not through the shared link"}.</p></div>}
       {actor?.appRole === "superuser" && !acting && codeStatus && <div className="settings-section"><h3><ShieldCheck size={16} /> Two-step verification</h3><TwoFactorSettings status={codeStatus} api={api} onChanged={() => void api<CodingStatus>("/api/code/status").then(setCodeStatus).catch(report)} /></div>}
       <div className="settings-section"><h3><Mic size={16} /> Local audio/video processing</h3><p>{mediaInfo?.message || "Checking local media configuration..."} {mediaInfo?.ready && <>Whisper model: {mediaInfo.model}, running on this computer&apos;s CPU.</>}</p><p>MP3, WAV, M4A, AAC, FLAC, OGG, OPUS, MP4, MOV, WEBM, MKV and AVI are accepted when their streams are decodable. Speech becomes a machine transcript; video also supplies up to four still frames. Copilot receives those extracted inputs when you press Send, not native audio/video. Transcription can be imperfect, and unsampled visual events may be missed.</p><p>One recording and one document can process at a time; others wait in a durable queue. No media-duration or overall-processing deadline is imposed. Long recordings are decoded/transcribed in bounded-memory windows, and processing may take a long time. Closing the browser does not discard accepted uploads. Interrupted jobs resume from the beginning after a server restart. Administrator-created delegated jobs stop if that administrator loses access or signs out. Transcription uses installed local packages/cached weights, without a speech API key. Public-link uploads pass through Cloudflare.</p></div>

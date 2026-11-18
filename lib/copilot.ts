@@ -6,7 +6,8 @@ import path from "node:path";
 import { dataDirectory } from "./config";
 import { AppError } from "./errors";
 import { systemInstruction } from "./context";
-import type { CodeEvent, NativeImage } from "./contracts";
+import type { CodeEvent, NativeImage, WebSource } from "./contracts";
+import { WEB_SERVER, WEB_TOOL, extractSources, mergeSources } from "./web-search";
 import { expectedCopilotLogin, isAccountError, isolatedRuntimeEnvironment, selectStoredSignIn, verifyRuntimeIdentity } from "./copilot-account";
 
 const copilotHome = process.env.MODEL_CHAT_COPILOT_HOME ? path.resolve(process.env.MODEL_CHAT_COPILOT_HOME) : path.join(dataDirectory, "copilot");
@@ -140,16 +141,18 @@ export async function listModels(refresh = false): Promise<ModelInfo[]> {
   })().catch(error => { throw copilotError(error); }).finally(() => { catalogState.modelChatCatalogPending = undefined; });
   return catalogState.modelChatCatalogPending;
 }
-export function safeSessionConfig(model: string, directory: string, sessionId: string, tools: Tool[] = [], toolInstruction?: string, reasoningEffort?: ReasoningEffort): SessionConfig {
+export function safeSessionConfig(model: string, directory: string, sessionId: string, tools: Tool[] = [], toolInstruction?: string, reasoningEffort?: ReasoningEffort, webSearch = false): SessionConfig {
   const allowed = new Set(tools.map(tool => tool.name));
   return {
     sessionId,
     model,
     clientName: "Model Chat",
     ...(reasoningEffort ? { reasoningEffort, reasoningSummary: "detailed" as const } : {}),
-    // Only app-defined tools are allow-listed; built-in, MCP and every other custom tool stays excluded.
-    availableTools: tools.map(tool => `custom:${tool.name}`),
-    excludedTools: tools.length ? ["builtin:*", "mcp:*"] : ["builtin:*", "mcp:*", "custom:*"],
+    // Only app-defined tools (and, for web-enabled chats, GitHub's hosted web search) are allow-listed; every other built-in, MCP and custom tool stays excluded.
+    availableTools: [...tools.map(tool => `custom:${tool.name}`), ...(webSearch ? [`mcp:${WEB_TOOL}`] : [])],
+    excludedTools: webSearch ? (tools.length ? ["builtin:*"] : ["builtin:*", "custom:*"]) : tools.length ? ["builtin:*", "mcp:*"] : ["builtin:*", "mcp:*", "custom:*"],
+    // The runtime's built-in GitHub MCP server starts only for web-enabled chats, limited to its web search toolset; the filter above admits only web_search.
+    ...(webSearch ? { githubMcpToolConfig: { additionalToolsets: ["web_search"] }, toolSearch: { enabled: false } } : {}),
     tools,
     mcpServers: {},
     customAgents: [],
@@ -174,8 +177,9 @@ export function safeSessionConfig(model: string, directory: string, sessionId: s
     workingDirectory: directory,
     configDirectory: copilotHome,
     streaming: true,
-    systemMessage: { mode: "replace", content: systemInstruction(tools.length ? toolInstruction : undefined) },
-    onPermissionRequest: request => request.kind === "custom-tool" && allowed.has(request.toolName)
+    systemMessage: { mode: "replace", content: systemInstruction(tools.length ? toolInstruction : undefined, webSearch) },
+    onPermissionRequest: request => (request.kind === "custom-tool" && allowed.has(request.toolName))
+      || (webSearch && request.kind === "mcp" && request.serverName === WEB_SERVER && request.toolName === WEB_TOOL)
       ? { kind: "approved" }
       : { kind: "reject", feedback: "Model Chat denies every built-in, filesystem, shell, URL, MCP and unknown tool request." },
   };
@@ -198,6 +202,9 @@ export interface ReplyInput {
   onReasoning?: (text: string, replace: boolean) => void;
   /** Coding mode: a command, file change or approval card was created or updated. */
   onCodeEvent?: (event: CodeEvent) => void;
+  /** Offer GitHub's hosted web search in this turn (decided by the server for the account). */
+  webSearch?: boolean;
+  onWeb?: (update: { searching: boolean; searches: number; sources: WebSource[] }) => void;
 }
 export type ReplyRunner = (input: ReplyInput) => Promise<void>;
 // Without an explicit level the runtime requests no reasoning; "medium" lets models think when a question warrants it.
@@ -215,6 +222,7 @@ export function verifyToolMetadata(tools: { name: string; mcpServerName?: string
       : "The runtime did not confirm a tool-free session. Generation was blocked for safety.");
   }
 }
+const toolViolationError = () => new AppError(503, "The runtime offered a tool Model Chat doesn't allow in this chat, so the reply was stopped for safety.");
 export function createMessageAccumulator(onDelta: (text: string) => void, onReplace: (text: string) => void) {
   const parts = new Map<string, string>();
   let sent = "";
@@ -226,7 +234,13 @@ export function createMessageAccumulator(onDelta: (text: string) => void, onRepl
     sent = full;
   };
 }
-export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDelta, onReplace, images, authorize, onRequestStart, tools = [], toolInstruction, reasoningEffort, onReasoning }) => {
+/** Every tool the runtime offers mid-turn must be an app tool or, for web-enabled chats, GitHub's web search; anything else stops the reply. */
+export function unexpectedTool(tools: { name: string; mcpServerName?: string }[], customNames: string[], webSearch: boolean) {
+  return tools.find(tool => tool.mcpServerName
+    ? !(webSearch && tool.mcpServerName === WEB_SERVER && tool.name === WEB_TOOL)
+    : !customNames.includes(tool.name))?.name ?? null;
+}
+export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDelta, onReplace, images, authorize, onRequestStart, onProgress, tools = [], toolInstruction, reasoningEffort, onReasoning, webSearch = false, onWeb }) => {
   onRequestStart?.();
   const sessionId = `modelchat-${randomUUID()}`;
   const directory = path.join(copilotHome, "requests", sessionId);
@@ -234,13 +248,14 @@ export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDe
   let client: CopilotClient | undefined;
   let session: CopilotSession | undefined;
   let abortListener: (() => void) | undefined;
+  let toolViolation: string | undefined;
   const unsubscribe: (() => void)[] = [];
   try {
     signal.throwIfAborted();
     authorize?.();
     client = await createClient();
     signal.throwIfAborted();
-    session = await deadline(client.createSession(safeSessionConfig(model, directory, sessionId, tools, toolInstruction, reasoningEffort)), 30_000);
+    session = await deadline(client.createSession(safeSessionConfig(model, directory, sessionId, tools, toolInstruction, reasoningEffort, webSearch)), 30_000);
     signal.throwIfAborted();
     await deadline(session.rpc.tools.initializeAndValidate(), 15_000);
     const metadata = await deadline(session.rpc.tools.getCurrentMetadata(), 15_000);
@@ -258,6 +273,44 @@ export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDe
     }
     let sessionError: string | undefined;
     unsubscribe.push(session.on("session.error", event => { sessionError = event.data.message; }));
+    if (webSearch) {
+      // GitHub's MCP tools load when the turn starts, so the tool set is checked again then, and every tool call is checked as it starts.
+      const customNames = tools.map(tool => tool.name);
+      const pending = new Set<string>();
+      const hosted = new Map<number, boolean>();
+      let searches = 0;
+      let sources: WebSource[] = [];
+      const report = () => onWeb?.({ searching: pending.size > 0 || [...hosted.values()].some(Boolean), searches, sources });
+      const violate = (name: string) => {
+        toolViolation ||= name;
+        void session?.abort().catch(error => console.error("[model-chat] Copilot abort failed:", error.name));
+      };
+      unsubscribe.push(session.on("session.tools_updated", () => {
+        void session?.rpc.tools.getCurrentMetadata().then(metadata => { const bad = unexpectedTool(metadata.tools ?? [], customNames, true); if (bad) violate(bad); })
+          .catch(() => violate("unverifiable tool list"));
+      }));
+      unsubscribe.push(session.on("tool.execution_start", event => {
+        const { toolCallId, toolName, mcpServerName } = event.data;
+        if (mcpServerName === WEB_SERVER && toolName === WEB_TOOL) {
+          pending.add(toolCallId); searches++;
+          onRequestStart?.(); onProgress?.("Searching the web"); report();
+        } else if (unexpectedTool([{ name: toolName, mcpServerName }], customNames, true)) violate(toolName);
+      }));
+      unsubscribe.push(session.on("tool.execution_complete", event => {
+        if (!pending.delete(event.data.toolCallId)) return;
+        onRequestStart?.();
+        if (event.data.success !== false) sources = mergeSources(sources, extractSources(event.data.result?.content));
+        onProgress?.(pending.size ? "Searching the web" : "Reading web results");
+        report();
+      }));
+      // Provider-hosted search (not offered to this app's account today) reports progress without a tool call.
+      unsubscribe.push(session.on("assistant.server_tool_progress", event => {
+        if (event.data.kind !== "web_search") return;
+        if (!hosted.has(event.data.outputIndex)) searches++;
+        hosted.set(event.data.outputIndex, event.data.status !== "completed");
+        onRequestStart?.(); onProgress?.(event.data.status === "completed" ? "Reading web results" : "Searching the web"); report();
+      }));
+    }
     const aborted = new Promise<never>((_, reject) => {
       abortListener = () => {
         void session?.abort().catch(error => console.error("[model-chat] Copilot abort failed:", error.name));
@@ -268,10 +321,12 @@ export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDe
     });
     signal.throwIfAborted();
     authorize?.();
-    await Promise.race([session.sendAndWait({ prompt, attachments: images }, tools.length ? 45 * 60_000 : 180_000), aborted]);
+    await Promise.race([session.sendAndWait({ prompt, attachments: images }, tools.length ? 45 * 60_000 : webSearch ? 10 * 60_000 : 180_000), aborted]);
+    if (toolViolation) throw toolViolationError();
     if (sessionError) throw new Error(sessionError);
   } catch (error) {
     if (signal.aborted) throw new DOMException("Reply cancelled", "AbortError");
+    if (toolViolation) throw toolViolationError();
     throw copilotError(error);
   } finally {
     for (const off of unsubscribe) off();

@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { dataDirectory, ensureDataDirectory } from "./config";
 import { AppError } from "./errors";
-import { LIMITS, PREVIEW_TYPES, type Chat, type CodeEvent, type Message, type MessageStatus, type Attachment, type ImageSource, type ImageAnalysis } from "./contracts";
+import { LIMITS, PREVIEW_TYPES, type Chat, type CodeEvent, type Message, type MessageStatus, type Attachment, type ImageSource, type ImageAnalysis, type WebSource } from "./contracts";
 import type { MediaFrame } from "./media";
 import { installUploadSchema, fileTextPage, fileContextExcerpt } from "./upload-store";
 
@@ -79,6 +79,8 @@ export class Store {
     if (!fileColumns.some(column => column.name === "mimeType")) db.exec("ALTER TABLE app_file ADD COLUMN mimeType TEXT NOT NULL DEFAULT 'text/plain'");
     const messageColumns = db.pragma("table_info(app_message)") as { name: string }[];
     if (!messageColumns.some(column => column.name === "reasoning")) db.exec("ALTER TABLE app_message ADD COLUMN reasoning TEXT NOT NULL DEFAULT ''");
+    // Web search sources for a reply (JSON); NULL for replies that didn't search.
+    if (!messageColumns.some(column => column.name === "sources")) db.exec("ALTER TABLE app_message ADD COLUMN sources TEXT");
     const chatColumns = db.pragma("table_info(app_chat)") as { name: string }[];
     if (!chatColumns.some(column => column.name === "mode")) db.exec("ALTER TABLE app_chat ADD COLUMN mode TEXT NOT NULL DEFAULT 'chat'");
     if (!chatColumns.some(column => column.name === "projectPath")) db.exec("ALTER TABLE app_chat ADD COLUMN projectPath TEXT");
@@ -176,7 +178,11 @@ export class Store {
   }
   messages(userId: string, chatId: string): Message[] {
     this.chat(userId, chatId);
-    return this.db.prepare("SELECT * FROM app_message WHERE chatId=? ORDER BY createdAt,rowid").all(chatId) as Message[];
+    const rows = this.db.prepare("SELECT * FROM app_message WHERE chatId=? ORDER BY createdAt,rowid").all(chatId) as (Omit<Message, "sources"> & { sources?: string | null })[];
+    return rows.map(({ sources, ...row }) => {
+      if (!sources) return row;
+      try { return { ...row, sources: JSON.parse(sources) as WebSource[] }; } catch { return row; }
+    });
   }
   attachments(userId: string, chatId: string): Attachment[] {
     this.chat(userId, chatId);
@@ -302,10 +308,10 @@ export class Store {
       return { user, assistant };
     })();
   }
-  saveReply(userId: string, chatId: string, messageId: string, content: string, status: MessageStatus, error: string | null = null, reasoning?: string): Message {
+  saveReply(userId: string, chatId: string, messageId: string, content: string, status: MessageStatus, error: string | null = null, reasoning?: string, sources?: WebSource[]): Message {
     this.chat(userId, chatId);
-    const result = this.db.prepare("UPDATE app_message SET content=?,status=?,error=?,reasoning=COALESCE(?,reasoning) WHERE id=? AND chatId=? AND role='assistant' AND status='streaming'")
-      .run(content, status, error, reasoning ?? null, messageId, chatId);
+    const result = this.db.prepare("UPDATE app_message SET content=?,status=?,error=?,reasoning=COALESCE(?,reasoning),sources=COALESCE(?,sources) WHERE id=? AND chatId=? AND role='assistant' AND status='streaming'")
+      .run(content, status, error, reasoning ?? null, sources?.length ? JSON.stringify(sources) : null, messageId, chatId);
     if (result.changes !== 1) throw new AppError(409, "This reply is no longer active.");
     this.db.prepare("UPDATE app_chat SET updatedAt=? WHERE id=? AND userId=?").run(Date.now(), chatId, userId);
     return this.messages(userId, chatId).find(m => m.id === messageId)!;

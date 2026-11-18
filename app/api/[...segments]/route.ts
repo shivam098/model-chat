@@ -10,6 +10,7 @@ import { listModels, runCopilotReply, type ReplyRunner } from "@/lib/copilot";
 import { prepareImageTurn } from "@/lib/image-turn";
 import { codeToolInstruction, createCodeTool, previewMatches } from "@/lib/code-tool";
 import { sandboxConfig, sandboxStatus } from "@/lib/sandbox";
+import { webSearchStatus } from "@/lib/web-search";
 import { createChatStream, stopReply, stopSessionReplies, hasSessionReply, type StreamSecurity } from "@/lib/stream";
 import { disposeCodeChat, handleCodeApi, handleCodeMessage } from "@/lib/coding/routes";
 import { hasCodeSession } from "@/lib/coding/agent";
@@ -111,6 +112,9 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
     if (s.length === 1 && s[0] === "sandbox-status" && method === "GET") {
       return Response.json(run("sandbox.status", null, () => sandboxStatus()));
     }
+    if (s.length === 1 && s[0] === "web-status" && method === "GET") {
+      return Response.json(webSearchStatus(ctx, guard));
+    }
     if (s[0] === "admin") {
       if (s.length === 2 && s[1] === "acting" && method === "POST") {
         guard.requireAdmin(ctx);
@@ -209,15 +213,26 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
       const turn = prepareImageTurn(store, user.id, chatId, body.content, body.fileIds, model, runCopilotReply,
         (id, outcome, reason) => guard.record(ctx, "image.analysis", id, outcome, reason, true));
       const sandbox = sandboxConfig();
-      const runner: ReplyRunner = sandbox ? input => turn.runner({
+      // Decided on the server for this turn: the owner's own chats by default, never while acting as another user.
+      const web = webSearchStatus(ctx, guard).enabled;
+      const base: ReplyRunner = sandbox ? input => turn.runner({
         ...input,
-        toolInstruction: codeToolInstruction(sandbox),
+        toolInstruction: codeToolInstruction(sandbox, Boolean(input.webSearch)),
         tools: [createCodeTool({
           store, access: ctx, chatId, assistantMessageId: input.assistantMessageId!, signal: input.signal,
           authorize: () => { guard.check(ctx); }, onProgress: input.onProgress, onActivity: input.onRequestStart, onAttachments: input.onAttachments,
           audit: (action, objectId, outcome, reason) => guard.record(ctx, action, objectId, outcome, reason, true),
         })],
       }) : turn.runner;
+      const runner: ReplyRunner = !web ? base : async input => {
+        let searches = 0;
+        try {
+          await base({ ...input, webSearch: true, onWeb: update => { searches = update.searches; input.onWeb?.(update); } });
+        } finally {
+          // Audited without query text: actor, subject, chat and how many searches the reply made.
+          if (searches) guard.record(ctx, "web.search", chatId, "allowed", `${searches} search${searches === 1 ? "" : "es"}`, true);
+        }
+      };
       return createChatStream(store, user.id, chatId, body.content, body.model, body.fileIds, turn.prompt, runner, request.signal, streamSecurity);
     }
     if (s.length === 3 && s[2] === "files" && method === "POST") {

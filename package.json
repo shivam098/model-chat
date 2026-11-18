@@ -32,6 +32,7 @@
     "test:copilot-account": "tsx --test tests/copilot-account.integration.ts",
     "copilot:login": "node scripts/copilot-login.mjs",
     "code:remote": "node scripts/code-remote.mjs",
+    "web:search": "node scripts/web-search.mjs",
     "setup:media": "node scripts/setup-media.mjs",
     "setup:sandbox": "node scripts/setup-sandbox.mjs",
     "test:sandbox": "tsx --test tests/sandbox.integration.ts"

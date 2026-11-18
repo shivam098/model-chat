@@ -1,7 +1,8 @@
 import type { Store } from "./store";
 import { AppError } from "./errors";
 import { copilotError, type ReplyRunner } from "./copilot";
-import { LIMITS, type StreamEvent, type MessageStatus, type NativeImage } from "./contracts";
+import { LIMITS, type StreamEvent, type MessageStatus, type NativeImage, type WebSource } from "./contracts";
+import { finalizeSources } from "./web-search";
 
 type ActiveReply = { userId: string; actorId: string; sessionId?: string; controller: AbortController };
 export interface StreamSecurity {
@@ -67,13 +68,15 @@ export function createChatStream(store: Store, userId: string, chatId: string, c
       void (async () => {
         let text = "";
         let reasoning = "";
+        let found: WebSource[] = [];
+        const sources = () => found.length ? finalizeSources(found, text) : undefined;
         let lastSave = 0;
         let outputExceeded = false;
         let status: MessageStatus = "complete";
         let error: string | null = null;
         const persist = () => {
           if (Date.now() - lastSave > 250) {
-            store.saveReply(userId, chatId, turn.assistant.id, text, "streaming", null, reasoning);
+            store.saveReply(userId, chatId, turn.assistant.id, text, "streaming", null, reasoning, sources());
             lastSave = Date.now();
           }
         };
@@ -118,6 +121,12 @@ export function createChatStream(store: Store, userId: string, chatId: string, c
           await runner({ model, prompt, images, authorize: security?.check, signal: controller.signal, assistantMessageId: turn.assistant.id,
             onAttachments: () => { if (checkAccess()) send({ type: "attachments" }); },
             onCodeEvent: event => { if (checkAccess()) send({ type: "code", event }); },
+            onWeb: update => {
+              if (controller.signal.aborted || !checkAccess()) return;
+              found = update.sources;
+              send({ type: "web", searching: update.searching, searches: update.searches, sources: sources() ?? [] });
+              persist();
+            },
             onRequestStart: requestStarted, onProgress: value => { stage = value; if (checkAccess()) send({ type: "progress", stage }); },
             onDelta: text => accept(text, false), onReplace: text => accept(text, true), onReasoning: acceptReasoning });
           if (controller.signal.aborted) throw new DOMException("Reply cancelled", "AbortError");
@@ -136,7 +145,7 @@ export function createChatStream(store: Store, userId: string, chatId: string, c
           checkAccess();
           if (accessLost) { status = "cancelled"; error = "Reply stopped because the actor's access ended. Partial text remains in this chat."; }
           try {
-            const message = store.saveReply(userId, chatId, turn.assistant.id, text, status, error, reasoning);
+            const message = store.saveReply(userId, chatId, turn.assistant.id, text, status, error, reasoning, sources());
             security?.finished(message.id, status, accessLost);
             if (!accessLost) send({ type: "done", message });
           } catch (saveError) {

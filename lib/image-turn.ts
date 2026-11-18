@@ -97,7 +97,7 @@ Return only JSON matching {"images":[{"id":"exact supplied image id","analysis":
       const analysisPrompt = buildPrompt([], batch.map(source => ({ id: source.id, name: source.name, text: "Supplied image pixels; use this exact id in the JSON response." })), task, tokens - images.length * 4096);
       try {
         for (const source of batch) audit?.(source.id, "allowed", "request_started");
-        const result = await collectAnalysis(runner, { ...input, tools: undefined, toolInstruction: undefined, prompt: analysisPrompt, images });
+        const result = await collectAnalysis(runner, { ...input, tools: undefined, toolInstruction: undefined, webSearch: undefined, onWeb: undefined, prompt: analysisPrompt, images });
         if (result.length !== batch.length || new Set(result.map(item => item.id)).size !== batch.length || result.some(item => !batch.some(source => source.id === item.id))) {
           throw new AppError(502, "Copilot did not analyze every requested image. All attachments are saved, but no combined answer was generated.");
         }

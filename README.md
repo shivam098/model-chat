@@ -239,6 +239,27 @@ npm run code:remote -- off
 
 Even when it's on, every coding request through the link needs the superuser's session to have been **signed in with a two-step verification code** (see "Two-step verification" below). Older sessions, password-only sessions, ordinary accounts and acting are refused. Live previews stay available only in the host's own browser. The switch takes effect immediately and is audited.
 
+### Web search (superuser's own chats by default)
+
+The model can search the web for current information (recent releases, news, prices, schedules) and cite its sources. It uses **GitHub-hosted web search**: the Copilot runtime's built-in GitHub MCP server, with only its `web_search` tool enabled. The search runs on GitHub's servers with the app's Copilot account, so nothing is fetched from this computer and no search API key is needed. It depends on your Copilot plan and policy allowing it.
+
+- **Who:** by default only the superuser, in their own chats. It is never available while acting as another user, and it is decided on the server for every turn. A **Web** chip in the message box shows when it is on; *Account & connection* shows the status.
+- **Change it** (local command only, audited):
+
+```powershell
+npm run web:search -- status
+npm run web:search -- owner            # default: the superuser's own chats
+npm run web:search -- everyone --yes   # every signed-in account (each search uses the owner's Copilot entitlement)
+npm run web:search -- off
+```
+
+- **Sources:** while it searches, the reply shows "Searching the web". Up to 8 clickable sources appear under the reply, with the ones the model cited first. They are saved with the message and survive reload. Links open in a new tab without a referrer. Only plain public `http(s)` addresses are shown; IP addresses, local names and links with embedded credentials are dropped.
+- **Cost:** each search adds one follow-up model call that the runtime marks as agent-initiated, and the search results (typically a few hundred to a few thousand tokens) count as input. GitHub documents premium requests as counted per user prompt; check your plan's usage page if this matters.
+- **Pasted links:** the model can't open a page. It searches for the link and says it saw only search results, not the full page. A local page fetcher was deliberately not added: on a work computer it would fetch from inside the corporate network, which can't be reliably fenced off.
+- **Safety:** every other built-in and GitHub tool stays excluded. If the runtime offers or runs any tool other than `web_search` (or `run_python` when the code runner is set up), the reply stops with a safety error. Web results are treated as untrusted data. Chats without web search keep the "cannot browse" instruction and say so.
+- **Audit:** each reply that searched records `web.search` with the actor, subject, chat and the number of searches, never the query text.
+- Provider-native search (the model vendor's own hosted search) isn't available with this SDK and account, so it isn't used.
+
 ### Local audio/video uploads
 
 Uploaded recordings use a separate **local** processing path: faster-whisper transcribes speech on the host CPU, and PyAV decodes media using its bundled FFmpeg libraries. Video also produces up to four timestamped JPEG samples. Copilot receives the transcript and sampled images when you press Send, not raw native audio/video. Use a vision-capable model for videos. Transcription and frame extraction do not themselves make Copilot model requests.
@@ -350,8 +371,8 @@ From then on, signing in to that account asks for a code after the password (or 
 - Better Auth hashes passwords, stores sessions server-side, and issues HttpOnly, SameSite=Strict cookies. Cookies are Secure in HTTPS tunnel mode and not Secure only for local loopback HTTP. No auth tokens go in localStorage. The launcher supplies a fixed, unspoofable loopback identity for auth rate limiting, shared by remote sign-in attempts too.
 - Every chat, message, draft, demo, attachment, download, rename, delete, and stop operation checks ownership on the server. Ordinary users are isolated; a superuser may explicitly act as a user with auditing. The administrator can therefore access users' chats/files and operate in their workspaces. Files live as BLOBs in SQLite, not under a public web root. Client MIME and paths are never trusted.
 - Document parsers run in bounded-memory worker threads. Office archives are inspected before parsing; external file access, macros, and executable payloads are rejected. Media runs in a cancellable Python child process with offline model loading, fixed decoder formats, bounded audio windows/frame dimensions and periodic authorization checks. Neither mechanism is an OS sandbox or a substitute for patched parser dependencies.
-- Copilot uses `mode: "empty"`, explicit `builtin:*`/`mcp:*` exclusions and no MCP servers, custom agents, skills, hooks, instructions, host git context, cross-session memory/store or embedding retrieval. Without the code runner, `availableTools` is empty and `custom:*` is excluded too. With it, the allow-list is exactly `custom:run_python`. The permission handler approves only that tool and rejects every shell, read, write, URL, MCP and unknown request; `approveAll` is never used. Before sending any prompt, the app checks the runtime's initialized tool list is exactly that set (or empty), and fails closed otherwise.
-- The model sees only the authorized conversation and extracted files as a JSON data payload. A separate system instruction treats file content as untrusted, not permission grants. In ordinary chats it cannot run a shell, browse, or access the host filesystem. The optional `run_python` tool executes only inside the offline WSL sandbox described above; code induced by uploaded content is contained by that sandbox. **Coding mode** is the one exception: a separate superuser-only session on this computer with the shell and file tools, where every action goes through the approvals described in "Coding mode". Ordinary chats never get those tools.
+- Copilot uses `mode: "empty"`, explicit `builtin:*`/`mcp:*` exclusions and no MCP servers, custom agents, skills, hooks, instructions, host git context, cross-session memory/store or embedding retrieval. Without the code runner, `availableTools` is empty and `custom:*` is excluded too. With it, the allow-list is exactly `custom:run_python`. The permission handler approves only that tool and rejects every shell, read, write, URL, MCP and unknown request; `approveAll` is never used. Before sending any prompt, the app checks the runtime's initialized tool list is exactly that set (or empty), and fails closed otherwise. **Web search** is the one MCP exception: for chats where it is enabled, the runtime's built-in GitHub MCP server is started with only its `web_search` toolset, `availableTools` adds exactly `mcp:web_search`, `builtin:*` stays excluded, and the app re-checks the tool list when the server's tools load and stops the reply if any other tool appears or runs.
+- The model sees only the authorized conversation and extracted files as a JSON data payload. A separate system instruction treats file content as untrusted, not permission grants. In ordinary chats it cannot run a shell, open web pages, or access the host filesystem; where web search is enabled it can only search through GitHub's hosted tool, and results are treated as untrusted data. The optional `run_python` tool executes only inside the offline WSL sandbox described above; code induced by uploaded content is contained by that sandbox. **Coding mode** is the one exception: a separate superuser-only session on this computer with the shell and file tools, where every action goes through the approvals described in "Coding mode". Ordinary chats never get those tools.
 - Prompts, conversation context, extracted file text, and native image attachments are sent to **GitHub Copilot** when you send a message, subject to your plan's policies. Local storage is **not encrypted at rest**. Windows account or backup access can expose it; store only data you are allowed to send and retain.
 
 ### Data, backup, and removal
@@ -438,6 +459,14 @@ For an explicit end-to-end check of the **currently running public tunnel**, `np
 $env:MODEL_CHAT_CODING_E2E = '1'; $env:MODEL_CHAT_PROJECTS_DIR = "$env:TEMP\model-chat-e2e"; New-Item -ItemType Directory -Force $env:MODEL_CHAT_PROJECTS_DIR
 npx playwright test tests/browser/coding.spec.ts
 Remove-Item Env:\MODEL_CHAT_CODING_E2E, Env:\MODEL_CHAT_PROJECTS_DIR
+```
+
+`lib/web-search.ts` decides who gets web search, holds its instruction and turns results into safe, saved sources; `scripts/web-search.mjs` is the owner command. `tests/web-search.test.ts` covers the session config, access rules and sources without model calls. `tests/browser/web-search.spec.ts` is an opt-in real run (about four Copilot turns) against a candidate build:
+
+```powershell
+$env:MODEL_CHAT_CANDIDATE_BUILD = '1'; npm run build
+$env:MODEL_CHAT_WEB_E2E = '1'; npx playwright test tests/browser/web-search.spec.ts
+Remove-Item Env:\MODEL_CHAT_WEB_E2E, Env:\MODEL_CHAT_CANDIDATE_BUILD
 ```
 
 `components/chat-app.tsx` and `app/globals.css` implement the interface. `app/api/[...segments]/route.ts` handles the API. `lib/auth.ts` owns Better Auth; `lib/signup.ts` validates the short signup payload. `lib/demos.ts` contains synthetic samples and `lib/demo-storage.ts` creates owned, transactional demo chats. `lib/store.ts` owns SQLite and ownership, `lib/context.ts` builds bounded context, `lib/copilot.ts` owns runtime isolation, and `lib/stream.ts` handles durable streaming. `scripts/extract-file.mjs` is the document/image worker; `lib/media.ts` and `scripts/media-worker.py` handle local recordings. `sandbox/run-job.py` is the root-owned WSL runner, `scripts/setup-sandbox.mjs` the owner-only setup, `lib/sandbox.ts` the framed bridge and `lib/code-tool.ts` the `run_python` tool. `scripts/serve.mjs` is the loopback-bound launcher; `scripts/tunnel.mjs` manages the separate Quick Tunnel and app processes and the auto-restart check (`lib/watchdog.mjs` decides what to repair). `link-page/` is the shareable-link page (not `pages/`, which Next.js would treat as routes) and `lib/stable-link.mjs` publishes it.

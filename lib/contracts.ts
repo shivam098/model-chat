@@ -11,6 +11,7 @@ export const LIMITS = {
   outputCharacters: 32_000,
   reasoningCharacters: 32_000,
   codeEventText: 64_000,
+  webSources: 8,
   messagesPerChat: 200,
   chatsPerUser: 100,
 };
@@ -53,7 +54,10 @@ export interface Message {
   createdAt: number;
   /** The model's own reasoning summary, shown behind "Show thinking"; never sent back as context. */
   reasoning: string;
+  /** Web pages found by web search for this reply (cited ones first); absent when the reply didn't search. */
+  sources?: WebSource[];
 }
+export interface WebSource { url: string; title: string; cited?: boolean }
 export interface Attachment {
   id: string;
   chatId: string;
@@ -97,6 +101,7 @@ export type StreamEvent =
   | { type: "replace"; text: string }
   | { type: "reasoning"; text: string; replace?: boolean }
   | { type: "code"; event: CodeEvent }
+  | { type: "web"; searching: boolean; searches: number; sources: WebSource[] }
   | { type: "progress"; stage: string }
   | { type: "attachments" }
   | { type: "done"; message: Message }
