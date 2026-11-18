@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { PermissionRequest } from "@github/copilot-sdk";
@@ -9,9 +9,10 @@ import { Store } from "../lib/store";
 import { AccessService } from "../lib/access";
 import { dataDirectory } from "../lib/config";
 import { applyDecision, emptyAllowances, gate } from "../lib/coding/policy";
-import { classifyPath, mentionsBlocked, validateProjectPath } from "../lib/coding/paths";
+import { classifyPath, createProject, mentionsBlocked, validateProjectPath } from "../lib/coding/paths";
+import { screenshot } from "../lib/coding/routes";
 import { codingStatus, requireCoding } from "../lib/coding/access";
-import { codingEnvironment, verifyCodingTools } from "../lib/coding/agent";
+import { codingEnvironment, screenshotsSince, verifyCodingTools } from "../lib/coding/agent";
 
 // macOS temp folders resolve under /private, which projects may not use.
 const scratch = () => mkdtempSync(path.join(process.platform === "darwin" ? os.homedir() : os.tmpdir(), "model-chat-coding-test-"));
@@ -76,6 +77,40 @@ test("project folders exclude the app, its data, credentials and whole drives", 
       assert.throws(() => validateProjectPath(bad), Error, bad);
     }
   } finally { rmSync(project, { recursive: true, force: true }); }
+});
+
+test("iOS template projects get a valid app name, tests and ios.sh; screenshots are shown only as real images from the project", () => {
+  const root = scratch();
+  const saved = process.env.MODEL_CHAT_PROJECTS_DIR;
+  process.env.MODEL_CHAT_PROJECTS_DIR = root;
+  try {
+    const project = createProject("my notes", "ios");
+    const spec = readFileSync(path.join(project, "project.yml"), "utf8");
+    assert.match(spec, /^name: MyNotesApp$/m);
+    assert.match(spec, /PRODUCT_BUNDLE_IDENTIFIER: local\.modelchat\.mynotesapp$/m);
+    assert.ok(existsSync(path.join(project, "Sources", "MyNotesApp.swift")));
+    assert.match(readFileSync(path.join(project, "Tests", "CounterTests.swift"), "utf8"), /@testable import MyNotesApp/);
+    assert.match(readFileSync(path.join(project, "ios.sh"), "utf8"), /^APP=MyNotesApp$/m);
+    if (process.platform !== "win32") assert.ok(statSync(path.join(project, "ios.sh")).mode & 0o100, "ios.sh is executable");
+    assert.match(readFileSync(path.join(createProject("2048 game", "ios"), "project.yml"), "utf8"), /^name: My2048GameApp$/m);
+    assert.deepEqual(readdirSync(createProject("plain", "empty")), []);
+
+    const shots = path.join(project, ".modelchat", "screenshots");
+    mkdirSync(shots, { recursive: true });
+    writeFileSync(path.join(shots, "sim.png"), Buffer.from("89504e470d0a1a0a0000000d49484452", "hex"));
+    writeFileSync(path.join(shots, "fake.png"), "not an image");
+    writeFileSync(path.join(shots, "notes.txt"), "text");
+    assert.deepEqual(screenshotsSince(project, Date.now() - 60_000).sort(), ["fake.png", "sim.png"]);
+    assert.deepEqual(screenshotsSince(project, Date.now() + 60_000), [], "Only images saved during the command are attached");
+    const served = screenshot(project, "sim.png");
+    assert.equal(served.headers.get("content-type"), "image/png");
+    assert.equal(served.headers.get("content-security-policy"), "default-src 'none'");
+    assert.throws(() => screenshot(project, "fake.png"), /isn't a PNG/);
+    for (const name of ["../project.yml", "..\\project.yml", "notes.txt", "missing.png", ".modelchat"]) assert.throws(() => screenshot(project, name), /not found/, name);
+  } finally {
+    if (saved === undefined) delete process.env.MODEL_CHAT_PROJECTS_DIR; else process.env.MODEL_CHAT_PROJECTS_DIR = saved;
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("coding access: superuser only, never while acting, and local-only without remote coding turned on", () => {

@@ -1,0 +1,95 @@
+name: macOS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  app:
+    name: Model Chat on macOS
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - name: Unit tests
+        run: npm test
+      - name: Production build
+        run: npm run build
+      - name: Server restart and tunnel-mode tests (process checks use ps on macOS)
+        run: |
+          npm run test:restart
+          npm run test:tunnel
+      - name: Auto-restart launchd agent installs, runs and uninstalls
+        run: |
+          brew install cloudflared
+          node scripts/tunnel.mjs autorestart-on --minutes 5
+          for i in $(seq 1 30); do grep -q "Auto-restart is idle" .local/watchdog.log 2>/dev/null && break; sleep 1; done
+          cat .local/watchdog.log
+          grep -q "Auto-restart is idle" .local/watchdog.log
+          node scripts/tunnel.mjs status > status.json
+          node -e 'const s = require("./status.json"); console.log(s.autoRestart); if (!s.autoRestart.installed) process.exit(1)'
+          node scripts/tunnel.mjs autorestart-off
+          test ! -f ~/Library/LaunchAgents/com.modelchat.autorestart.plist
+      - name: Remote coding switch refuses without two-step verification
+        run: |
+          node scripts/code-remote.mjs status
+          if node scripts/code-remote.mjs on --yes; then exit 1; fi
+          node scripts/code-remote.mjs off
+
+  ios:
+    name: iOS app from the coding-mode template (Simulator)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      MODEL_CHAT_PROJECTS_DIR: ${{ github.workspace }}/../ios-projects
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: brew install xcodegen
+      - name: Create the app the way coding mode does
+        run: |
+          npx tsx -e 'import("./lib/coding/paths.ts").then(paths => console.log(paths.createProject("Sample Counter", "ios")))' | tail -n 1 > project-path.txt
+          cat project-path.txt
+          ls -la "$(cat project-path.txt)"
+      - name: Build for the iPhone Simulator
+        run: |
+          cd "$(cat project-path.txt)"
+          ./ios.sh build
+      - name: Run it in the Simulator and take a screenshot
+        run: |
+          cd "$(cat project-path.txt)"
+          SCREENSHOT_DELAY=10 ./ios.sh run
+      - name: Run the app's unit tests
+        run: |
+          cd "$(cat project-path.txt)"
+          ./ios.sh test
+      - name: Check the screenshot
+        run: |
+          shot=$(ls "$(cat project-path.txt)"/.modelchat/screenshots/*.png | head -n 1)
+          file "$shot"
+          sips -g pixelWidth -g pixelHeight "$shot"
+          cp "$shot" simulator-screenshot.png
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-simulator-screenshot
+          path: simulator-screenshot.png
+          if-no-files-found: ignore

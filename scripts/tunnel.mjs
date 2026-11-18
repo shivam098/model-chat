@@ -4,6 +4,7 @@
 // outside the caller's job object, and the optional auto-restart task (ensure) repairs them if they stop.
 import { spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import env from "@next/env";
@@ -218,13 +219,61 @@ function scheduledTask(script, extra = {}) {
 function autoRestartStatus() {
   const wanted = readJson(files.wanted)?.wanted === true;
   let task = null;
-  try {
+  if (process.platform === "darwin") task = launchAgentStatus();
+  else if (process.platform !== "win32") task = { error: "Auto-restart is available on Windows and macOS." };
+  else try {
     const found = scheduledTask("$t = Get-ScheduledTask -TaskName $env:MC_TASK -ErrorAction SilentlyContinue; if ($t) { $i = $t | Get-ScheduledTaskInfo; "
       + "[pscustomobject]@{ state = \"$($t.State)\"; lastRun = $(if ($i.LastRunTime.Year -gt 2000) { $i.LastRunTime.ToString('o') }); lastResult = $i.LastTaskResult; nextRun = $(if ($i.NextRunTime) { $i.NextRunTime.ToString('o') }) } | ConvertTo-Json -Compress }; exit 0");
     task = found ? JSON.parse(found) : null;
   } catch (error) { task = { error: error.message }; }
   const lastEvent = tail(files.watchdogLog, 4000).trim().split(/\r?\n/).at(-1) || null;
   return { installed: Boolean(task && !task.error), on: wanted, task, lastEvent };
+}
+
+// macOS: a per-user launchd agent runs the same check at login and every few minutes (no window, no admin rights).
+const LAUNCH_LABEL = "com.modelchat.autorestart";
+const launchAgentFile = () => path.join(os.homedir(), "Library", "LaunchAgents", `${LAUNCH_LABEL}.plist`);
+const launchTarget = () => `gui/${process.getuid()}`;
+const plistText = value => String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const launchctl = args => spawnSync("launchctl", args, { encoding: "utf8", timeout: 30_000 });
+function installLaunchAgent(minutes) {
+  const cloudflared = (spawnSync("/usr/bin/which", ["cloudflared"], { encoding: "utf8" }).stdout || "").trim();
+  if (!cloudflared) throw new Error("cloudflared is not on PATH. Install it with: brew install cloudflared");
+  // launchd starts agents with a minimal PATH, so node, cloudflared and Homebrew's tools are named explicitly.
+  const searchPath = [...new Set([path.dirname(process.execPath), path.dirname(cloudflared), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"])].join(":");
+  const program = [process.execPath, path.resolve("scripts", "tunnel.mjs"), "ensure", "--port", String(port)];
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${LAUNCH_LABEL}</string>
+  <key>ProgramArguments</key><array>${program.map(part => `<string>${plistText(part)}</string>`).join("")}</array>
+  <key>WorkingDirectory</key><string>${plistText(process.cwd())}</string>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${plistText(searchPath)}</string><key>MODEL_CHAT_DATA_DIR</key><string>${plistText(data)}</string></dict>
+  <key>StartInterval</key><integer>${minutes * 60}</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>/dev/null</string>
+  <key>StandardErrorPath</key><string>/dev/null</string>
+</dict>
+</plist>
+`;
+  mkdirSync(path.dirname(launchAgentFile()), { recursive: true });
+  writeFileSync(launchAgentFile(), plist, { mode: 0o644 });
+  launchctl(["bootout", `${launchTarget()}/${LAUNCH_LABEL}`]);
+  const loaded = launchctl(["bootstrap", launchTarget(), launchAgentFile()]);
+  if (loaded.status !== 0) throw new Error(`launchd: ${(loaded.stderr || loaded.stdout || "could not load the agent").trim().split(/\r?\n/)[0]}`);
+}
+function removeLaunchAgent() {
+  launchctl(["bootout", `${launchTarget()}/${LAUNCH_LABEL}`]);
+  try { unlinkSync(launchAgentFile()); } catch { /* Not installed. */ }
+}
+function launchAgentStatus() {
+  if (!existsSync(launchAgentFile())) return null;
+  const printed = launchctl(["print", `${launchTarget()}/${LAUNCH_LABEL}`]);
+  if (printed.status !== 0) return { state: "not loaded", file: launchAgentFile() };
+  const field = name => new RegExp(`^\\s*${name} = (.+)$`, "m").exec(printed.stdout)?.[1]?.trim() ?? null;
+  return { state: field("state"), runs: field("runs"), lastExitCode: field("last exit code"), file: launchAgentFile() };
 }
 
 // The auto-restart check (run by the scheduled task): repair whatever stopped, quietly when nothing did.
@@ -307,6 +356,11 @@ if (command === "status") {
 } else if (command === "autorestart-on") {
   const minutes = Number(option("--minutes") ?? 5);
   if (!Number.isInteger(minutes) || minutes < 2 || minutes > 60) throw new Error("--minutes must be a whole number from 2 to 60.");
+  if (process.platform === "darwin") {
+    installLaunchAgent(minutes);
+    console.log(`Auto-restart is on: the launchd agent "${LAUNCH_LABEL}" checks at login and every ${minutes} minutes, without opening a window.`);
+    console.log(readJson(files.wanted)?.wanted ? "It will restart the app and tunnel whenever they stop." : "It starts working after the next npm run tunnel (the link is currently turned off).");
+  } else {
   scheduledTask(`$ErrorActionPreference = 'Stop'
 $argument = '//B //Nologo "{0}" "{1}" "{2}" {3}' -f $env:MC_VBS, $env:MC_NODE, $env:MC_ROOT, $env:MC_PORT
 $action = New-ScheduledTaskAction -Execute "$env:WINDIR\\System32\\wscript.exe" -Argument $argument -WorkingDirectory $env:MC_ROOT
@@ -318,8 +372,10 @@ Register-ScheduledTask -TaskName $env:MC_TASK -Action $action -Trigger @($repeat
   { MC_VBS: quotePath(path.resolve("scripts", "run-hidden.vbs")).slice(1, -1), MC_NODE: quotePath(process.execPath).slice(1, -1), MC_ROOT: quotePath(process.cwd()).slice(1, -1), MC_PORT: String(port), MC_MINUTES: String(minutes) });
   console.log(`Auto-restart is on: "${TASK}" checks at sign-in and every ${minutes} minutes while you're signed in, without opening a window.`);
   console.log(readJson(files.wanted)?.wanted ? "It will restart the app and tunnel whenever they stop." : "It starts working after the next npm run tunnel (the link is currently turned off).");
+  }
 } else if (command === "autorestart-off") {
-  scheduledTask("Unregister-ScheduledTask -TaskName $env:MC_TASK -Confirm:$false -ErrorAction SilentlyContinue; exit 0");
+  if (process.platform === "darwin") removeLaunchAgent();
+  else scheduledTask("Unregister-ScheduledTask -TaskName $env:MC_TASK -Confirm:$false -ErrorAction SilentlyContinue; exit 0");
   console.log("Auto-restart is off. The app and tunnel keep running; they are no longer restarted if they stop.");
 } else if (!(await acquireManagerLock(true))) {
   throw new Error("Another Model Chat command is still running. Try again shortly.");
@@ -344,7 +400,7 @@ Register-ScheduledTask -TaskName $env:MC_TASK -Action $action -Trigger @($repeat
   await verifyPublic(tunnel.url);
   await syncStableLink(tunnel.url);
   const stable = (() => { try { return stableLinkConfig()?.address; } catch { return null; } })();
-  const autoRestart = process.platform === "win32" && autoRestartStatus().installed;
+  const autoRestart = ["win32", "darwin"].includes(process.platform) && autoRestartStatus().installed;
   console.log(`\nYour Model Chat link: ${tunnel.url}${stable ? `\nShareable link (always opens the current one): ${stable}` : ""}\nThe link stays the same when you update the app with npm run app:update (or npm run app:restart). It changes only if the tunnel process stops, for example after a PC restart.`);
   console.log(autoRestart ? "Auto-restart is on: if the app or tunnel stops, they are restarted within a few minutes.\n" : "Tip: npm run autorestart:on restarts them automatically if they stop.\n");
 } else if (command === "restart-app") {

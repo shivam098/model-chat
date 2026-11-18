@@ -6,6 +6,10 @@ import env from "@next/env";
 import { runtimeEnvironment } from "../lib/runtime-env.mjs";
 
 env.loadEnvConfig(process.cwd());
+if (process.platform !== "win32") {
+  console.error("The code runner sandbox uses WSL and is available on Windows only. On this computer the superuser's coding mode runs code instead, with approval for each command.");
+  process.exit(1);
+}
 const DISTRO = "ModelChatSandbox";
 const wsl = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "wsl.exe");
 const data = path.resolve(process.env.MODEL_CHAT_DATA_DIR || ".local");

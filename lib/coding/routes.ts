@@ -7,8 +7,10 @@ import { LIMITS } from "../contracts";
 import { listModels, replyReasoningEffort, type ReplyRunner } from "../copilot";
 import { createChatStream, type StreamSecurity } from "../stream";
 import { codingStatus, requireCoding } from "./access";
-import { codingRunner, decideApproval, disposeCodeSession, listProcesses, stopProcess } from "./agent";
-import { createProject, listProjects, validateProjectPath } from "./paths";
+import { readFileSync, realpathSync, statSync } from "node:fs";
+import path from "node:path";
+import { SCREENSHOT_NAME, codingRunner, decideApproval, disposeCodeSession, listProcesses, stopProcess } from "./agent";
+import { createProject, isBlockedPath, isInside, listProjects, validateProjectPath } from "./paths";
 import { createPreview, revokePreviews } from "./preview";
 
 const appPort = () => Number(process.env.PORT || 3210);
@@ -23,9 +25,9 @@ export async function handleCodeApi(request: Request, s: string[], ctx: AccessCo
   const audit = (name: string, objectId: string | null, reason: string | null) => guard.record(ctx, name, objectId, "allowed", reason, true);
   if (s.length === 2 && s[1] === "projects" && method === "GET") return Response.json(listProjects());
   if (s.length === 2 && s[1] === "projects" && method === "POST") {
-    const { name } = await readJson(request, z.object({ name: z.string().min(1).max(64) }).strict());
-    const full = createProject(name);
-    audit("code.project.create", null, full);
+    const { name, template } = await readJson(request, z.object({ name: z.string().min(1).max(64), template: z.enum(["empty", "ios"]).default("empty") }).strict());
+    const full = createProject(name, template);
+    audit("code.project.create", null, `${template === "ios" ? "iOS app " : ""}${full}`);
     return Response.json({ path: full }, { status: 201 });
   }
   if (s.length === 2 && s[1] === "chats" && method === "POST") {
@@ -45,6 +47,7 @@ export async function handleCodeApi(request: Request, s: string[], ctx: AccessCo
     const chat = store.chat(user.id, chatId);
     if (chat.mode !== "code") throw new AppError(404, "Not a coding chat.");
     if (s.length === 4 && s[3] === "processes" && method === "GET") return Response.json({ processes: await listProcesses(chatId, user.id) });
+    if (s.length === 5 && s[3] === "screenshots" && method === "GET") return screenshot(chat.projectPath!, decodeURIComponent(s[4]));
     if (s.length === 6 && s[3] === "processes" && s[5] === "stop" && method === "POST") {
       const result = await stopProcess(chatId, user.id, s[4]);
       audit("code.process.stop", chatId, s[4]);
@@ -63,6 +66,28 @@ export async function handleCodeApi(request: Request, s: string[], ctx: AccessCo
 export async function disposeCodeChat(chatId: string) {
   revokePreviews(chatId);
   await disposeCodeSession(chatId);
+}
+
+// A screenshot a command saved under the project's .modelchat/screenshots folder: only real images, only from there.
+export function screenshot(project: string, name: string) {
+  const missing = () => new AppError(404, "Screenshot not found.");
+  if (!SCREENSHOT_NAME.test(name)) throw missing();
+  let file: string;
+  try { file = realpathSync.native(path.join(project, ".modelchat", "screenshots", name)); } catch { throw missing(); }
+  if (!isInside(file, realpathSync.native(project)) || isBlockedPath(file)) throw missing();
+  const info = statSync(file);
+  if (!info.isFile() || info.size > 25 * 1024 * 1024) throw missing();
+  const bytes = readFileSync(file);
+  const head = bytes.subarray(0, 12);
+  const type = head[0] === 0x89 && head.subarray(1, 4).toString("latin1") === "PNG" ? "image/png"
+    : head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff ? "image/jpeg"
+    : head.subarray(0, 4).toString("latin1") === "GIF8" ? "image/gif"
+    : head.subarray(0, 4).toString("latin1") === "RIFF" && head.subarray(8, 12).toString("latin1") === "WEBP" ? "image/webp" : null;
+  if (!type) throw new AppError(415, "That file isn't a PNG, JPEG, GIF or WebP image.");
+  return new Response(new Uint8Array(bytes), { headers: {
+    "Content-Type": type, "Content-Length": String(bytes.length), "Cache-Control": "private, no-store",
+    "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'", "Content-Disposition": `inline; filename="${name}"`,
+  } });
 }
 
 /** A message in a coding chat: the same streamed reply and saved history as chat, run by the owner's coding session. */

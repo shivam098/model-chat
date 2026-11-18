@@ -50,7 +50,7 @@ function ApprovalBox({ approval, deciding, onDecide }: { approval: Approval; dec
   </div>;
 }
 
-export function CodeCard({ event, live, deciding, onDecide }: { event: CodeEvent; live: boolean; deciding: boolean; onDecide: (id: string, decision: Decision) => void }) {
+export function CodeCard({ event, live, deciding, showImages = true, onDecide }: { event: CodeEvent; live: boolean; deciding: boolean; showImages?: boolean; onDecide: (id: string, decision: Decision) => void }) {
   const status = statusOf(event, live);
   const approval = event.data.approval as Approval | undefined;
   const asking = approval?.state === "pending" && status === "awaiting approval";
@@ -58,10 +58,15 @@ export function CodeCard({ event, live, deciding, onDecide }: { event: CodeEvent
   const error = text(event.data.error);
   if (event.kind === "command") {
     const output = text(event.data.output);
+    const images = Array.isArray(event.data.images) ? (event.data.images as unknown[]).filter((item): item is string => typeof item === "string") : [];
     return <div className={`code-card ${asking ? "asking" : ""}`}>
       <div className="code-card-head"><Terminal size={16} aria-hidden="true" /><code className="code-command">{text(event.data.command) || "Command"}</code><Badge status={status} /></div>
       {blocked && <p className="code-blocked">{blocked}</p>}
       {asking && <ApprovalBox approval={approval!} deciding={deciding} onDecide={onDecide} />}
+      {images.length > 0 && (showImages ? <div className="code-shots">{images.map(name => {
+        const source = `/api/code/chats/${event.chatId}/screenshots/${encodeURIComponent(name)}`;
+        return <a key={name} href={source} target="_blank" rel="noopener noreferrer" title={`Open ${name}`}><img src={source} alt={`Screenshot ${name}`} loading="lazy" /></a>;
+      })}</div> : <p className="code-blocked muted">Screenshots ({images.length}) can be viewed where coding mode is available.</p>)}
       {output && <details className="code-output" open={status === "running" || status === "failed" || undefined}><summary>Output</summary><pre>{output.length > 8000 ? `…\n${output.slice(-8000)}` : output}</pre></details>}
     </div>;
   }
@@ -176,9 +181,10 @@ export function CodePanel({ chatId, project, events, live, tab, appPort, remote,
   </aside>;
 }
 
-export function ProjectPicker({ api, root, onOpen }: { api: Api; root: string | null; onOpen: (chat: import("@/lib/contracts").Chat) => void }) {
+export function ProjectPicker({ api, root, platform, onOpen }: { api: Api; root: string | null; platform?: string; onOpen: (chat: import("@/lib/contracts").Chat) => void }) {
   const [projects, setProjects] = useState<{ name: string; path: string }[] | null>(null);
   const [name, setName] = useState("");
+  const [template, setTemplate] = useState<"empty" | "ios">("empty");
   const [folder, setFolder] = useState("");
   const [error, setError] = useState("");
   const [working, setWorking] = useState(false);
@@ -200,7 +206,7 @@ export function ProjectPicker({ api, root, onOpen }: { api: Api; root: string | 
   async function create(event: FormEvent) {
     event.preventDefault();
     setWorking(true); setError("");
-    try { const created = await api<{ path: string }>("/api/code/projects", { method: "POST", body: JSON.stringify({ name }) }); setWorking(false); await open(created.path); }
+    try { const created = await api<{ path: string }>("/api/code/projects", { method: "POST", body: JSON.stringify({ name, template }) }); setWorking(false); await open(created.path); }
     catch (cause) { setError(problem(cause)); setWorking(false); }
   }
   return <div className="project-picker">
@@ -213,7 +219,12 @@ export function ProjectPicker({ api, root, onOpen }: { api: Api; root: string | 
     <form className="project-form" onSubmit={create}>
       <label htmlFor="project-name">New project</label>
       <div><input id="project-name" placeholder="my-app" value={name} maxLength={64} onChange={event => setName(event.target.value)} />
+        {platform === "darwin" && <select aria-label="Project template" value={template} onChange={event => setTemplate(event.target.value as "empty" | "ios")}>
+          <option value="empty">Empty folder</option>
+          <option value="ios">iOS app (SwiftUI)</option>
+        </select>}
         <button type="submit" className="secondary-button" disabled={working || !name.trim()}><FolderPlus size={16} /> Create</button></div>
+      {template === "ios" && <small className="project-note">A SwiftUI app with tests, built with Xcode and XcodeGen. Run it in the iPhone Simulator from the chat; screenshots appear there.</small>}
     </form>
     <form className="project-form" onSubmit={event => { event.preventDefault(); void open(folder.trim()); }}>
       <label htmlFor="project-folder">Or open an existing folder</label>

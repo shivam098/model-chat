@@ -11,7 +11,7 @@ const value = (flag, fallback) => {
   if (index >= 0 && !args[index + 1]) throw new Error(`Missing value for ${flag}.`);
   return index >= 0 ? args[index + 1] : fallback;
 };
-const python = value("--python", process.env.MODEL_CHAT_MEDIA_PYTHON || "python");
+const python = value("--python", process.env.MODEL_CHAT_MEDIA_PYTHON || (process.platform === "win32" ? "python" : "python3"));
 const model = value("--model", process.env.MODEL_CHAT_WHISPER_MODEL || "large-v3-turbo");
 const result = spawnSync(python, [path.resolve("scripts", "media-worker.py"), "--probe", "--model", model], {
   env: { ...runtimeEnvironment(), HF_HUB_OFFLINE: "1", PYTHONDONTWRITEBYTECODE: "1", PYTHONNOUSERSITE: "1" },

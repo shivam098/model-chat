@@ -52,7 +52,7 @@ Both wait for streaming replies to finish (up to 10 minutes); add `-- --force` t
 
 The launcher uses an app-owned minimal Cloudflare config instead of modifying any existing global tunnel configuration, and disables auto-updates. `.local/tunnel.json` records the active link and its cloudflared process; the app trusts it only while that process is still running, and adopts the link at startup as its exact public origin (`scripts/serve.mjs --tunnel`). Restarts use a graceful stop request (`.local/app-stop.json`) so file processing and streams are checkpointed; a server that does not stop within 45 seconds is ended, and interrupted work is recovered on the next start.
 
-On Windows, cloudflared and the app are started through WMI, so they don't belong to the terminal or app that ran the command. Closing, updating or restarting that terminal or app (for example the Copilot desktop app, which ends every process it started) no longer stops the link. They still stop at sign-out, restart or shutdown. Owner commands and auto-restart take turns using `.local/manager.lock`; a second command waits for the first.
+On Windows, cloudflared and the app are started through WMI, so they don't belong to the terminal or app that ran the command. On a Mac they start in their own background session for the same reason. Closing, updating or restarting that terminal or app (for example the Copilot desktop app, which ends every process it started) no longer stops the link. They still stop at sign-out, restart or shutdown. Owner commands and auto-restart take turns using `.local/manager.lock`; a second command waits for the first.
 
 ### Auto-restart
 
@@ -61,7 +61,7 @@ npm run autorestart:on    # turn on (once); add -- --minutes 10 for a different 
 npm run autorestart:off   # turn off; the app and tunnel keep running
 ```
 
-This registers a per-user Windows scheduled task, **Model Chat auto-restart**. No admin rights are needed. It runs `scripts/tunnel.mjs ensure` hidden (through `wscript` and `scripts/run-hidden.vbs`) when you sign in and every 5 minutes while you're signed in. Each check:
+This registers a per-user Windows scheduled task, **Model Chat auto-restart**. No admin rights are needed. It runs `scripts/tunnel.mjs ensure` hidden (through `wscript` and `scripts/run-hidden.vbs`) when you sign in and every 5 minutes while you're signed in. On a Mac the same command installs a per-user launchd agent, `~/Library/LaunchAgents/com.modelchat.autorestart.plist`, which runs the same check at login and on the same interval. Each check:
 
 - starts the app again if it stopped or stops answering, behind the **same link**;
 - starts a new tunnel if cloudflared stopped, moves the app to it, and **publishes the new address to the shareable link**;
@@ -134,6 +134,37 @@ Limitations:
 
 `npm run check:copilot -- --chat` additionally makes **one small, real, billable model request**. The UI and scripts never produce pretend model answers. Model choices come from `client.listModels()`, filtered by policy and a usable advertised context limit; entries reporting only zero/unknown capacity (including the current Auto routing entry) are omitted rather than inventing a context size. Choices can differ from those in the desktop app. A failed connection, model restriction, empty answer, or exhausted allowance is shown explicitly.
 
+## Running on a Mac
+
+Model Chat runs on macOS too (Apple silicon or Intel), with the same app, data layout and commands. Differences: auto-restart uses a per-user **launchd** agent instead of Task Scheduler; the WSL **code runner** isn't available (the superuser's coding mode runs code instead, with approvals); and coding mode adds **iOS apps** built with Xcode and the iPhone Simulator. The macOS workflow in `.github/workflows/macos.yml` runs the unit tests, the production build, the restart and tunnel tests, the launchd agent and an iOS template app (Simulator build, screenshot and tests) on GitHub's Mac machines for every push.
+
+**Set up (once):**
+
+1. Install **Xcode** from the App Store (free, but a large download). Open it once to accept the licence, then add an iOS Simulator in *Xcode → Settings → Components*.
+2. Install [Homebrew](https://brew.sh), then: `brew install node@24 cloudflared xcodegen gh`.
+3. `git clone https://github.com/shivam098/model-chat.git && cd model-chat && npm ci`
+4. Copilot: `npm run copilot:login` (the sign-in is stored in the Mac's Keychain; allow access if macOS asks), add `MODEL_CHAT_COPILOT_LOGIN=<your login>` to `.env.local`, then `npm run check:copilot`, which must list models.
+5. `npm run build`, then `npm start` (this Mac only) or `npm run tunnel` (with the shared link) and `npm run autorestart:on`. `npm run autorestart:off` removes the launchd agent `com.modelchat.autorestart`.
+6. Make your account the superuser: sign up at http://127.0.0.1:3210, then `npm run admin:role -- --email you@example.com --role superuser`.
+7. Optional media: `python3 -m venv .local/media-venv && .local/media-venv/bin/pip install -r requirements-media.txt`, download a Whisper model once (`.local/media-venv/bin/python -c "from faster_whisper import WhisperModel; WhisperModel('small')"`), then `npm run setup:media -- --python .local/media-venv/bin/python --model small`.
+
+**Check it works:**
+
+- [ ] `npm run check:copilot` lists models, and `npm test` passes.
+- [ ] http://127.0.0.1:3210 opens, and you can sign in.
+- [ ] Choose **Code → New project → iOS app (SwiftUI)**, then ask "Run it in the Simulator". Approve `./ios.sh run`: the Simulator opens on the Mac and a screenshot appears on the command's card in the chat.
+- [ ] Ask "Run the tests". `./ios.sh test` shows `** TEST SUCCEEDED **`.
+- [ ] Ask for a change (for example "make the count button green"), approve the diff, and run it again: the new screenshot shows the change.
+- [ ] With the link: `npm run tunnel:status` shows the link and `autoRestart.installed: true`.
+- [ ] Remote coding (optional): turn on two-step verification in *Account & connection*, run `npm run code:remote -- on --yes`, then sign in through the link with your code. Coding works there, and previews say they're host-only.
+
+**iOS apps: how it works and the limits.** The iOS template is an XcodeGen project (`project.yml`, no hand-edited `.xcodeproj`) with a SwiftUI app, unit tests and `ios.sh` (`build`, `run`, `screenshot`, `test`). It picks an available iPhone simulator, and screenshots go to `.modelchat/screenshots/`, which Model Chat shows in the chat. That's how you see the app when you're away from the Mac; tapping the Simulator from the browser isn't supported. Every command still needs your approval.
+
+- Xcode is a large free install, and the Simulator needs no Apple ID.
+- Installing on your own iPhone needs an Apple ID signed in to Xcode (*Xcode → Settings → Accounts*), plus first-time setup at the Mac: connect and trust the iPhone, turn on Developer Mode, and choose your team under *Signing & Capabilities*. Model Chat never asks for, stores or handles Apple ID details. Signing and keychain prompts appear on the Mac's own screen.
+- With a free Apple account, apps installed on a device expire after **7 days** (run it again to reinstall).
+- Publishing to the App Store or TestFlight needs Apple's paid **Developer Program ($99 a year)**.
+
 ## Using it
 
 The layout follows Gemini's: a sidebar of recent conversations (collapse it to an icon rail on desktop; it opens as a drawer from **☰** on phones), **Menu** and your account at its foot, and one large message box. For a new chat the box sits in the middle of the screen with a few starting suggestions; afterwards it stays at the bottom. **+** attaches files, the microphone dictates, and the model picker and Send/Stop sit at the right of the box. Your messages appear as bubbles on the right; replies are plain text with the model's name, and **Read aloud** is the speaker icon under each reply. Message times appear on hover.
@@ -189,6 +220,8 @@ Coding mode lets the model work on a project folder on the computer running Mode
 **Always refused, even if you would approve:** Model Chat's folder and data, `.env` files, `~/.ssh`, `.gnupg`, `.aws`, `.azure`, the GitHub CLI and Copilot configuration, git credentials, `.netrc`, `.npmrc`, `.pypirc`, `.kube`, keychains and Windows credential stores; commands that print tokens (`gh auth token`, `cmdkey`); and detached launches (`Start-Process`, `Start-Job`, `nohup`, `setsid`, a trailing `&`, or the shell tool's `detach`), because Model Chat couldn't list or stop them. These checks are a safety net. **Your approval is the real boundary: an approved command runs with your Windows account's full rights.**
 
 **Secrets:** shells get this computer's normal environment minus secret-looking variables and Model Chat's own settings. The Copilot token goes to the runtime for each coding session over its private connection, not through environment variables, so commands can't read it. `gh` inside coding shells sees an empty, isolated configuration.
+
+**Screenshots:** a command that saves an image in the project's `.modelchat/screenshots/` folder (for example a Simulator screenshot from `./ios.sh run`) shows it on its card. Only PNG, JPEG, GIF and WebP files from that folder are served, after checking their contents.
 
 **Live preview and processes:** ask the model to start a dev server (it runs in the shell's attached background mode on 127.0.0.1). The Preview tab offers the ports it printed, or enter one. The preview opens at a private address such as `http://p-<random>.localhost:3210/`, which proxies the dev server for 12 hours, works only in this computer's browser and can't use Model Chat's sign-in. Hot-reload WebSockets are passed through. The Processes tab lists background commands with **Stop**. They also end when the coding session ends. **Stop reply** cancels the turn, including a command still running in it; background servers keep running until you stop them.
 

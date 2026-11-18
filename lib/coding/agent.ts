@@ -1,6 +1,7 @@
 import { CopilotClient, type CopilotSession, type PermissionRequest, type SessionConfig } from "@github/copilot-sdk";
 import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
+import { readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import type { Store } from "../store";
 import type { Chat, CodeEvent } from "../contracts";
@@ -57,8 +58,10 @@ export function codingInstruction(project: string) {
     `Project folder: ${project}. Work inside it; only go outside it when the owner asks, and say so first.`,
     "Every command, file change and web fetch needs the owner's approval in the app. If something is denied, don't retry it; explain and suggest an alternative.",
     "Never read, print or change Model Chat's own folder, .env files, credentials, tokens, keychains or SSH keys, and never print environment variables.",
-    mac ? "This is a Mac: use zsh/bash and the installed tools (Homebrew, Xcode command-line tools, xcodebuild, xcrun simctl). Never ask for Apple ID details; signing prompts appear on the Mac itself."
+    mac ? "This is a Mac: use zsh/bash and the installed tools (Homebrew, Xcode, xcodebuild, xcrun simctl, xcodegen). Never ask for Apple ID details or passwords; signing and keychain prompts appear on the Mac itself, for the owner."
       : "This is Windows: use PowerShell and the installed tools (node/npm, python, dotnet, git). Package installs use the machine's configured feeds; if a download is blocked, report it rather than working around it.",
+    ...(mac ? ["iOS apps: a project with project.yml is an XcodeGen project (run xcodegen generate after changing it or adding files; never hand-edit .xcodeproj). If it has ios.sh, use ./ios.sh build, ./ios.sh run (installs and launches it in the iPhone Simulator and saves a screenshot) and ./ios.sh test. For a new iOS app without it, suggest the owner create a project from Model Chat's iOS template, or write an XcodeGen project.yml. Fix build errors and run the tests before saying it works."] : []),
+    "To show the owner an image (for example a Simulator or app screenshot), save it as a PNG or JPEG in .modelchat/screenshots/ inside the project; Model Chat shows it with the command that created it.",
     "For web apps and other long-running commands (dev servers, watchers), run them with the shell tool in mode \"async\" without detach, bound to 127.0.0.1, and print the URL. They then appear in Model Chat's process list, where the owner can stop them, and end with the coding session. Don't use detach, Start-Process, Start-Job, nohup, disown, setsid or a trailing &: Model Chat refuses them because it couldn't stop the process.",
     "Keep replies short: what you changed, how to run it, and anything that needs the owner.",
   ].join("\n");
@@ -107,6 +110,18 @@ function tidyDiff(session: CodeSession, diff: string) {
   return diff.split(/\r?\n/).map(line => /^(diff --git|---|\+\+\+) /.test(line) ? line.replace(prefix, "$1") : line).join("\n").slice(0, 64_000);
 }
 const writeAction = (intention: unknown, diff: string) => /^--- (a\/)?\/?dev\/null/m.test(diff) || /creat/i.test(String(intention || "")) ? "Created" : /delet/i.test(String(intention || "")) ? "Deleted" : "Edited";
+// Images a command saved in the project's .modelchat/screenshots folder (for example a Simulator screenshot) are shown on its card.
+export const SCREENSHOT_NAME = /^[A-Za-z0-9._-]{1,120}\.(png|jpe?g|gif|webp)$/i;
+const newScreenshots = (session: CodeSession, since: number) => screenshotsSince(session.project, since);
+export function screenshotsSince(project: string, since: number) {
+  const folder = path.join(project, ".modelchat", "screenshots");
+  try {
+    return readdirSync(folder, { withFileTypes: true })
+      .filter(entry => entry.isFile() && SCREENSHOT_NAME.test(entry.name))
+      .map(entry => ({ name: entry.name, at: statSync(path.join(folder, entry.name)).mtimeMs }))
+      .filter(file => file.at >= since - 2000).sort((a, b) => b.at - a.at).slice(0, 4).map(file => file.name);
+  } catch { return []; }
+}
 function snapshot(session: CodeSession, card: Card): CodeEvent {
   return { id: card.id, chatId: session.chatId, messageId: card.messageId, seq: card.seq, kind: card.kind, data: card.data, createdAt: card.createdAt, updatedAt: Date.now() };
 }
@@ -181,6 +196,8 @@ function onToolComplete(session: CodeSession, data: { toolCallId: string; succes
     if (card.kind === "command") {
       const result = data.result?.content || data.error?.message || "";
       if (!card.data.output && result) patch.output = result.slice(-64_000);
+      const images = newScreenshots(session, card.createdAt);
+      if (images.length) patch.images = images;
     } else if (failed && data.error?.message) patch.error = data.error.message.slice(0, 2000);
     upsert(session, key, card.kind, patch);
     if (card.kind === "command" || card.kind === "file") {

@@ -970,7 +970,7 @@ export function ChatApp() {
                   <div className="reply-meta"><span className="model-tag">{models.find(m => m.id === item.model)?.name || item.model}</span><time className="hover-time" dateTime={new Date(item.createdAt).toISOString()}>{time}</time></div>
                   {item.reasoning && <Thinking text={item.reasoning} live={streaming && !item.content} open={openThinking.has(item.id)} onToggle={() => toggleThinking(item.id)} />}
                   {codeChat && <div className="code-cards">{(detail!.codeEvents || []).filter(event => event.messageId === item.id).map(event =>
-                    <CodeCard key={event.id} event={event} live={Boolean(detail!.codeLive) || streaming} deciding={deciding.has(String((event.data.approval as { id?: string } | undefined)?.id))} onDecide={(id, decision) => void decide(id, decision)} />)}</div>}
+                    <CodeCard key={event.id} event={event} live={Boolean(detail!.codeLive) || streaming} showImages={codeReady} deciding={deciding.has(String((event.data.approval as { id?: string } | undefined)?.id))} onDecide={(id, decision) => void decide(id, decision)} />)}</div>}
                   <div className="markdown">
                     {item.content ? <Md text={item.content} /> : streaming ? <span className="pending-reply"><i /><i /><i />{busy ? streamStage : "Processing attachments or generating reply"}</span> : <p className="muted">No answer was generated.</p>}
                   </div>
@@ -1083,7 +1083,7 @@ export function ChatApp() {
       tab={codePanel} appPort={codeStatus?.localUrl.split(":").pop() || "3210"} remote={codeStatus?.via === "tunnel"} api={api} onTab={setCodePanel} onClose={() => setCodePanel(null)}
       onChanged={() => void refreshChat(detail.chat.id).catch(report)} onError={report} />}
     {projectPicker && <Dialog title="Open a project" onClose={() => setProjectPicker(false)}>
-      <ProjectPicker api={api} root={codeStatus?.projectsRoot || null} onOpen={openCodeChat} />
+      <ProjectPicker api={api} root={codeStatus?.projectsRoot || null} platform={codeStatus?.platform} onOpen={openCodeChat} />
     </Dialog>}
     {settings && <Dialog title="Account & connection" onClose={() => setSettings(false)}>
       <div className="settings-account"><span className="avatar">{user.name.slice(0, 1).toUpperCase()}</span><div><strong>{user.name}</strong><p>{user.email}</p></div></div>

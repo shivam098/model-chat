@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { dataDirectory } from "../config";
@@ -81,7 +81,23 @@ export function listProjects() {
     .sort((a, b) => b.updatedAt - a.updatedAt);
   return { root, projects };
 }
-export function createProject(name: string) {
+export type ProjectTemplate = "empty" | "ios";
+const TEMPLATES: Record<Exclude<ProjectTemplate, "empty">, string> = { ios: path.join(appDirectory, "templates", "ios-swiftui") };
+// "my notes" -> MyNotesApp: a valid Swift type and target name that never clashes with SwiftUI's App.
+function swiftAppName(name: string) {
+  let base = name.split(/[^A-Za-z0-9]+/).filter(Boolean).map(word => word[0].toUpperCase() + word.slice(1)).join("").slice(0, 40);
+  if (!base || /^\d/.test(base)) base = `My${base}`;
+  return base.endsWith("App") && base !== "App" ? base : `${base}App`;
+}
+function copyTemplate(source: string, target: string, replace: (text: string) => string) {
+  for (const entry of readdirSync(source, { withFileTypes: true })) {
+    const from = path.join(source, entry.name);
+    const to = path.join(target, replace(entry.name));
+    if (entry.isDirectory()) { mkdirSync(to); copyTemplate(from, to, replace); }
+    else if (entry.isFile()) writeFileSync(to, replace(readFileSync(from, "utf8")), { mode: entry.name.endsWith(".sh") ? 0o755 : 0o644 });
+  }
+}
+export function createProject(name: string, template: ProjectTemplate = "empty") {
   const trimmed = name.trim();
   if (!NAME.test(trimmed) || trimmed.endsWith(".")) throw new AppError(400, "Use a project name of letters, numbers, spaces, dots, dashes or underscores (up to 64).");
   const root = projectsRoot();
@@ -89,6 +105,10 @@ export function createProject(name: string) {
   const full = path.join(root, trimmed);
   if (existsSync(full)) throw new AppError(409, "A project with that name already exists. Open it instead.");
   mkdirSync(full);
+  if (template !== "empty") {
+    const app = swiftAppName(trimmed);
+    copyTemplate(TEMPLATES[template], full, text => text.replaceAll("CounterApp", app).replaceAll("counterapp", app.toLowerCase()));
+  }
   return validateProjectPath(full);
 }
 // A project folder must be a real directory that keeps Model Chat's own files, credentials and the OS out of reach.

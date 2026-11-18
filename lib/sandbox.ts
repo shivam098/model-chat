@@ -24,13 +24,14 @@ const configSchema = z.object({
 });
 export type SandboxConfig = z.infer<typeof configSchema>;
 export function sandboxConfig(): SandboxConfig | null {
-  if (process.env.MODEL_CHAT_DISABLE_SANDBOX === "1") return null;
+  if (process.env.MODEL_CHAT_DISABLE_SANDBOX === "1" || process.platform !== "win32") return null;
   const file = path.join(dataDirectory, "sandbox-config.json");
   if (!existsSync(file)) return null;
   try { return configSchema.parse(JSON.parse(readFileSync(file, "utf8"))); } catch { return null; }
 }
 export function sandboxStatus() {
   const config = sandboxConfig();
+  if (!config && process.platform !== "win32") return { ready: false, message: "The code runner uses a Windows WSL sandbox, so it isn't available on this computer. The superuser's coding mode can run code here instead, with approval for each command.", libraries: [] as string[], limits: null };
   if (!config) return { ready: false, message: "The code runner is not set up. The host owner can run npm run setup:sandbox on this computer.", libraries: [] as string[], limits: null };
   return {
     ready: true, message: "Code runner available: Python in a disposable WSL sandbox with no internet.",
