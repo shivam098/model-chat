@@ -121,7 +121,8 @@ pdf.setFont('Helvetica', 11); pdf.drawString(72, 744, 'Planned 620 USD, actual 6
       "**Entertainment** went furthest over, by 45 USD. Groceries was also 35 USD over, while transport and books came in under plan.",
       "",
       "One practical adjustment: move 30 USD of the unused books budget to groceries next month, and set a 110 USD cap on entertainment.",
-    ].join("\n"), "complete", null, "**Comparing each row**\n\nPlanned totals 620 and actual totals 645, so the month is 25 over. Entertainment is +45 and groceries +35, so entertainment is the largest overrun.");
+    ].join("\n"), "complete", null, "**Comparing each row**\n\nPlanned totals 620 and actual totals 645, so the month is 25 over. Entertainment is +45 and groceries +35, so entertainment is the largest overrun.",
+    [{ url: "https://www.consumerfinance.gov/consumer-tools/budgeting/", title: "Budgeting: How to create a budget and stick with it", cited: true }, { url: "https://www.investopedia.com/terms/b/budget.asp", title: "Budget: What It Is and How to Create One" }]);
     const second = store.beginTurn(owner.id, chat.id, "Make a bar chart of planned vs actual, a one-page PDF summary, and an animation of spending through the month.", modelB, []);
     const uploads = new UploadStore(store);
     for (const output of outputs?.files ?? []) {
@@ -141,7 +142,9 @@ pdf.setFont('Helvetica', 11); pdf.drawString(72, 744, 'Planned 620 USD, actual 6
 
   await page.goto(`/?chat=${seeded.chat}`);
   await expect(page.locator(".message.assistant").first()).toContainText("Entertainment");
+  await page.locator(".message.assistant").first().getByRole("button", { name: "Show thinking" }).click();
   await capture(page, "04-conversation", async () => { await page.locator(".conversation").evaluate(node => { node.scrollTop = 0; }); });
+  await capture(page, "04b-conversation-sources", async () => { await page.locator(".web-sources").first().evaluate(node => node.scrollIntoView({ block: "center" })); });
   if (outputs) {
     await expect.poll(() => page.locator("img.generated-preview").evaluateAll(images => images.every(image => (image as HTMLImageElement).naturalWidth > 0))).toBe(true);
     await capture(page, "05-generated-files", async () => { await page.locator("img.generated-preview").first().scrollIntoViewIfNeeded(); await page.locator(".conversation").evaluate(node => { node.scrollTop -= 160; }); });
@@ -201,6 +204,14 @@ pdf.setFont('Helvetica', 11); pdf.drawString(72, 744, 'Planned 620 USD, actual 6
     await openMenuItem(page, "Account & connection");
     await expect(page.getByRole("dialog")).toContainText("Copilot connection");
     await capture(page, "11-account-and-connection");
+    const themes = page.getByRole("group", { name: "Theme" });
+    if (await themes.count()) {
+      await themes.getByRole("button", { name: "Light" }).click();
+      await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+      await capture(page, "11b-appearance-light");
+      await themes.getByRole("button", { name: "Dark" }).click();
+      await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    }
     await closeDialog(page);
     await openMenuItem(page, "Users & audit");
     await expect(page.locator(".admin-user").filter({ hasText: samUser.email })).toBeVisible();
@@ -218,6 +229,44 @@ pdf.setFont('Helvetica', 11); pdf.drawString(72, 744, 'Planned 620 USD, actual 6
     await page.getByRole("button", { name: "Return to my workspace", exact: true }).click();
     await expect(page.locator(".acting-banner")).toHaveCount(0);
   } finally { await sam.close(); }
+
+  // Coding mode: a seeded project chat with a command, a diff and a pending approval (shown as live so the approval card renders).
+  const projects = process.env.MODEL_CHAT_PROJECTS_DIR;
+  if (projects) {
+    const project = path.join(projects, "budget-app");
+    mkdirSync(project, { recursive: true });
+    const codeChat = withStore(store => {
+      const chat = store.createChat(owner.id, { projectPath: project });
+      const turn = store.beginTurn(owner.id, chat.id, "Add a total row to the budget table and run the tests.", modelA, []);
+      store.addCodeEvent(owner.id, chat.id, turn.assistant.id, "file", { path: "src/table.js", action: "Edited", status: "done", diff: [
+        "--- a/src/table.js", "+++ b/src/table.js", "@@ -12,6 +12,10 @@ export function renderTable(rows) {", "   for (const row of rows) body.append(renderRow(row));",
+        "-  return table;", "+  const planned = rows.reduce((sum, row) => sum + row.planned, 0);", "+  const actual = rows.reduce((sum, row) => sum + row.actual, 0);",
+        "+  body.append(renderRow({ category: \"Total\", planned, actual }));", "+  return table;", " }"].join("\n") });
+      store.addCodeEvent(owner.id, chat.id, turn.assistant.id, "command", { command: "npm test", status: "done", output: "> budget-app@1.0.0 test\n> node --test\n\n✔ renders one row per category (1.2ms)\n✔ adds a total row (0.8ms)\nℹ tests 2\nℹ pass 2\nℹ fail 0\n" });
+      store.addCodeEvent(owner.id, chat.id, turn.assistant.id, "command", { command: "npm run dev -- --port 5173", status: "awaiting approval",
+        approval: { id: "screen-approval", kind: "command", subject: "npm run dev -- --port 5173", intention: "Start the dev server so you can preview the table.", sessionScope: "npm run commands", state: "pending" } });
+      store.saveReply(owner.id, chat.id, turn.assistant.id, "I added a **Total** row that sums planned and actual spending, and both tests pass. Shall I start the dev server so you can preview it?", "complete");
+      return chat.id;
+    });
+    await page.route(`**/api/chats/${codeChat}`, async route => {
+      const response = await route.fetch();
+      route.fulfill({ response, json: { ...(await response.json()), codeLive: true } });
+    });
+    await page.goto(`/?chat=${codeChat}`);
+    await expect(page.getByRole("group", { name: "Run this command?" })).toBeVisible();
+    await page.locator(".code-card details").first().evaluate(node => { (node as HTMLDetailsElement).open = true; });
+    await capture(page, "18-coding-chat-approval");
+    await page.getByRole("button", { name: "Workspace" }).click();
+    const panel = page.getByRole("complementary", { name: "Project workspace" });
+    await expect(panel.locator(".code-diff")).toBeVisible();
+    await capture(page, "19-workspace-changes-diff");
+    await panel.getByRole("tab", { name: /Terminal/ }).click();
+    await expect(panel.locator(".terminal-output")).toContainText("pass 2");
+    await capture(page, "20-workspace-terminal");
+    await page.unroute(`**/api/chats/${codeChat}`);
+  }
+  await page.goto(`/?chat=${seeded.chat}`);
+  await expect(page.getByLabel("Message", { exact: true })).toBeVisible();
 
   await page.setViewportSize(mobile);
   await page.getByRole("button", { name: "Open sidebar" }).click();

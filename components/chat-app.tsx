@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { ArrowDown, ArrowRight, ArrowUp, BookOpen, Brain, ChevronDown, Code2, Eye, FileText, FolderOpen, Globe, Leaf, LoaderCircle, LogOut, Menu, MessageSquare, Mic, PanelLeft, PanelRight, Pencil, Plus, RefreshCw, Settings2, ShieldCheck, Square, SquarePen, Trash2, Volume2, X } from "lucide-react";
+import { ArrowDown, ArrowRight, ArrowUp, BookOpen, Brain, ChevronDown, Code2, Eye, FileText, FolderOpen, Globe, Leaf, LoaderCircle, LogOut, Menu, MessageSquare, Mic, Moon, PanelLeft, PanelRight, Pencil, Plus, RefreshCw, Settings2, ShieldCheck, Square, SquarePen, Sun, Trash2, Volume2, X } from "lucide-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { FILE_ACCEPT, LIMITS, type Attachment, type Chat, type ChatDetail, type Model, type StreamEvent, type WebSource } from "@/lib/contracts";
@@ -10,6 +10,16 @@ import { DEMOS, type DemoId } from "@/lib/demos";
 import type { AccountView, AppUser } from "@/lib/access";
 import { AdminPanel } from "./admin-panel";
 import { CodeCard, CodePanel, ProjectPicker, TwoFactorSettings, folderName, mergeCodeEvent, type CodingStatus, type Decision, type PanelTab } from "./code-mode";
+import { LampLight } from "./lamp-light";
+import { THEME_STORAGE_KEY, type Theme } from "@/lib/theme";
+import { softwareRendering } from "@/lib/render-tier";
+
+// The theme is chosen per browser (dark unless this browser picked light); app/layout.tsx applies it before the first paint.
+function applyTheme(theme: Theme) {
+  document.documentElement.dataset.theme = theme;
+  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", theme === "light" ? "#fafaf9" : "#131412");
+  try { localStorage.setItem(THEME_STORAGE_KEY, theme); } catch { /* Storage can be blocked; the choice then lasts for this page only. */ }
+}
 
 type User = AppUser;
 type Transfer = { id: string; name: string; progress: number; fileId?: string; error?: string; active: boolean };
@@ -31,7 +41,7 @@ function Md({ text }: { text: string }) {
 }
 // The model's own reasoning, collapsed by default like Gemini's "Show thinking"; only rendered when the model sent some.
 function Thinking({ text, live, open, onToggle }: { text: string; live: boolean; open: boolean; onToggle: () => void }) {
-  return <div className={`thinking-block ${open ? "open" : ""}`}>
+  return <div className={`thinking-block ${open ? "open" : ""} ${live ? "live" : ""}`}>
     <button type="button" className="thinking-toggle" aria-expanded={open} onClick={onToggle}>
       <Brain size={16} /><span>{open ? "Hide thinking" : "Show thinking"}</span>{live && <span className="thinking-live">Thinking</span>}<ChevronDown size={16} />
     </button>
@@ -124,6 +134,14 @@ export function ChatApp() {
   const [draft, setDraft] = useState("");
   const [sidebar, setSidebar] = useState(false);
   const [settings, setSettings] = useState(false);
+  const [theme, setTheme] = useState<Theme>("dark");
+  useEffect(() => {
+    const current: Theme = document.documentElement.dataset.theme === "light" ? "light" : "dark";
+    setTheme(current);
+    document.querySelector('meta[name="theme-color"]')?.setAttribute("content", current === "light" ? "#fafaf9" : "#131412");
+    softwareRendering();
+  }, []);
+  const chooseTheme = (next: Theme) => { applyTheme(next); setTheme(next); };
   const [menu, setMenu] = useState(false);
   const [how, setHow] = useState(false);
   const [demoLoading, setDemoLoading] = useState(false);
@@ -958,6 +976,7 @@ export function ChatApp() {
       </div>
     </aside>
     <main className={`main-panel ${welcome ? "empty" : ""}`}>
+      {welcome && <LampLight restY={0.3} quiet=".welcome" />}
       <header className="topbar">
         <IconButton label="Open sidebar" onClick={() => setSidebar(true)}><Menu size={18} /></IconButton>
         {detail?.messages.length || codeChat ? <span className="topbar-title">{detail!.chat.title}</span> : <span className="topbar-brand"><Brand /></span>}
@@ -988,7 +1007,7 @@ export function ChatApp() {
                 {item.error && <div className={`message-status ${item.status}`} role="status">{item.error}</div>}
               </article>;
               const streaming = item.status === "streaming";
-              return <article key={item.id} className="message assistant" aria-label="Assistant message">
+              return <article key={item.id} className={`message assistant ${streaming ? "streaming" : ""}`} aria-label="Assistant message">
                 <span className="reply-mark" aria-hidden="true"><Leaf size={14} /></span>
                 <div className="reply-body">
                   <div className="reply-meta"><span className="model-tag">{models.find(m => m.id === item.model)?.name || item.model}</span><time className="hover-time" dateTime={new Date(item.createdAt).toISOString()}>{time}</time></div>
@@ -1024,6 +1043,8 @@ export function ChatApp() {
         <div ref={bottom} />
       </div>
       <div className="composer-wrap">
+        <div className={`composer-frame ${replyRunning ? "working" : ""}`}>
+        <span className="composer-glow" aria-hidden="true" />
         <form className={`composer ${listening ? "listening" : ""}`} onSubmit={send}
           onDragOver={event => { if (event.dataTransfer.types.includes("Files")) event.preventDefault(); }}
           onDrop={event => { if (event.dataTransfer.files.length) { event.preventDefault(); void upload(event.dataTransfer.files); } }}>
@@ -1089,6 +1110,7 @@ export function ChatApp() {
             </div>
           </div>
         </form>
+        </div>
         {welcome && codeChat && !codeBlocked && <div className="suggestions">
           <button title="A small page with a live preview" onClick={() => suggest("Create a small web page with a counter button. Start it on 127.0.0.1 in the background and tell me the URL so I can preview it.")}><Code2 size={16} /><span>Build a small web app</span></button>
           <button title="The model reads the folder and summarises it" onClick={() => suggest("Explain what this project contains and how to build and run it.")}><FileText size={16} /><span>Explain this project</span></button>
@@ -1114,6 +1136,13 @@ export function ChatApp() {
     </Dialog>}
     {settings && <Dialog title="Account & connection" onClose={() => setSettings(false)}>
       <div className="settings-account"><span className="avatar">{user.name.slice(0, 1).toUpperCase()}</span><div><strong>{user.name}</strong><p>{user.email}</p></div></div>
+      <div className="settings-section"><h3>{theme === "light" ? <Sun size={16} /> : <Moon size={16} />} Appearance</h3>
+        <div className="theme-switch" role="group" aria-label="Theme">
+          <button type="button" aria-pressed={theme === "dark"} onClick={() => chooseTheme("dark")}><Moon size={14} aria-hidden="true" />Dark</button>
+          <button type="button" aria-pressed={theme === "light"} onClick={() => chooseTheme("light")}><Sun size={14} aria-hidden="true" />Light</button>
+        </div>
+        <p>Dark is the default. Your choice is saved in this browser only. The lamp-light effect on the sign-in and new-chat screens stays still if your device asks for reduced motion, and on phones.</p>
+      </div>
       <div className="settings-section"><h3><ShieldCheck size={16} /> {access.tunnelMode ? "Temporary remote access" : "Personal, local-only"}</h3><p>{access.tunnelMode ? "A temporary Cloudflare HTTPS tunnel is active. Anyone with the link can create an email/password account without OTP. This link uses the app's password login, not Cloudflare Access. Cloudflare relays the traffic. Stop the tunnel when finished." : "This app listens on 127.0.0.1 only. Use only the app's explicit temporary-tunnel mode for remote access; do not otherwise expose it through a proxy, LAN or the internet."} App accounts have separate histories and files, but all use the host owner&apos;s Copilot account and usage limits.</p><p>Histories and original files stay in this app&apos;s local SQLite database. Prompts, chat context and extracted file text go to GitHub Copilot when you send. These are not end-to-end encrypted; people with access to your Windows account or backups can read local data.</p></div>
       <div className="settings-section"><h3><span className={`status-dot ${connectionError ? "offline" : ""}`} /> Copilot connection</h3><p>{connectionError || `${models.length} models discovered from the Copilot SDK. Availability may differ from the desktop app and can change with your plan.`}</p><p>Already signed-in CLI credentials are reused through supported SDK authentication. If sign-in is needed, run this from the app folder:</p><code className="command">npm run copilot:login</code><button className="secondary-button" onClick={() => void refreshModels()} disabled={modelLoading}><RefreshCw size={16} /> Refresh connection</button></div>
       <div className="settings-section"><h3><FileText size={16} /> Files and model context</h3>
@@ -1182,6 +1211,7 @@ function AuthScreen({ onSuccess, notice, access, onMenu }: { onSuccess: (account
     finally { setBusy(false); }
   }
   if (challenge) return <main className="auth-page">
+    <LampLight restY={0.22} quiet=".auth-card" />
     <section className="auth-side auth-only">
       <form className="auth-card" onSubmit={submit}>
         <div className="auth-mobile-brand"><Brand /></div>
@@ -1198,7 +1228,8 @@ function AuthScreen({ onSuccess, notice, access, onMenu }: { onSuccess: (account
       </form>
     </section>
   </main>;
-  return <main className="auth-page">
+  return <main className="auth-page with-story">
+    <LampLight restX={0.34} restY={0.24} quiet=".auth-card, .auth-story-body > h1, .auth-story-body > p" />
     <button className="menu-button auth-menu" type="button" onClick={onMenu}><Menu size={16} /><span>Menu</span></button>
     <section className="auth-story">
       <Brand />

@@ -1,5 +1,6 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import localFont from "next/font/local";
+import { THEME_SCRIPT } from "@/lib/theme";
 import "./globals.css";
 
 // Self-hosted (SIL Open Font License, see app/fonts); no runtime requests to font services.
@@ -10,6 +11,11 @@ export const metadata: Metadata = {
   title: "Model Chat",
   description: "Chat with Copilot models about your files. Runs on the host's computer.",
 };
+export const viewport: Viewport = { themeColor: "#131412", colorScheme: "dark light" };
+// Dark by default; a browser that chose light in Account & connection gets data-theme="light" before the first paint.
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
-  return <html lang="en" className={`${sans.variable} ${mono.variable}`}><body>{children}</body></html>;
+  return <html lang="en" data-theme="dark" suppressHydrationWarning className={`${sans.variable} ${mono.variable}`}>
+    <head><script dangerouslySetInnerHTML={{ __html: THEME_SCRIPT }} /></head>
+    <body>{children}</body>
+  </html>;
 }
