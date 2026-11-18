@@ -9,6 +9,7 @@ export const LIMITS = {
   promptBytes: 100_000,
   inputCharacters: 8_000,
   outputCharacters: 32_000,
+  reasoningCharacters: 32_000,
   messagesPerChat: 200,
   chatsPerUser: 100,
 };
@@ -36,6 +37,8 @@ export interface Message {
   status: MessageStatus;
   error: string | null;
   createdAt: number;
+  /** The model's own reasoning summary, shown behind "Show thinking"; never sent back as context. */
+  reasoning: string;
 }
 export interface Attachment {
   id: string;
@@ -76,6 +79,7 @@ export type StreamEvent =
   | { type: "start"; user: Message; assistant: Message }
   | { type: "delta"; text: string }
   | { type: "replace"; text: string }
+  | { type: "reasoning"; text: string; replace?: boolean }
   | { type: "progress"; stage: string }
   | { type: "attachments" }
   | { type: "done"; message: Message }

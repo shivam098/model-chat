@@ -5,6 +5,7 @@ import { Store } from "../lib/store";
 import { AccessService } from "../lib/access";
 import { UploadStore } from "../lib/upload-store";
 import { createChatStream } from "../lib/stream";
+import { buildPrompt } from "../lib/context";
 
 function fixture() {
   const db = new Database(":memory:");
@@ -95,4 +96,36 @@ test("mid-reply composer changes keep delegation, audit attribution and account 
     assert.equal(store.chat("alice", chat.id).draft, "ADMIN_DRAFT_TEXT");
     reply.finish(); await reply.done;
   } finally { db.close(); }
+});
+
+test("model thinking streams live, is saved with its reply, migrates old databases and never returns as context", async () => {
+  const { db, store } = fixture();
+  try {
+    const chat = store.createChat("alice");
+    let midway = "";
+    const response = createChatStream(store, "alice", chat.id, "Why is the sky blue?", "model-a", [], "{}", async input => {
+      input.onReasoning?.("Recalling ", false);
+      input.onReasoning?.("Recalling Rayleigh scattering.", true);
+      await new Promise(resolve => setTimeout(resolve, 300));
+      midway = store.messages("alice", chat.id).at(-1)!.reasoning;
+      input.onDelta("Shorter wavelengths scatter more.");
+    }, new AbortController().signal);
+    const events = (await response.text()).trim().split("\n").map(line => JSON.parse(line));
+    assert.deepEqual(events.filter(event => event.type === "reasoning"), [
+      { type: "reasoning", text: "Recalling " }, { type: "reasoning", text: "Recalling Rayleigh scattering.", replace: true }]);
+    assert.equal(midway, "Recalling ", "Thinking is saved while the reply streams, so a reload shows it");
+    const saved = store.messages("alice", chat.id).at(-1)!;
+    assert.deepEqual([saved.content, saved.reasoning, saved.status], ["Shorter wavelengths scatter more.", "Recalling Rayleigh scattering.", "complete"]);
+    assert.doesNotMatch(buildPrompt(store.messages("alice", chat.id), [], "And sunsets?"), /Rayleigh/);
+  } finally { db.close(); }
+
+  const old = new Database(":memory:");
+  try {
+    old.exec(`CREATE TABLE user(id TEXT PRIMARY KEY,name TEXT,email TEXT,appRole TEXT); INSERT INTO user VALUES ('alice','Alice','alice@example.test','user');
+      CREATE TABLE app_chat(id TEXT PRIMARY KEY,userId TEXT NOT NULL,title TEXT NOT NULL,model TEXT NOT NULL DEFAULT '',draft TEXT NOT NULL DEFAULT '',createdAt INTEGER NOT NULL,updatedAt INTEGER NOT NULL);
+      CREATE TABLE app_message(id TEXT PRIMARY KEY,chatId TEXT NOT NULL,role TEXT NOT NULL,content TEXT NOT NULL,model TEXT NOT NULL,status TEXT NOT NULL,error TEXT,createdAt INTEGER NOT NULL);
+      INSERT INTO app_chat VALUES ('c1','alice','Old chat','m','',1,1); INSERT INTO app_message VALUES ('m1','c1','user','Saved before thinking existed','m','complete',NULL,1);`);
+    const migrated = new Store(old);
+    assert.deepEqual(migrated.messages("alice", "c1").map(message => [message.content, message.reasoning]), [["Saved before thinking existed", ""]]);
+  } finally { old.close(); }
 });

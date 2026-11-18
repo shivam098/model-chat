@@ -113,6 +113,7 @@ test("accounts, ownership, files, histories, password validation and responsive 
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(page.getByRole("button", { name: "Open sidebar" })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.getByRole("button", { name: "Open sidebar" }).click();
   await page.getByRole("button", { name: "Menu", exact: true }).click();
   await page.getByRole("button", { name: "How Model Chat works & Demos", exact: true }).click();
   await page.screenshot({ path: "test-results/demos-mobile.png", fullPage: true, animations: "disabled" });
@@ -120,6 +121,7 @@ test("accounts, ownership, files, histories, password validation and responsive 
   await expect(page.getByLabel("Message", { exact: true })).toHaveValue(/Write a friendly project-update email/);
   const writingId = new URL(page.url()).searchParams.get("chat");
   expect(writingId).not.toBe(demoId);
+  await page.getByRole("button", { name: "Open sidebar" }).click();
   await page.getByRole("button", { name: "Menu", exact: true }).click();
   await page.getByRole("button", { name: "How Model Chat works & Demos", exact: true }).click();
   await page.getByRole("button", { name: "Load Make a concept click", exact: true }).click();

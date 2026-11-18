@@ -1,4 +1,5 @@
 import { CopilotClient, type SessionConfig, type CopilotSession, type ModelInfo, type Tool } from "@github/copilot-sdk";
+type ReasoningEffort = NonNullable<SessionConfig["reasoningEffort"]>;
 import { mkdir, rm } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
@@ -133,12 +134,13 @@ export async function listModels(refresh = false): Promise<ModelInfo[]> {
   })().catch(error => { throw copilotError(error); }).finally(() => { catalogState.modelChatCatalogPending = undefined; });
   return catalogState.modelChatCatalogPending;
 }
-export function safeSessionConfig(model: string, directory: string, sessionId: string, tools: Tool[] = [], toolInstruction?: string): SessionConfig {
+export function safeSessionConfig(model: string, directory: string, sessionId: string, tools: Tool[] = [], toolInstruction?: string, reasoningEffort?: ReasoningEffort): SessionConfig {
   const allowed = new Set(tools.map(tool => tool.name));
   return {
     sessionId,
     model,
     clientName: "Model Chat",
+    ...(reasoningEffort ? { reasoningEffort, reasoningSummary: "detailed" as const } : {}),
     // Only app-defined tools are allow-listed; built-in, MCP and every other custom tool stays excluded.
     availableTools: tools.map(tool => `custom:${tool.name}`),
     excludedTools: tools.length ? ["builtin:*", "mcp:*"] : ["builtin:*", "mcp:*", "custom:*"],
@@ -186,8 +188,17 @@ export interface ReplyInput {
   onAttachments?: () => void;
   tools?: Tool[];
   toolInstruction?: string;
+  reasoningEffort?: ReasoningEffort;
+  onReasoning?: (text: string, replace: boolean) => void;
 }
 export type ReplyRunner = (input: ReplyInput) => Promise<void>;
+// Without an explicit level the runtime requests no reasoning; "medium" lets models think when a question warrants it.
+export function replyReasoningEffort(model: ModelInfo): ReasoningEffort | undefined {
+  if (!model.capabilities.supports.reasoningEffort) return undefined;
+  const supported = (model.supportedReasoningEfforts ?? []).filter(level => (level as string) !== "none");
+  if (model.defaultReasoningEffort && supported.includes(model.defaultReasoningEffort)) return model.defaultReasoningEffort;
+  return supported.includes("medium") ? "medium" : supported[0];
+}
 export function verifyToolMetadata(tools: { name: string; mcpServerName?: string; deferLoading?: boolean }[] | null | undefined, expected: string[]) {
   const names = (tools || []).map(tool => tool.name).sort();
   if (!tools || names.join("\n") !== [...expected].sort().join("\n") || tools.some(tool => tool.mcpServerName || tool.deferLoading)) {
@@ -207,7 +218,7 @@ export function createMessageAccumulator(onDelta: (text: string) => void, onRepl
     sent = full;
   };
 }
-export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDelta, onReplace, images, authorize, onRequestStart, tools = [], toolInstruction }) => {
+export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDelta, onReplace, images, authorize, onRequestStart, tools = [], toolInstruction, reasoningEffort, onReasoning }) => {
   onRequestStart?.();
   const sessionId = `modelchat-${randomUUID()}`;
   const directory = path.join(copilotHome, "requests", sessionId);
@@ -221,7 +232,7 @@ export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDe
     authorize?.();
     client = await createClient();
     signal.throwIfAborted();
-    session = await deadline(client.createSession(safeSessionConfig(model, directory, sessionId, tools, toolInstruction)), 30_000);
+    session = await deadline(client.createSession(safeSessionConfig(model, directory, sessionId, tools, toolInstruction, reasoningEffort)), 30_000);
     signal.throwIfAborted();
     await deadline(session.rpc.tools.initializeAndValidate(), 15_000);
     const metadata = await deadline(session.rpc.tools.getCurrentMetadata(), 15_000);
@@ -232,6 +243,11 @@ export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDe
     const accumulate = createMessageAccumulator(onDelta, onReplace);
     unsubscribe.push(session.on("assistant.message_delta", event => accumulate(event.data.messageId, event.data.deltaContent, false)));
     unsubscribe.push(session.on("assistant.message", event => accumulate(event.data.messageId, event.data.content || "", true)));
+    if (onReasoning) {
+      const reason = createMessageAccumulator(text => onReasoning(text, false), text => onReasoning(text, true));
+      unsubscribe.push(session.on("assistant.reasoning_delta", event => reason(event.data.reasoningId, event.data.deltaContent, false)));
+      unsubscribe.push(session.on("assistant.reasoning", event => reason(event.data.reasoningId, event.data.content || "", true)));
+    }
     let sessionError: string | undefined;
     unsubscribe.push(session.on("session.error", event => { sessionError = event.data.message; }));
     const aborted = new Promise<never>((_, reject) => {

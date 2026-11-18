@@ -29,7 +29,7 @@ export class Store {
         id TEXT PRIMARY KEY, chatId TEXT NOT NULL REFERENCES app_chat(id) ON DELETE CASCADE,
         role TEXT NOT NULL CHECK(role IN ('user','assistant')), content TEXT NOT NULL,
         model TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('complete','streaming','cancelled','error')),
-        error TEXT, createdAt INTEGER NOT NULL
+        error TEXT, createdAt INTEGER NOT NULL, reasoning TEXT NOT NULL DEFAULT ''
       );
       CREATE INDEX IF NOT EXISTS app_message_chat ON app_message(chatId, createdAt);
       CREATE UNIQUE INDEX IF NOT EXISTS app_one_generation ON app_message(chatId) WHERE status='streaming';
@@ -71,6 +71,8 @@ export class Store {
     if (userColumns.length && !userColumns.some(column => column.name === "appRole")) db.exec("ALTER TABLE user ADD COLUMN appRole TEXT NOT NULL DEFAULT 'user'");
     const fileColumns = db.pragma("table_info(app_file)") as { name: string }[];
     if (!fileColumns.some(column => column.name === "mimeType")) db.exec("ALTER TABLE app_file ADD COLUMN mimeType TEXT NOT NULL DEFAULT 'text/plain'");
+    const messageColumns = db.pragma("table_info(app_message)") as { name: string }[];
+    if (!messageColumns.some(column => column.name === "reasoning")) db.exec("ALTER TABLE app_message ADD COLUMN reasoning TEXT NOT NULL DEFAULT ''");
     installUploadSchema(db);
   }
   recoverInterrupted() {
@@ -231,9 +233,9 @@ export class Store {
       this.contextFiles(userId, chatId, fileIds);
       if (this.messages(userId, chatId).length >= LIMITS.messagesPerChat) throw new AppError(400, "This chat has reached 100 turns. Start a new chat.");
       const now = Date.now();
-      const user: Message = { id: randomUUID(), chatId, role: "user", content, model, status: "complete", error: null, createdAt: now };
+      const user: Message = { id: randomUUID(), chatId, role: "user", content, model, status: "complete", error: null, createdAt: now, reasoning: "" };
       const assistant: Message = { ...user, id: randomUUID(), role: "assistant", content: "", status: "streaming", createdAt: now + 1 };
-      const insert = this.db.prepare("INSERT INTO app_message VALUES (@id,@chatId,@role,@content,@model,@status,@error,@createdAt)");
+      const insert = this.db.prepare("INSERT INTO app_message(id,chatId,role,content,model,status,error,createdAt,reasoning) VALUES (@id,@chatId,@role,@content,@model,@status,@error,@createdAt,@reasoning)");
       insert.run(user);
       insert.run(assistant);
       for (const id of fileIds) this.db.prepare("UPDATE app_file SET messageId=? WHERE chatId=? AND id=?").run(user.id, chatId, id);
@@ -244,10 +246,10 @@ export class Store {
       return { user, assistant };
     })();
   }
-  saveReply(userId: string, chatId: string, messageId: string, content: string, status: MessageStatus, error: string | null = null): Message {
+  saveReply(userId: string, chatId: string, messageId: string, content: string, status: MessageStatus, error: string | null = null, reasoning?: string): Message {
     this.chat(userId, chatId);
-    const result = this.db.prepare("UPDATE app_message SET content=?,status=?,error=? WHERE id=? AND chatId=? AND role='assistant' AND status='streaming'")
-      .run(content, status, error, messageId, chatId);
+    const result = this.db.prepare("UPDATE app_message SET content=?,status=?,error=?,reasoning=COALESCE(?,reasoning) WHERE id=? AND chatId=? AND role='assistant' AND status='streaming'")
+      .run(content, status, error, reasoning ?? null, messageId, chatId);
     if (result.changes !== 1) throw new AppError(409, "This reply is no longer active.");
     this.db.prepare("UPDATE app_chat SET updatedAt=? WHERE id=? AND userId=?").run(Date.now(), chatId, userId);
     return this.messages(userId, chatId).find(m => m.id === messageId)!;

@@ -65,10 +65,17 @@ export function createChatStream(store: Store, userId: string, chatId: string, c
       send({ type: "start", ...turn });
       void (async () => {
         let text = "";
+        let reasoning = "";
         let lastSave = 0;
         let outputExceeded = false;
         let status: MessageStatus = "complete";
         let error: string | null = null;
+        const persist = () => {
+          if (Date.now() - lastSave > 250) {
+            store.saveReply(userId, chatId, turn.assistant.id, text, "streaming", null, reasoning);
+            lastSave = Date.now();
+          }
+        };
         const accept = (value: string, replace: boolean) => {
           if (controller.signal.aborted || !checkAccess()) return;
           const next = replace ? value : text + value;
@@ -81,10 +88,21 @@ export function createChatStream(store: Store, userId: string, chatId: string, c
             text = next;
             send(replace ? { type: "replace", text } : { type: "delta", text: value });
           }
-          if (Date.now() - lastSave > 250) {
-            store.saveReply(userId, chatId, turn.assistant.id, text, "streaming");
-            lastSave = Date.now();
+          persist();
+        };
+        // Reasoning is display-only: kept with the reply, capped, and never returned to the model as context.
+        const acceptReasoning = (value: string, replace: boolean) => {
+          if (controller.signal.aborted || !checkAccess()) return;
+          const next = replace ? value : reasoning + value;
+          if (next.length > LIMITS.reasoningCharacters) {
+            if (reasoning.length >= LIMITS.reasoningCharacters) return;
+            reasoning = next.slice(0, LIMITS.reasoningCharacters);
+            send({ type: "reasoning", text: reasoning, replace: true });
+          } else {
+            reasoning = next;
+            send(replace ? { type: "reasoning", text: reasoning, replace: true } : { type: "reasoning", text: value });
           }
+          persist();
         };
         let timeout: ReturnType<typeof setTimeout> | undefined;
         const requestStarted = () => {
@@ -99,7 +117,7 @@ export function createChatStream(store: Store, userId: string, chatId: string, c
           await runner({ model, prompt, images, authorize: security?.check, signal: controller.signal, assistantMessageId: turn.assistant.id,
             onAttachments: () => { if (checkAccess()) send({ type: "attachments" }); },
             onRequestStart: requestStarted, onProgress: value => { stage = value; if (checkAccess()) send({ type: "progress", stage }); },
-            onDelta: text => accept(text, false), onReplace: text => accept(text, true) });
+            onDelta: text => accept(text, false), onReplace: text => accept(text, true), onReasoning: acceptReasoning });
           if (controller.signal.aborted) throw new DOMException("Reply cancelled", "AbortError");
           if (!text.trim()) throw new AppError(503, "Copilot returned no text. The request was saved, but no answer was generated.");
         } catch (cause) {
@@ -116,7 +134,7 @@ export function createChatStream(store: Store, userId: string, chatId: string, c
           checkAccess();
           if (accessLost) { status = "cancelled"; error = "Reply stopped because the actor's access ended. Partial text remains in this chat."; }
           try {
-            const message = store.saveReply(userId, chatId, turn.assistant.id, text, status, error);
+            const message = store.saveReply(userId, chatId, turn.assistant.id, text, status, error, reasoning);
             security?.finished(message.id, status, accessLost);
             if (!accessLost) send({ type: "done", message });
           } catch (saveError) {

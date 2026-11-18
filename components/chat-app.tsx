@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { ArrowDown, ArrowRight, ArrowUp, BookOpen, ChevronDown, Code2, Eye, FileText, Leaf, LoaderCircle, LogOut, Menu, MessageSquare, Mic, PanelLeft, Paperclip, Pencil, Plus, RefreshCw, Settings2, ShieldCheck, Square, Trash2, Volume2, X } from "lucide-react";
+import { ArrowDown, ArrowRight, ArrowUp, BookOpen, Brain, ChevronDown, Code2, Eye, FileText, Leaf, LoaderCircle, LogOut, Menu, MessageSquare, Mic, PanelLeft, Pencil, Plus, RefreshCw, Settings2, ShieldCheck, Square, SquarePen, Trash2, Volume2, X } from "lucide-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { FILE_ACCEPT, LIMITS, type Attachment, type Chat, type ChatDetail, type Model, type StreamEvent } from "@/lib/contracts";
@@ -22,6 +22,20 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
 function message(error: unknown) { return error instanceof Error ? error.message : "Something went wrong. Please try again."; }
 function IconButton({ label, children, ...props }: React.ButtonHTMLAttributes<HTMLButtonElement> & { label: string }) {
   return <button type="button" className="icon-button" aria-label={label} title={label} {...props}>{children}</button>;
+}
+function Md({ text }: { text: string }) {
+  return <Markdown remarkPlugins={[remarkGfm]} skipHtml disallowedElements={["img"]} components={{
+    a: ({ href, children }) => <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>,
+  }}>{text}</Markdown>;
+}
+// The model's own reasoning, collapsed by default like Gemini's "Show thinking"; only rendered when the model sent some.
+function Thinking({ text, live, open, onToggle }: { text: string; live: boolean; open: boolean; onToggle: () => void }) {
+  return <div className={`thinking-block ${open ? "open" : ""}`}>
+    <button type="button" className="thinking-toggle" aria-expanded={open} onClick={onToggle}>
+      <Brain size={16} /><span>{open ? "Hide thinking" : "Show thinking"}</span>{live && <span className="thinking-live">Thinking</span>}<ChevronDown size={16} />
+    </button>
+    {open && <div className="reasoning markdown"><Md text={text} /></div>}
+  </div>;
 }
 function Brand() { return <div className="brand"><span className="brand-icon" aria-hidden="true"><Leaf size={16} /></span><span>model<span className="brand-light">chat</span></span></div>; }
 function formatSize(bytes: number) {
@@ -86,7 +100,7 @@ export function ChatApp() {
   const [busy, setBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [transfers, setTransfers] = useState<Transfer[]>([]);
-  const [streamStage, setStreamStage] = useState("Thinking");
+  const [streamStage, setStreamStage] = useState("Waiting for the model");
   const [mediaInfo, setMediaInfo] = useState<{ ready: boolean; model: string | null; message: string } | null>(null);
   const [sandboxInfo, setSandboxInfo] = useState<{ ready: boolean; message: string; libraries: string[]; limits: { wallSeconds: number; memoryBytes: number; workBytes: number; outputFiles: number; cpus: number } | null } | null>(null);
   const [filePreview, setFilePreview] = useState<{ name: string; text: string; notes: string; nextCursor: number | null; cursor: number; file: Attachment } | null>(null);
@@ -106,6 +120,8 @@ export function ChatApp() {
   const [speaking, setSpeaking] = useState<string | null>(null);
   const [voiceConsent, setVoiceConsent] = useState(false);
   const [voiceDialog, setVoiceDialog] = useState(false);
+  const [rail, setRail] = useState(false);
+  const [openThinking, setOpenThinking] = useState<Set<string>>(() => new Set());
   const bottom = useRef<HTMLDivElement>(null);
   const scroller = useRef<HTMLDivElement>(null);
   const follow = useRef(true);
@@ -159,7 +175,7 @@ export function ChatApp() {
     setUser(account.user); setActor(account.actor); setDetail(null); setChats([]); setDraft(""); setSelectedModel("");
     setAdmin(false); setMenu(false); setSidebar(false); setSettings(false); setDraftState("saved");
     setFilePreview(null);
-    setTransfers([]); setStreamStage("Thinking");
+    setTransfers([]); setStreamStage("Waiting for the model");
     if (chatId !== undefined) window.history.replaceState(null, "", chatId ? `?chat=${chatId}` : "/");
   }
 
@@ -173,6 +189,7 @@ export function ChatApp() {
       .finally(() => { if (alive) setBooting(false); });
     setDictationAvailable(Boolean(dictationConstructor(window as VoiceWindow)));
     setSpeechAvailable("speechSynthesis" in window);
+    setRail(window.localStorage.getItem("modelchat:sidebar") === "rail");
     return () => { alive = false; recognition.current?.abort(); generation.current?.abort(); uploadController.current?.abort(); speechEpoch.current++; window.speechSynthesis?.cancel(); };
   }, []);
 
@@ -314,7 +331,7 @@ export function ChatApp() {
     setDraft(""); setBusy(false); setUploading(false); setTransfers([]); setSettings(false); setSidebar(false);
     setMenu(false); setHow(false); setDemoLoading(false);
     setActor(null); setAdmin(false); setSwitching(false);
-    setFilePreview(null); setStreamStage("Thinking");
+    setFilePreview(null); setStreamStage("Waiting for the model");
     setSpeaking(null); setInterim(""); setVoiceConsent(false); setConnectionError("");
     window.history.replaceState(null, "", "/");
   }
@@ -543,6 +560,9 @@ export function ChatApp() {
         } else if (item.type === "delta" || item.type === "replace") {
           setDetail(previous => previous && previous.chat.id === chatId ? ({ ...previous, messages: previous.messages.map((m, index) => index === previous.messages.length - 1 ?
             { ...m, content: item.type === "delta" ? m.content + item.text : item.text } : m) }) : previous);
+        } else if (item.type === "reasoning") {
+          setDetail(previous => previous && previous.chat.id === chatId ? ({ ...previous, messages: previous.messages.map((m, index) => index === previous.messages.length - 1 ?
+            { ...m, reasoning: item.replace ? item.text : (m.reasoning || "") + item.text } : m) }) : previous);
         } else if (item.type === "done") {
           done = true;
           setDetail(previous => previous && previous.chat.id === chatId ? ({ ...previous, messages: previous.messages.map(m => m.id === item.message.id ? item.message : m) }) : previous);
@@ -827,16 +847,35 @@ export function ChatApp() {
   if (booting) return <main className="boot"><Brand /><LoaderCircle className="spin" aria-label="Loading account" /></main>;
   if (!user) return <><AuthScreen notice={notice} access={access} onMenu={() => setMenu(true)} onSuccess={next => { setNotice(""); applyAccount(next, null); }} />{navigation}</>;
 
-  return <div className="app-shell">
+  const welcome = !loadingChat && !detail?.messages.length;
+  const toggleRail = () => setRail(value => {
+    window.localStorage.setItem("modelchat:sidebar", value ? "full" : "rail");
+    return !value;
+  });
+  const toggleThinking = (id: string) => setOpenThinking(previous => {
+    const next = new Set(previous);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+  const sentFile = (file: Attachment) => <span key={file.id} className="sent-file"><a className="file-chip sent" title={file.notes} href={`/api/chats/${file.chatId}/files/${file.id}`}><FileText size={16} /><span>{file.name}</span><ArrowDown size={16} /></a>
+    {file.preview === "pdf" ? <a className="icon-button" aria-label={`Open PDF preview of ${file.name}`} title="Open PDF preview" href={`/api/chats/${file.chatId}/files/${file.id}/preview`} target="_blank" rel="noopener noreferrer"><Eye size={16} /></a>
+      : <IconButton label={`Preview extracted text for ${file.name}`} onClick={() => void previewFile(file)}><Eye size={16} /></IconButton>}</span>;
+  const suggest = (text: string) => { setDraft(text); draftRef.current = text; setDraftState("saving"); composer.current?.focus(); };
+
+  return <div className={`app-shell ${rail ? "rail" : ""}`}>
     {sidebar && <button className="sidebar-backdrop" aria-label="Close sidebar" onClick={() => setSidebar(false)} />}
     <aside className={`sidebar ${sidebar ? "open" : ""}`}>
-      <div className="sidebar-brand"><Brand /><IconButton label="Close sidebar" onClick={() => setSidebar(false)}><X size={16} /></IconButton></div>
-      <button className="new-chat" onClick={() => void newChat()} disabled={locked}><Plus size={16} /> New conversation</button>
-      <div className="sidebar-label">Conversations <span>{chats.length}</span></div>
+      <div className="sidebar-top">
+        <button type="button" className="icon-button rail-toggle" aria-label={rail ? "Expand sidebar" : "Collapse sidebar"} title={rail ? "Expand sidebar" : "Collapse sidebar"} aria-expanded={!rail} onClick={toggleRail}><PanelLeft size={18} /></button>
+        <IconButton label="Close sidebar" onClick={() => setSidebar(false)}><X size={18} /></IconButton>
+        <Brand />
+      </div>
+      <button className="new-chat" title="New conversation" onClick={() => void newChat()} disabled={locked}><SquarePen size={18} /><span>New conversation</span></button>
+      <div className="sidebar-label">Recent</div>
       <nav className="chat-list" aria-label="Chat history">
         {chats.length === 0 && <p className="history-empty">No conversations yet</p>}
         {chats.map(chat => <div className={`chat-item ${detail?.chat.id === chat.id ? "selected" : ""}`} key={chat.id}>
-          <button className="chat-select" onClick={() => void openChat(chat)} disabled={locked}><MessageSquare size={16} /><span>{chat.title}</span></button>
+          <button className="chat-select" onClick={() => void openChat(chat)} disabled={locked}><span>{chat.title}</span></button>
           <div className="chat-actions">
             <IconButton label={`Rename ${chat.title}`} disabled={locked} onClick={() => { setEditingTitle(chat.title); setRename(chat); }}><Pencil size={16} /></IconButton>
             <IconButton label={`Delete ${chat.title}`} disabled={locked} onClick={() => setDeleteChat(chat)}><Trash2 size={16} /></IconButton>
@@ -844,23 +883,14 @@ export function ChatApp() {
         </div>)}
       </nav>
       <div className="sidebar-footer">
-        <div className="local-badge"><span className="status-dot" /> {access.tunnelMode ? "Temporary public link" : "Local only"}</div>
-        <button className="account-button" onClick={() => setSettings(true)}><span className="avatar">{user.name.slice(0, 1).toUpperCase()}</span><span className="account-text"><strong>{user.name}</strong><small>Account & connection</small></span><Settings2 size={16} /></button>
+        <button className="side-item" title="Menu: help, demos and settings" onClick={() => { setSidebar(false); setMenu(true); }}><Menu size={18} /><span>Menu</span></button>
+        <button className="account-button" title={`${user.name}: Account & connection`} onClick={() => { setSidebar(false); setSettings(true); }}><span className="avatar">{user.name.slice(0, 1).toUpperCase()}</span><span className="account-text"><strong>{user.name}</strong><small>Account &amp; connection</small></span></button>
       </div>
     </aside>
-    <main className="main-panel">
+    <main className={`main-panel ${welcome ? "empty" : ""}`}>
       <header className="topbar">
-        <div className="topbar-title"><IconButton label="Open sidebar" onClick={() => setSidebar(true)}><PanelLeft size={16} /></IconButton><button className="menu-button" onClick={() => setMenu(true)}><Menu size={16} /><span>Menu</span></button><span>{detail?.chat.title || "New conversation"}</span></div>
-        <div className="model-control">
-          <span className={`status-dot ${connectionError ? "offline" : ""}`} />
-          <select aria-label="Select model" value={selectedModel} disabled={composeLocked || modelLoading || !models.length} onChange={event => { setSelectedModel(event.target.value); setDraftState("saving"); }}>
-            {!selectedModel && <option value="">{modelLoading ? "Connecting..." : "No models available"}</option>}
-            {selectedModel && !modelAvailable && <option value={selectedModel}>{selectedModel} (unavailable)</option>}
-            {models.map(model => <option value={model.id} key={model.id}>{model.name}{model.vision ? " · vision" : ""}{model.multiplier !== undefined ? ` · ${model.multiplier}x` : ""}</option>)}
-          </select>
-          <ChevronDown size={16} aria-hidden="true" />
-          <IconButton label="Refresh Copilot connection" onClick={() => void refreshModels()} disabled={composeLocked || modelLoading}><RefreshCw size={16} className={modelLoading ? "spin" : ""} /></IconButton>
-        </div>
+        <IconButton label="Open sidebar" onClick={() => setSidebar(true)}><Menu size={18} /></IconButton>
+        {detail?.messages.length ? <span className="topbar-title">{detail.chat.title}</span> : <span className="topbar-brand"><Brand /></span>}
       </header>
       {acting && <div className="acting-banner" role="status"><div><strong>Acting as {user.name}</strong><span>{user.email} · Signed in as {actor?.email}. Actions are audited.</span></div><button onClick={() => void returnToSelf()} disabled={locked}>Return to my workspace</button>{(busy || remoteBusy) && <small>Stop the current reply before returning.</small>}</div>}
       {connectionError && <div className="connection-banner" role="status"><ShieldCheck size={16} /><span>{connectionError}</span><button onClick={() => setSettings(true)}>Setup</button></div>}
@@ -870,44 +900,49 @@ export function ChatApp() {
         if (node) follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 120;
       }}>
         {loadingChat ? <div className="loading-chat"><LoaderCircle className="spin" /> Opening conversation...</div> :
-          !detail?.messages.length ? <div className="welcome">
+          welcome ? <div className="welcome">
             <h1>Start with a question or a file</h1>
-            <p>{pending.length ? processing ? "Your files are processing. You can keep writing meanwhile." : readyPending.length ? "Your files are ready. Ask about them below." : "Some uploads need attention before you send." : "Pick any of your Copilot models above. You can switch models mid-conversation and it keeps the context."}</p>
-            {pending.length === 0 && <div className="suggestions">
-              <button onClick={() => { setDraft("Help me think through an idea. Ask me one useful question to get started."); setDraftState("saving"); composer.current?.focus(); }}><MessageSquare size={16} /><strong>Think something through</strong><span>The model starts by asking you one question</span></button>
-              <button onClick={() => fileInput.current?.click()} disabled={uploadLocked}><FileText size={16} /><strong>Explore a document</strong><span>CSV, PDF, Word, Excel, images or recordings</span></button>
-              <button onClick={() => { setDraft("Help me write something clear and concise. Ask what I want to communicate."); setDraftState("saving"); composer.current?.focus(); }}><Pencil size={16} /><strong>Write something</strong><span>The model asks what you want to say first</span></button>
-              {sandboxInfo?.ready && <button onClick={() => { setDraft("Create a one-page PDF report and a matching bar-chart PNG for these sample figures: Q1 = 12, Q2 = 18, Q3 = 15, Q4 = 22. Include a short summary in the PDF."); setDraftState("saving"); composer.current?.focus(); }}><Code2 size={16} /><strong>Make a file</strong><span>PDF, chart, GIF or MP4, Word, Excel or PowerPoint</span></button>}
-            </div>}
+            <p>{pending.length ? processing ? "Your files are processing. You can keep writing meanwhile." : readyPending.length ? "Your files are ready. Ask about them below." : "Some uploads need attention before you send." : "Choose any of your Copilot models in the box below. Switch models mid-conversation and the context carries over."}</p>
           </div> : <div className="message-list">
-            {detail.messages.map(item => <article key={item.id} className={`message ${item.role}`} aria-label={`${item.role === "user" ? "Your" : "Assistant"} message`}>
-              <div className="message-label">{item.role === "user" ? <><span className="mini-avatar">{user.name.slice(0, 1).toUpperCase()}</span><strong>You</strong></> : <span className="model-tag">{models.find(m => m.id === item.model)?.name || item.model}</span>}
-                <time>{new Date(item.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>
-              </div>
-              {item.role === "assistant" ? <div className="markdown">
-                {item.content ? <Markdown remarkPlugins={[remarkGfm]} skipHtml disallowedElements={["img"]} components={{
-                  a: ({ href, children }) => <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>,
-                }}>{item.content}</Markdown> : item.status === "streaming" ? <span className="thinking"><i /><i /><i />{busy ? streamStage : "Processing attachments or generating reply"}</span> : <p className="muted">No answer was generated.</p>}
-              </div> : <div className="user-text">{item.content}</div>}
-              {item.status === "streaming" && busy && item.content && <div className="tool-stage" role="status"><LoaderCircle className="spin" size={16} />{streamStage}</div>}
-              {detail.attachments.filter(f => f.messageId === item.id && f.preview).map(file => {
-                const source = `/api/chats/${file.chatId}/files/${file.id}/preview`;
-                if (file.preview === "pdf") return <a key={`preview-${file.id}`} className="exhibit exhibit-pdf" href={source} target="_blank" rel="noopener noreferrer" aria-label={`Preview ${file.name} in a new tab`}>
-                  <span className="sheet" aria-hidden="true"><span>PDF</span></span><span className="exhibit-text"><strong>{file.name}</strong><small>PDF · {formatSize(file.size)} · opens in a new tab</small></span><ArrowRight size={16} />
-                </a>;
-                return <figure key={`preview-${file.id}`} className="exhibit">
-                  {file.preview === "image"
-                    ? <img className="generated-preview" src={source} alt={`Generated ${file.name}`} loading="lazy" />
-                    : <video className="generated-preview" src={source} controls preload="metadata" aria-label={`Generated ${file.name}`} />}
-                  <figcaption><span>{file.name}</span><span>{fileKind(file.name)} · {formatSize(file.size)}</span></figcaption>
-                </figure>;
-              })}
-              {detail.attachments.filter(f => f.messageId === item.id).map(file => <span key={file.id} className="sent-file"><a className="file-chip sent" title={file.notes} href={`/api/chats/${file.chatId}/files/${file.id}`}><FileText size={16} /><span>{file.name}</span><ArrowDown size={16} /></a>
-                {file.preview === "pdf" ? <a className="icon-button" aria-label={`Open PDF preview of ${file.name}`} title="Open PDF preview" href={`/api/chats/${file.chatId}/files/${file.id}/preview`} target="_blank" rel="noopener noreferrer"><Eye size={16} /></a>
-                  : <IconButton label={`Preview extracted text for ${file.name}`} onClick={() => void previewFile(file)}><Eye size={16} /></IconButton>}</span>)}
-              {item.error && <div className={`message-status ${item.status}`} role="status">{item.error}</div>}
-              {item.role === "assistant" && item.content && item.status !== "streaming" && <button className={`read-aloud ${speaking === item.id ? "active" : ""}`} disabled={!speechAvailable} onClick={() => readAloud(item.id, item.content)}><Volume2 size={16} />{speaking === item.id ? "Stop reading" : "Read aloud"}</button>}
-            </article>)}
+            {detail!.messages.map(item => {
+              const time = new Date(item.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+              const files = detail!.attachments.filter(f => f.messageId === item.id);
+              if (item.role === "user") return <article key={item.id} className="message user" aria-label="Your message">
+                {files.length > 0 && <div className="sent-files">{files.map(sentFile)}</div>}
+                <div className="bubble">{item.content}</div>
+                <time className="hover-time" dateTime={new Date(item.createdAt).toISOString()}>{time}</time>
+                {item.error && <div className={`message-status ${item.status}`} role="status">{item.error}</div>}
+              </article>;
+              const streaming = item.status === "streaming";
+              return <article key={item.id} className="message assistant" aria-label="Assistant message">
+                <span className="reply-mark" aria-hidden="true"><Leaf size={14} /></span>
+                <div className="reply-body">
+                  <div className="reply-meta"><span className="model-tag">{models.find(m => m.id === item.model)?.name || item.model}</span><time className="hover-time" dateTime={new Date(item.createdAt).toISOString()}>{time}</time></div>
+                  {item.reasoning && <Thinking text={item.reasoning} live={streaming && !item.content} open={openThinking.has(item.id)} onToggle={() => toggleThinking(item.id)} />}
+                  <div className="markdown">
+                    {item.content ? <Md text={item.content} /> : streaming ? <span className="pending-reply"><i /><i /><i />{busy ? streamStage : "Processing attachments or generating reply"}</span> : <p className="muted">No answer was generated.</p>}
+                  </div>
+                  {streaming && busy && item.content && <div className="tool-stage" role="status"><LoaderCircle className="spin" size={16} />{streamStage}</div>}
+                  {files.filter(f => f.preview).map(file => {
+                    const source = `/api/chats/${file.chatId}/files/${file.id}/preview`;
+                    if (file.preview === "pdf") return <a key={`preview-${file.id}`} className="exhibit exhibit-pdf" href={source} target="_blank" rel="noopener noreferrer" aria-label={`Preview ${file.name} in a new tab`}>
+                      <span className="sheet" aria-hidden="true"><span>PDF</span></span><span className="exhibit-text"><strong>{file.name}</strong><small>PDF · {formatSize(file.size)} · opens in a new tab</small></span><ArrowRight size={16} />
+                    </a>;
+                    return <figure key={`preview-${file.id}`} className="exhibit">
+                      {file.preview === "image"
+                        ? <img className="generated-preview" src={source} alt={`Generated ${file.name}`} loading="lazy" />
+                        : <video className="generated-preview" src={source} controls preload="metadata" aria-label={`Generated ${file.name}`} />}
+                      <figcaption><span>{file.name}</span><span>{fileKind(file.name)} · {formatSize(file.size)}</span></figcaption>
+                    </figure>;
+                  })}
+                  {files.length > 0 && <div className="sent-files">{files.map(sentFile)}</div>}
+                  {item.error && <div className={`message-status ${item.status}`} role="status">{item.error}</div>}
+                  {item.content && !streaming && <div className="reply-actions">
+                    <IconButton label={speaking === item.id ? "Stop reading" : "Read aloud"} disabled={!speechAvailable} aria-pressed={speaking === item.id} onClick={() => readAloud(item.id, item.content)}><Volume2 size={16} /></IconButton>
+                  </div>}
+                </div>
+              </article>;
+            })}
           </div>}
         <div ref={bottom} />
       </div>
@@ -940,7 +975,7 @@ export function ChatApp() {
           {pending.some(file => file.processingStatus && file.processingStatus !== "ready") && <p className="file-guidance">Send will include every attached file once ready. Wait or retry/remove unfinished files, or choose Send text only to leave them for later.</p>}
           {extraImageRequests > 0 && <p className="file-guidance" role="status">These images/frames need up to {extraImageRequests} additional Copilot {extraImageRequests === 1 ? "request" : "requests"} with this model, using extra quota. Each is analyzed separately at its supplied detail; one reply combines the results. Analyses are saved for later turns.</p>}
           <label className="sr-only" htmlFor="message">Message</label>
-          <textarea id="message" ref={composer} rows={2} placeholder={listening ? "Listening" : "Ask a question or attach a file"} value={draft}
+          <textarea id="message" ref={composer} rows={1} placeholder={listening ? "Listening" : "Ask Model Chat"} value={draft}
             onChange={event => { draftRef.current = event.target.value; setDraft(event.target.value); setDraftState("saving"); }} maxLength={LIMITS.inputCharacters} disabled={composeLocked}
             onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send(); } }}
             onPaste={event => { if (event.clipboardData.files.length) { event.preventDefault(); void upload(event.clipboardData.files); } }} />
@@ -948,25 +983,39 @@ export function ChatApp() {
           <div className="composer-tools">
             <div className="tool-group">
               <input type="file" accept={FILE_ACCEPT} multiple ref={fileInput} className="sr-only" tabIndex={-1} onChange={event => void upload(event.target.files)} />
-              <IconButton label="Attach files" onClick={() => fileInput.current?.click()} disabled={uploadLocked}>{uploading ? <LoaderCircle className="spin" size={16} /> : <Paperclip size={16} />}</IconButton>
-              <button type="button" className={`voice-button ${listening ? "active" : ""}`} disabled={composeLocked || !dictationAvailable}
-                title={!dictationAvailable ? "Dictation unavailable in this browser; text chat works." : "Dictate with your browser's speech service"}
-                onClick={() => listening ? recognition.current?.stop() : startDictation()}><Mic size={16} /><span>{listening ? "Stop dictation" : "Dictate"}</span></button>
-              <span className="upload-status">{uploading ? `${transfers.filter(item => item.active).length} uploading` : pending.length ? `${readyPending.length} ready · ${pending.length - readyPending.length} pending` : ""}</span>
-              {uploading && <button type="button" className="voice-button" onClick={() => uploadController.current?.abort()}>Cancel upload</button>}
+              <button type="button" className="icon-button tool" aria-label="Attach files" title="Attach files. You can also drop files here or paste images; Send includes all of them." onClick={() => fileInput.current?.click()} disabled={uploadLocked}>{uploading ? <LoaderCircle className="spin" size={18} /> : <Plus size={20} />}</button>
+              <button type="button" className={`icon-button tool ${listening ? "active" : ""}`} aria-label={listening ? "Stop dictation" : "Dictate"} disabled={composeLocked || !dictationAvailable}
+                title={!dictationAvailable ? "Dictation unavailable in this browser; text chat works." : listening ? "Stop dictation" : "Dictate with your browser's speech service"}
+                onClick={() => listening ? recognition.current?.stop() : startDictation()}><Mic size={18} /></button>
+              {(uploading || pending.length > readyPending.length) && <span className="upload-status">{uploading ? `${transfers.filter(item => item.active).length} uploading` : `${readyPending.length} of ${pending.length} ready`}</span>}
+              {uploading && <button type="button" className="text-button" onClick={() => uploadController.current?.abort()}>Cancel upload</button>}
+              {(pending.length > readyPending.length || transfers.some(transfer => transfer.error)) && <button type="button" className="text-button" disabled={!draft.trim() || locked || !modelAvailable} onClick={() => void send(undefined, true)}>Send text only</button>}
             </div>
             <div className="send-group">{draft.length > 7000 && <small>{draft.length}/{LIMITS.inputCharacters}</small>}
-              {busy || remoteBusy ? <button type="button" className="send-button stop" aria-label="Stop reply" onClick={() => void stop()}><Square size={16} fill="currentColor" /></button> :
-                <button type="submit" className="send-button" aria-label="Send message" disabled={!draft.trim() || locked || !modelAvailable}><ArrowUp size={16} /></button>}
+              <label className="model-pill" title="Model for the next message">
+                <select aria-label="Select model" value={selectedModel} disabled={composeLocked || modelLoading || !models.length} onChange={event => { setSelectedModel(event.target.value); setDraftState("saving"); }}>
+                  {!selectedModel && <option value="">{modelLoading ? "Connecting..." : "No models"}</option>}
+                  {selectedModel && !modelAvailable && <option value={selectedModel}>{selectedModel} (unavailable)</option>}
+                  {models.map(model => <option value={model.id} key={model.id}>{model.name}{model.vision ? " · vision" : ""}{model.multiplier !== undefined && model.multiplier !== 1 ? ` · ${model.multiplier}x` : ""}</option>)}
+                </select>
+                <ChevronDown size={14} aria-hidden="true" />
+              </label>
+              {busy || remoteBusy ? <button type="button" className="send-button stop" aria-label="Stop reply" title="Stop reply. Partial text is kept." onClick={() => void stop()}><Square size={14} fill="currentColor" /></button> :
+                <button type="submit" className="send-button" aria-label="Send message" title="Send (Enter). Shift + Enter adds a new line." disabled={!draft.trim() || locked || !modelAvailable}><ArrowUp size={18} /></button>}
             </div>
           </div>
-          <div className="attachment-actions">
-            <p className="attachment-hint">Attach several files, drop them here or paste images. Send includes all of them</p>
-            {(pending.length > 0 || transfers.some(transfer => transfer.error)) && <button type="button" className="voice-button" disabled={!draft.trim() || locked || !modelAvailable} onClick={() => void send(undefined, true)}>Send text only</button>}
-          </div>
         </form>
-        <div className="composer-caption"><span>{draftState === "saving" ? "Saving draft…" : draftState === "error" ? "Draft not saved, retry before leaving" : "Draft saved"}{replyRunning ? " · Reply in progress. Keep writing; Send returns when it finishes or you press Stop" : dictationAvailable ? <span className="shortcut-hint"> · <kbd>Enter</kbd> to send, <kbd>Shift</kbd> + <kbd>Enter</kbd> for a new line</span> : " · Text chat is ready"}</span><button onClick={() => setSettings(true)}>Files & privacy <ShieldCheck size={16} /></button></div>
-        <div className="disclaimer">Models can make mistakes. Prompts and file text are sent to GitHub Copilot.</div>
+        {welcome && pending.length === 0 && <div className="suggestions">
+          <button title="The model starts by asking you one question" onClick={() => suggest("Help me think through an idea. Ask me one useful question to get started.")}><MessageSquare size={16} /><span>Think something through</span></button>
+          <button title="CSV, PDF, Word, Excel, images or recordings" onClick={() => fileInput.current?.click()} disabled={uploadLocked}><FileText size={16} /><span>Explore a document</span></button>
+          <button title="The model asks what you want to say first" onClick={() => suggest("Help me write something clear and concise. Ask what I want to communicate.")}><Pencil size={16} /><span>Write something</span></button>
+          {sandboxInfo?.ready && <button title="PDF, chart, GIF or MP4, Word, Excel or PowerPoint" onClick={() => suggest("Create a one-page PDF report and a matching bar-chart PNG for these sample figures: Q1 = 12, Q2 = 18, Q3 = 15, Q4 = 22. Include a short summary in the PDF.")}><Code2 size={16} /><span>Make a file</span></button>}
+        </div>}
+        <div className="composer-caption">
+          {draftState === "error" ? <span className="caption-warning" role="status">Draft not saved, retry before leaving</span> : <span className="sr-only" role="status">{draftState === "saving" ? "Saving draft…" : "Draft saved"}</span>}
+          <span>{replyRunning ? "Reply in progress. Keep writing; Send returns when it finishes or you press Stop." : "Models can make mistakes. Prompts and file text are sent to GitHub Copilot."}</span>
+          <button type="button" onClick={() => setSettings(true)}>Files &amp; privacy</button>
+        </div>
       </div>
     </main>
     {settings && <Dialog title="Account & connection" onClose={() => setSettings(false)}>

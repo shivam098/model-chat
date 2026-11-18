@@ -74,6 +74,9 @@ test("capture every screen for design review", async ({ page, browser }) => {
   await page.goto("/");
   await expect(page.getByLabel("Message", { exact: true })).toBeVisible();
   await capture(page, "03-empty-chat");
+  await page.getByRole("button", { name: "Collapse sidebar" }).click();
+  await page.screenshot({ path: path.join(shots!, "03b-collapsed-sidebar-desktop.png"), animations: "disabled" });
+  await page.getByRole("button", { name: "Expand sidebar" }).click();
 
   const outputs = sandbox ? await runSandbox(`
 import numpy as np, matplotlib.pyplot as plt
@@ -118,7 +121,7 @@ pdf.setFont('Helvetica', 11); pdf.drawString(72, 744, 'Planned 620 USD, actual 6
       "**Entertainment** went furthest over, by 45 USD. Groceries was also 35 USD over, while transport and books came in under plan.",
       "",
       "One practical adjustment: move 30 USD of the unused books budget to groceries next month, and set a 110 USD cap on entertainment.",
-    ].join("\n"), "complete");
+    ].join("\n"), "complete", null, "**Comparing each row**\n\nPlanned totals 620 and actual totals 645, so the month is 25 over. Entertainment is +45 and groceries +35, so entertainment is the largest overrun.");
     const second = store.beginTurn(owner.id, chat.id, "Make a bar chart of planned vs actual, a one-page PDF summary, and an animation of spending through the month.", modelB, []);
     const uploads = new UploadStore(store);
     for (const output of outputs?.files ?? []) {
@@ -131,7 +134,8 @@ pdf.setFont('Helvetica', 11); pdf.drawString(72, 744, 'Planned 620 USD, actual 6
     const streaming = store.createChat(owner.id);
     store.renameChat(owner.id, streaming.id, "Weekend trip plan");
     const live = store.beginTurn(owner.id, streaming.id, "Plan a relaxed two-day trip to Lisbon for two people, with one museum and one viewpoint each day.", modelA, []);
-    store.saveReply(owner.id, streaming.id, live.assistant.id, "## Day 1: Baixa and Alfama\n\n- **Morning:** walk from Praça do Comércio up to the Sé cathedral.\n- **Museum:** the National Tile Museum, about two hours.\n- **Viewpoint:** Miradouro de Santa Luzia before sunset.\n\n## Day 2: Belém\n\n- **Morning:** Jerónimos Monastery", "streaming");
+    store.saveReply(owner.id, streaming.id, live.assistant.id, "## Day 1: Baixa and Alfama\n\n- **Morning:** walk from Praça do Comércio up to the Sé cathedral.\n- **Museum:** the National Tile Museum, about two hours.\n- **Viewpoint:** Miradouro de Santa Luzia before sunset.\n\n## Day 2: Belém\n\n- **Morning:** Jerónimos Monastery", "streaming", null,
+      "**Pacing two relaxed days**\n\nThe user wants one museum and one viewpoint per day, so I should group sights by area to avoid long transfers. Alfama and Baixa are walkable together, and Belém is a short tram ride west, which makes a natural second day.\n\n**Choosing the stops**\n\nThe Tile Museum fits day one; Jerónimos and the Belém Tower fit day two. Santa Luzia works for sunset on day one.");
     return { chat: chat.id, streaming: streaming.id };
   });
 
@@ -167,6 +171,8 @@ pdf.setFont('Helvetica', 11); pdf.drawString(72, 744, 'Planned 620 USD, actual 6
   await page.goto(`/?chat=${seeded.streaming}`);
   await expect(page.getByRole("button", { name: "Stop reply" })).toBeVisible();
   await page.getByLabel("Message", { exact: true }).fill("Also suggest one place for dinner each night.");
+  await page.locator(".message.assistant").last().getByRole("button", { name: "Show thinking" }).click();
+  await expect(page.locator(".reasoning")).toContainText("Pacing two relaxed days");
   await capture(page, "08-streaming-reply");
   withStore(store => {
     const reply = store.messages(owner.id, seeded.streaming).at(-1)!;

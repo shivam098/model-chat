@@ -3,7 +3,7 @@ import { z } from "zod";
 import { AppError } from "./errors";
 import { LIMITS, type ImageSource } from "./contracts";
 import { analysisExcerpt, buildPrompt, promptByteBudget, SYSTEM_INSTRUCTION, TOOL_INSTRUCTION_RESERVE, type ImageContext } from "./context";
-import { modelPromptTokens, type ReplyInput, type ReplyRunner } from "./copilot";
+import { modelPromptTokens, replyReasoningEffort, type ReplyInput, type ReplyRunner } from "./copilot";
 import { nativeImages } from "./native-images";
 import { GENERATED_CONTEXT_FILES, generatedFileSummary, type Store } from "./store";
 
@@ -24,7 +24,7 @@ async function collectAnalysis(runner: ReplyRunner, input: ReplyInput) {
     else text = next;
   };
   try {
-    await runner({ ...input, signal: controller.signal, onDelta: value => accept(value, false), onReplace: value => accept(value, true) });
+    await runner({ ...input, signal: controller.signal, onDelta: value => accept(value, false), onReplace: value => accept(value, true), onReasoning: undefined, reasoningEffort: undefined });
     input.signal.throwIfAborted();
     if (exceeded) throw new AppError(502, "The image analysis exceeded its output budget. All attachments are retained.");
     const json = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
@@ -119,7 +119,7 @@ Return only JSON matching {"images":[{"id":"exact supplied image id","analysis":
     input.onProgress?.(batches.length ? "Combining all attachments into one reply" : "Generating reply");
     const finalPrompt = makePrompt(true);
     const images = nativeImages(direct.map(source => store.imageFile(userId, chatId, source)), model);
-    await runner({ ...input, prompt: finalPrompt, images });
+    await runner({ ...input, prompt: finalPrompt, images, reasoningEffort: replyReasoningEffort(model) });
   };
   return { prompt, runner: planned, additionalRequests: batches.length };
 }

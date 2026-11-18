@@ -41,6 +41,8 @@ async function register(email: string) {
   return page;
 }
 async function demoMenu(page: Page) {
+  const drawer = page.getByRole("button", { name: "Open sidebar" });
+  if (await drawer.isVisible()) await drawer.click();
   await page.getByRole("button", { name: "Menu", exact: true }).click();
   await page.getByRole("button", { name: "How Model Chat works & Demos", exact: true }).click();
 }

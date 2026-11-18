@@ -6,7 +6,8 @@ import path from "node:path";
 import { Store } from "../lib/store";
 import { buildPrompt } from "../lib/context";
 import { createChatStream, stopReply } from "../lib/stream";
-import { modelPromptTokens, safeSessionConfig } from "../lib/copilot";
+import { modelPromptTokens, replyReasoningEffort, safeSessionConfig } from "../lib/copilot";
+import type { ModelInfo } from "@github/copilot-sdk";
 import { assertLocalRequest, readBytes } from "../lib/http";
 import { runtimeEnvironment } from "../lib/runtime-env.mjs";
 import { dictationConstructor, voiceError } from "../lib/voice";
@@ -142,6 +143,15 @@ test("runtime config explicitly disables tools, discovery, skills and cross-sess
   assert.equal(result.kind, "reject");
   assert.equal(runtimeEnvironment().COPILOT_GITHUB_TOKEN, undefined);
   assert.equal(runtimeEnvironment().GITHUB_TOKEN, undefined);
+});
+test("thinking is requested only from models that support it, at medium unless the model names its own default", () => {
+  const model = (supports: boolean, extra: Partial<ModelInfo> = {}) => ({ id: "m", name: "M", capabilities: { supports: { vision: false, reasoningEffort: supports }, limits: { max_context_window_tokens: 100_000 } }, ...extra }) as ModelInfo;
+  assert.equal(replyReasoningEffort(model(true, { supportedReasoningEfforts: ["none" as "low", "low", "medium", "high"] })), "medium");
+  assert.equal(replyReasoningEffort(model(true, { supportedReasoningEfforts: ["low", "high"], defaultReasoningEffort: "high" })), "high");
+  assert.equal(replyReasoningEffort(model(false)), undefined);
+  const thinking = safeSessionConfig("m", path.resolve(".local", "test"), "s", [], undefined, "medium");
+  assert.deepEqual([thinking.reasoningEffort, thinking.reasoningSummary], ["medium", "detailed"]);
+  assert.equal("reasoningEffort" in safeSessionConfig("m", path.resolve(".local", "test"), "s"), false);
 });
 test("loopback Host and same-origin mutation requirements reject cross-site attacks", async () => {
   const url = "http://127.0.0.1:3210/api/chats";
