@@ -1,4 +1,6 @@
+import { existsSync } from "node:fs";
 import { statfs } from "node:fs/promises";
+import path from "node:path";
 import { dataDirectory } from "./config";
 import { AppError } from "./errors";
 import type { UploadStore } from "./upload-store";
@@ -6,7 +8,10 @@ import type { UploadStore } from "./upload-store";
 export const UPLOAD_PART_BYTES = 4 * 1024 * 1024;
 const DISK_RESERVE = 1024n * 1024n * 1024n;
 export async function requireDiskCapacity(additionalBytes: number) {
-  const stats = await statfs(dataDirectory, { bigint: true });
+  // The data folder is created on first use; until then its parent volume is the one that matters.
+  let folder = dataDirectory;
+  while (!existsSync(folder) && path.dirname(folder) !== folder) folder = path.dirname(folder);
+  const stats = await statfs(folder, { bigint: true });
   const free = stats.bavail * stats.bsize;
   if (free < BigInt(Math.ceil(additionalBytes)) * 2n + DISK_RESERVE) {
     throw new AppError(507, "The host does not have enough free disk space. Free space or move the data directory, then retry.");
