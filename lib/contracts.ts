@@ -10,6 +10,7 @@ export const LIMITS = {
   inputCharacters: 8_000,
   outputCharacters: 32_000,
   reasoningCharacters: 32_000,
+  codeEventText: 64_000,
   messagesPerChat: 200,
   chatsPerUser: 100,
 };
@@ -27,6 +28,19 @@ export interface Chat {
   createdAt: number;
   updatedAt: number;
   draft?: string;
+  mode?: "chat" | "code";
+  projectPath?: string | null;
+}
+/** One card in a coding reply: a command, a file change, a read/search, or a note. Approvals live on the card they gate. */
+export interface CodeEvent {
+  id: string;
+  chatId: string;
+  messageId: string;
+  seq: number;
+  kind: "command" | "file" | "tool" | "note";
+  data: Record<string, unknown>;
+  createdAt: number;
+  updatedAt: number;
 }
 export interface Message {
   id: string;
@@ -67,6 +81,8 @@ export interface ChatDetail {
   chat: Chat;
   messages: Message[];
   attachments: Attachment[];
+  codeEvents?: CodeEvent[];
+  codeLive?: boolean;
 }
 export interface Model {
   id: string;
@@ -80,6 +96,7 @@ export type StreamEvent =
   | { type: "delta"; text: string }
   | { type: "replace"; text: string }
   | { type: "reasoning"; text: string; replace?: boolean }
+  | { type: "code"; event: CodeEvent }
   | { type: "progress"; stage: string }
   | { type: "attachments" }
   | { type: "done"; message: Message }

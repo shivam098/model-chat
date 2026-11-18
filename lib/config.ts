@@ -10,7 +10,15 @@ for (const name of ["public", ".next", ".next-candidate"]) {
     throw new Error("MODEL_CHAT_DATA_DIR must be outside public/ and build directories.");
   }
 }
-export const { origin, tunnelMode } = networkPolicy(process.env.PORT || 3210, process.env.MODEL_CHAT_TUNNEL_ORIGIN);
+export const { origin, localOrigin, tunnelMode } = networkPolicy(process.env.PORT || 3210, process.env.MODEL_CHAT_TUNNEL_ORIGIN);
+export type Via = "local" | "tunnel";
+// Set only by scripts/serve.mjs, which strips any client-supplied value; local means this computer's own browser.
+export function requestVia(request: Request): Via {
+  return !tunnelMode || request.headers.get("x-model-chat-via") === "local" ? "local" : "tunnel";
+}
+export function expectedOrigin(request: Request) {
+  return requestVia(request) === "local" ? localOrigin : origin;
+}
 export function ensureDataDirectory() {
   mkdirSync(dataDirectory, { recursive: true, mode: 0o700 });
 }

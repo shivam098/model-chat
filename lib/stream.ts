@@ -28,7 +28,8 @@ export function hasSessionReply(sessionId: string) {
 export function stopSessionReplies(sessionId: string) {
   for (const job of active.values()) if (job.sessionId === sessionId) job.controller.abort();
 }
-export function createChatStream(store: Store, userId: string, chatId: string, content: string, model: string, fileIds: string[], prompt: string, runner: ReplyRunner, requestSignal: AbortSignal, security?: StreamSecurity, images?: NativeImage[]) {
+export function createChatStream(store: Store, userId: string, chatId: string, content: string, model: string, fileIds: string[], prompt: string, runner: ReplyRunner, requestSignal: AbortSignal, security?: StreamSecurity, images?: NativeImage[], options: { idleMs?: number } = {}) {
+  const idleMs = options.idleMs ?? 240_000;
   if (active.has(chatId)) throw new AppError(409, "A reply is already running in this chat.");
   if (active.size >= 2 || [...active.values()].some(j => j.userId === userId || j.actorId === (security?.actorId ?? userId))) throw new AppError(429, "One reply per account or actor and two per app can run at once. Wait or stop the current reply.");
   const controller = new AbortController();
@@ -107,7 +108,7 @@ export function createChatStream(store: Store, userId: string, chatId: string, c
         let timeout: ReturnType<typeof setTimeout> | undefined;
         const requestStarted = () => {
           clearTimeout(timeout);
-          timeout = setTimeout(() => controller.abort(new Error("timeout")), 240_000);
+          timeout = setTimeout(() => controller.abort(new Error("timeout")), idleMs);
         };
         requestStarted();
         let stage = "Generating reply";
@@ -116,6 +117,7 @@ export function createChatStream(store: Store, userId: string, chatId: string, c
         try {
           await runner({ model, prompt, images, authorize: security?.check, signal: controller.signal, assistantMessageId: turn.assistant.id,
             onAttachments: () => { if (checkAccess()) send({ type: "attachments" }); },
+            onCodeEvent: event => { if (checkAccess()) send({ type: "code", event }); },
             onRequestStart: requestStarted, onProgress: value => { stage = value; if (checkAccess()) send({ type: "progress", stage }); },
             onDelta: text => accept(text, false), onReplace: text => accept(text, true), onReasoning: acceptReasoning });
           if (controller.signal.aborted) throw new DOMException("Reply cancelled", "AbortError");
@@ -123,7 +125,7 @@ export function createChatStream(store: Store, userId: string, chatId: string, c
         } catch (cause) {
           status = controller.signal.aborted ? "cancelled" : "error";
           if (outputExceeded) error = "Reply stopped at the 32,000-character output limit.";
-          else if (controller.signal.reason instanceof Error && controller.signal.reason.message === "timeout") error = "A model request exceeded four minutes and was stopped.";
+          else if (controller.signal.reason instanceof Error && controller.signal.reason.message === "timeout") error = idleMs > 240_000 ? `Nothing happened for ${Math.round(idleMs / 60_000)} minutes, so the reply was stopped.` : "A model request exceeded four minutes and was stopped.";
           else if (controller.signal.aborted) error = "Reply stopped. Any partial text is saved.";
           else error = copilotError(cause).message;
         } finally {

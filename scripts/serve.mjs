@@ -6,6 +6,7 @@ import env from "@next/env";
 import { networkPolicy } from "../lib/network-policy.mjs";
 import { readTunnelState } from "../lib/process-tools.mjs";
 import { stableLinkOrigin } from "../lib/stable-link.mjs";
+import { previewFor, proxyPreview, proxyPreviewUpgrade } from "../lib/preview-proxy.mjs";
 
 env.loadEnvConfig(process.cwd());
 const portIndex = process.argv.indexOf("--port");
@@ -49,19 +50,39 @@ process.once("exit", () => {
 const app = next({ dev: process.argv.includes("--dev"), hostname: "127.0.0.1", port });
 await app.prepare();
 const handler = app.getRequestHandler();
+const publicHost = new URL(policy.origin).host;
+const localHost = new URL(policy.localOrigin).host;
+// Headers Cloudflare and cloudflared add to every proxied request; a genuine local browser sends none of them.
+const FORWARDING_HEADERS = ["cf-connecting-ip", "cf-ray", "cf-visitor", "cdn-loop", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "forwarded"];
+// Only this launcher decides whether a request is local or came through the tunnel; the app trusts nothing else.
+function serve(req, res, expectedOrigin, via) {
+  const pageNavigation = req.method === "GET" && req.url.split("?")[0] === "/" && req.headers["sec-fetch-mode"] === "navigate";
+  if ((req.headers.origin && req.headers.origin !== expectedOrigin) || (req.headers["sec-fetch-site"] === "cross-site" && !pageNavigation)) {
+    res.writeHead(403, { "Content-Type": "text/plain" }).end("Open Model Chat at " + expectedOrigin);
+    return;
+  }
+  req.headers["x-model-chat-via"] = via;
+  req.headers["x-model-chat-ip"] = "127.0.0.1";
+  if (via === "tunnel") res.setHeader("Strict-Transport-Security", "max-age=86400");
+  handler(req, res);
+}
 const server = createServer((req, res) => {
   const local = ["127.0.0.1", "::ffff:127.0.0.1", "::1"].includes(req.socket.remoteAddress);
-  if (local && policy.tunnelMode && req.headers.host === new URL(policy.localOrigin).host) {
+  delete req.headers["x-model-chat-via"];
+  const preview = local && !FORWARDING_HEADERS.some(name => req.headers[name] !== undefined) ? previewFor(req.headers.host, port) : null;
+  if (preview) { proxyPreview(req, res, preview); return; }
+  if (local && policy.tunnelMode && req.headers.host === localHost) {
     if (req.method === "GET" && req.url === "/api/health") {
       res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" }).end('{"ok":true}');
-    } else if (["GET", "HEAD"].includes(req.method) && req.url.startsWith("/")) {
-      res.writeHead(307, { Location: policy.origin + req.url, "Cache-Control": "no-store" }).end();
+    } else if (FORWARDING_HEADERS.some(name => req.headers[name] !== undefined)) {
+      res.writeHead(403, { "Content-Type": "text/plain" }).end("Use the temporary HTTPS link for remote access.");
     } else {
-      res.writeHead(403, { "Content-Type": "text/plain" }).end("Use the temporary HTTPS link while tunnel mode is enabled.");
+      // The owner's own browser on this computer: the same app, plus owner-only features such as coding mode.
+      serve(req, res, policy.localOrigin, "local");
     }
     return;
   }
-  if (local && policy.tunnelMode && req.headers.host === new URL(policy.origin).host && req.headers["x-forwarded-proto"] !== "https") {
+  if (local && policy.tunnelMode && req.headers.host === publicHost && req.headers["x-forwarded-proto"] !== "https") {
     if (["GET", "HEAD"].includes(req.method) && req.url.startsWith("/")) {
       res.writeHead(308, { Location: policy.origin + req.url, "Cache-Control": "no-store" }).end();
     } else {
@@ -69,7 +90,7 @@ const server = createServer((req, res) => {
     }
     return;
   }
-  if (local && policy.tunnelMode && req.method === "GET" && req.url.split("?")[0] === "/api/link-status" && req.headers.host === new URL(policy.origin).host) {
+  if (local && policy.tunnelMode && req.method === "GET" && req.url.split("?")[0] === "/api/link-status" && req.headers.host === publicHost) {
     // Constant liveness answer for the shareable-link page: no cookies are read and nothing changes.
     // Only that page's origin may read it cross-origin; every other route keeps the checks below.
     const headers = { "Content-Type": "application/json", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", Vary: "Origin" };
@@ -77,18 +98,20 @@ const server = createServer((req, res) => {
     res.writeHead(200, headers).end('{"ok":true}');
     return;
   }
-  const pageNavigation = req.method === "GET" && req.url.split("?")[0] === "/" && req.headers["sec-fetch-mode"] === "navigate";
-  if (!local || req.headers.host !== new URL(policy.origin).host ||
-      (req.headers.origin && req.headers.origin !== process.env.MODEL_CHAT_ORIGIN) ||
-      (req.headers["sec-fetch-site"] === "cross-site" && !pageNavigation)) {
+  if (!local || req.headers.host !== publicHost) {
     res.writeHead(403, { "Content-Type": "text/plain" }).end("Open Model Chat at " + process.env.MODEL_CHAT_ORIGIN);
     return;
   }
-  req.headers["x-model-chat-ip"] = "127.0.0.1";
-  if (policy.tunnelMode) res.setHeader("Strict-Transport-Security", "max-age=86400");
-  handler(req, res);
+  serve(req, res, policy.origin, policy.tunnelMode ? "tunnel" : "local");
 });
 server.requestTimeout = 0;
+// WebSockets are only proxied for coding-mode previews (for example a dev server's hot reload); nothing else upgrades.
+server.on("upgrade", (req, socket, head) => {
+  const local = ["127.0.0.1", "::ffff:127.0.0.1", "::1"].includes(req.socket.remoteAddress);
+  const preview = local && !FORWARDING_HEADERS.some(name => req.headers[name] !== undefined) ? previewFor(req.headers.host, port) : null;
+  if (preview) proxyPreviewUpgrade(req, socket, head, preview);
+  else socket.destroy();
+});
 server.setTimeout(120_000, socket => socket.destroy());
 server.headersTimeout = 15_000;
 server.on("error", error => { console.error(error.message); process.exit(1); });

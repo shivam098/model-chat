@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { getAuth } from "@/lib/auth";
+import { authFor } from "@/lib/auth";
 import { getStore } from "@/lib/store";
 import { AccessService, type AccessContext } from "@/lib/access";
 import { AppError, errorResponse } from "@/lib/errors";
@@ -10,7 +10,9 @@ import { listModels, runCopilotReply, type ReplyRunner } from "@/lib/copilot";
 import { prepareImageTurn } from "@/lib/image-turn";
 import { codeToolInstruction, createCodeTool, previewMatches } from "@/lib/code-tool";
 import { sandboxConfig, sandboxStatus } from "@/lib/sandbox";
-import { createChatStream, stopReply, stopSessionReplies, hasSessionReply } from "@/lib/stream";
+import { createChatStream, stopReply, stopSessionReplies, hasSessionReply, type StreamSecurity } from "@/lib/stream";
+import { disposeCodeChat, handleCodeApi, handleCodeMessage } from "@/lib/coding/routes";
+import { hasCodeSession } from "@/lib/coding/agent";
 import { tunnelMode } from "@/lib/config";
 import { signupSchema } from "@/lib/signup";
 import { DEMO_IDS } from "@/lib/demos";
@@ -54,7 +56,7 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
     security = new AccessService(store);
     if (s[0] === "auth") {
       const endpoint = s.slice(1).join("/");
-      const auth = await getAuth();
+      const auth = await authFor(request);
       const session = await auth.api.getSession({ headers: request.headers });
       if (session) access = security.resolve(session.user.id, session.session.id, endpoint === "sign-out");
       if (access?.delegationId && !["sign-out", "get-session"].includes(endpoint)) {
@@ -146,6 +148,7 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
       const models = await listModels(new URL(request.url).searchParams.get("refresh") === "1");
       return Response.json(run("models.list", null, () => ({ models: models.map(m => ({ id: m.id, name: m.name, multiplier: m.billing?.multiplier, vision: Boolean(m.capabilities.supports.vision && m.capabilities.limits.vision), maxImages: m.capabilities.limits.vision?.max_prompt_images })), authenticated: true })));
     }
+    if (s[0] === "code") return await handleCodeApi(request, s, ctx, guard, store);
     if (s[0] !== "chats") throw new AppError(404, "Endpoint not found.");
     if (s.length === 1) {
       if (method === "GET") return Response.json({ chats: run("chat.list", user.id, () => store.listChats(user.id)) });
@@ -155,13 +158,15 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
     if (!chatId || !z.uuid().safeParse(chatId).success) throw new AppError(404, "Chat not found.");
     const chat = store.chat(user.id, chatId);
     if (s.length === 2) {
-      if (method === "GET") return Response.json(run("chat.read", chatId, () => ({ chat, messages: store.messages(user.id, chatId), attachments: store.attachments(user.id, chatId) })));
+      if (method === "GET") return Response.json(run("chat.read", chatId, () => ({ chat, messages: store.messages(user.id, chatId), attachments: store.attachments(user.id, chatId),
+        ...(chat.mode === "code" ? { codeEvents: store.codeEvents(user.id, chatId), codeLive: hasCodeSession(chatId) } : {}) })));
       if (method === "PATCH") {
         const { title } = await readJson(request, z.object({ title: z.string().trim().min(1).max(80) }).strict());
         return Response.json({ chat: run("chat.rename", chatId, () => store.renameChat(user.id, chatId, title)) });
       }
       if (method === "DELETE") {
         run("chat.delete", chatId, () => store.deleteChat(user.id, chatId));
+        if (chat.mode === "code") await disposeCodeChat(chatId);
         return Response.json({ ok: true });
       }
     }
@@ -169,6 +174,15 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
       run("message.stop", chatId, () => stopReply(store, user.id, chatId));
       return Response.json({ ok: true });
     }
+    const streamSecurity: StreamSecurity = {
+      actorId: ctx.actor.id, sessionId: ctx.sessionId, check: () => { guard.check(ctx); },
+      accepted: (userMessageId, assistantId) => {
+        guard.record(ctx, "message.send", userMessageId, "allowed");
+        guard.record(ctx, "message.begin", assistantId, "allowed");
+      },
+      finished: (messageId, status, lost) => guard.record(ctx, "message.finish", messageId, lost ? "denied" : status === "error" ? "error" : "allowed", lost ? "access_ended" : status),
+    };
+    if (s.length === 3 && s[2] === "messages" && method === "POST" && chat.mode === "code") return await handleCodeMessage(request, ctx, guard, store, chatId, streamSecurity);
     if (s.length === 3 && s[2] === "messages" && method === "POST") {
       const body = await readJson(request, z.object({
         content: z.string().trim().min(1, "Write a message first.").max(LIMITS.inputCharacters),
@@ -194,14 +208,7 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
           audit: (action, objectId, outcome, reason) => guard.record(ctx, action, objectId, outcome, reason, true),
         })],
       }) : turn.runner;
-      return createChatStream(store, user.id, chatId, body.content, body.model, body.fileIds, turn.prompt, runner, request.signal, {
-        actorId: ctx.actor.id, sessionId: ctx.sessionId, check: () => { guard.check(ctx); },
-        accepted: (userMessageId, assistantId) => {
-          guard.record(ctx, "message.send", userMessageId, "allowed");
-          guard.record(ctx, "message.begin", assistantId, "allowed");
-        },
-        finished: (messageId, status, lost) => guard.record(ctx, "message.finish", messageId, lost ? "denied" : status === "error" ? "error" : "allowed", lost ? "access_ended" : status),
-      });
+      return createChatStream(store, user.id, chatId, body.content, body.model, body.fileIds, turn.prompt, runner, request.signal, streamSecurity);
     }
     if (s.length === 3 && s[2] === "files" && method === "POST") {
       const release = transferSlot(user.id);

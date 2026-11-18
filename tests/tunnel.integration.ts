@@ -8,6 +8,10 @@ import { setTimeout as delay } from "node:timers/promises";
 import { networkPolicy } from "../lib/network-policy.mjs";
 import { readTunnelState, sameProcess } from "../lib/process-tools.mjs";
 import http from "node:http";
+import os from "node:os";
+import Database from "better-sqlite3";
+import { Store } from "../lib/store";
+import { AccessService } from "../lib/access";
 
 function directRequest(url: string, init: { method?: string; headers?: Record<string, string>; body?: string } = {}): Promise<Response> {
   return new Promise((resolve, reject) => {
@@ -87,12 +91,13 @@ test("a detached server stops gracefully only for a stop request naming this exa
 });
 test("tunnel mode allows email/password signup without OTP and preserves secure login and origin protections", { timeout: 90_000 }, async () => {
   const directory = await mkdtemp(path.resolve(".local", "tunnel-test-"));
+  const projects = await mkdtemp(path.join(process.platform === "darwin" ? os.homedir() : os.tmpdir(), "model-chat-projects-test-"));
   const local = "http://127.0.0.1:3213";
   const remote = "https://validation-only.trycloudflare.com";
   let child: ChildProcess | undefined;
   const start = async (tunnelMode: boolean) => {
     child = spawn(process.execPath, ["scripts/serve.mjs", "--port", "3213"], {
-      env: { ...process.env, MODEL_CHAT_DATA_DIR: directory, MODEL_CHAT_TUNNEL_ORIGIN: tunnelMode ? remote : "", MODEL_CHAT_PAGES_REPO: "example-owner/model-chat" },
+      env: { ...process.env, MODEL_CHAT_DATA_DIR: directory, MODEL_CHAT_PROJECTS_DIR: projects, MODEL_CHAT_TUNNEL_ORIGIN: tunnelMode ? remote : "", MODEL_CHAT_PAGES_REPO: "example-owner/model-chat" },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let logs = "";
@@ -123,6 +128,8 @@ test("tunnel mode allows email/password signup without OTP and preserves secure 
     });
     assert.equal(signup.status, 200);
     await stop();
+    const db = new Database(path.join(directory, "model-chat.db"));
+    try { new AccessService(new Store(db)).setRoleLocally("tunnel-test@example.test", "superuser"); } finally { db.close(); }
     await start(true);
     const headers = { host: new URL(remote).host, origin: remote, "content-type": "application/json", "x-forwarded-proto": "https" };
     const access = await (await directRequest(local + "/api/access", { headers })).json();
@@ -202,12 +209,44 @@ test("tunnel mode allows email/password signup without OTP and preserves secure 
     assert.equal((await directRequest(local + "/api/account", { headers: { ...headers, cookie: newCookie } })).status, 401);
     assert.equal((await directRequest(local + "/api/auth/sign-in/email", { method: "POST", headers, body: JSON.stringify({ email: "new@example.test", password: "wrong-password" }) })).status, 401);
     assert.equal((await directRequest(local + "/api/auth/sign-in/email", { method: "POST", headers, body: JSON.stringify({ email: "new@example.test", password }) })).status, 200);
-    assert.equal((await fetch(local + "/api/chats", { method: "POST", headers: { origin: local } })).status, 403);
-    const redirect = await fetch(local, { redirect: "manual" });
-    assert.equal(redirect.status, 307);
-    assert.equal(redirect.headers.get("location"), remote + "/");
+    assert.equal((await fetch(local + "/api/chats", { method: "POST", headers: { origin: local } })).status, 401, "The local console keeps its own origin and login checks");
+    assert.equal((await fetch(local + "/api/chats", { method: "POST", headers: { origin: remote } })).status, 403);
+    // The host's own browser gets the app on the loopback address, with its own session cookie; forwarded requests never do.
+    const page = await fetch(local, { redirect: "manual" });
+    assert.equal(page.status, 200);
+    assert.equal((await directRequest(local + "/api/access", { headers: { "cf-connecting-ip": "203.0.113.7" } })).status, 403);
+    const json = { origin: local, "content-type": "application/json" };
+    const ownerLogin = await fetch(local + "/api/auth/sign-in/email", { method: "POST", headers: json, body: JSON.stringify({ email: "tunnel-test@example.test", password }) });
+    assert.equal(ownerLogin.status, 200, await ownerLogin.clone().text());
+    const ownerCookies = ownerLogin.headers.getSetCookie();
+    assert.ok(ownerCookies.some(value => /session_token/.test(value) && /HttpOnly/i.test(value) && /SameSite=Strict/i.test(value) && !/;\s*Secure/i.test(value)));
+    const ownerCookie = ownerCookies.map(value => value.split(";")[0]).join("; ");
+    assert.equal((await directRequest(local + "/api/account", { headers: { ...headers, cookie: ownerCookie } })).status, 401, "A local-console session isn't valid through the tunnel");
+    assert.equal((await fetch(local + "/api/account", { headers: { cookie } })).status, 401, "A tunnel session isn't valid on the local console");
+    // Coding mode: available to the superuser on the local console, refused through the tunnel even with a forged marker.
+    const codeStatus = await (await fetch(local + "/api/code/status", { headers: { cookie: ownerCookie } })).json();
+    assert.equal(codeStatus.available, true, JSON.stringify(codeStatus));
+    const project = await fetch(local + "/api/code/projects", { method: "POST", headers: { ...json, cookie: ownerCookie }, body: JSON.stringify({ name: "demo-app" }) });
+    assert.equal(project.status, 201);
+    const codeChat = await fetch(local + "/api/code/chats", { method: "POST", headers: { ...json, cookie: ownerCookie }, body: JSON.stringify({ projectPath: (await project.json()).path }) });
+    assert.equal(codeChat.status, 201);
+    const codeChatId = (await codeChat.json()).chat.id;
+    const remoteStatus = await (await directRequest(local + "/api/code/status", { headers: { ...headers, cookie } })).json();
+    assert.equal(remoteStatus.available, false);
+    assert.match(remoteStatus.reason, /computer running Model Chat/);
+    for (const extra of [{}, { "x-model-chat-via": "local" }] as Record<string, string>[]) {
+      assert.equal((await directRequest(local + "/api/code/projects", { headers: { ...headers, ...extra, cookie } })).status, 403);
+      assert.equal((await directRequest(local + "/api/code/chats", { method: "POST", headers: { ...headers, ...extra, cookie }, body: JSON.stringify({ projectPath: projects }) })).status, 403);
+      assert.equal((await directRequest(local + `/api/chats/${codeChatId}/messages`, { method: "POST", headers: { ...headers, ...extra, cookie }, body: JSON.stringify({ content: "hi", model: "any" }) })).status, 403);
+    }
+    const userLogin = await fetch(local + "/api/auth/sign-in/email", { method: "POST", headers: json, body: JSON.stringify({ email: "new@example.test", password }) });
+    const userCookie = userLogin.headers.getSetCookie().map(value => value.split(";")[0]).join("; ");
+    assert.equal((await (await fetch(local + "/api/code/status", { headers: { cookie: userCookie } })).json()).available, false);
+    assert.equal((await fetch(local + "/api/code/projects", { headers: { cookie: userCookie } })).status, 403, "Ordinary accounts can't use coding mode, even locally");
+    assert.equal((await fetch(local + `/api/chats/${codeChatId}`, { headers: { cookie: userCookie } })).status, 404);
   } finally {
     await stop();
     await rm(directory, { recursive: true, force: true });
+    await rm(projects, { recursive: true, force: true });
   }
 });

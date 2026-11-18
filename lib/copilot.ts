@@ -6,7 +6,7 @@ import path from "node:path";
 import { dataDirectory } from "./config";
 import { AppError } from "./errors";
 import { systemInstruction } from "./context";
-import type { NativeImage } from "./contracts";
+import type { CodeEvent, NativeImage } from "./contracts";
 import { expectedCopilotLogin, isAccountError, isolatedRuntimeEnvironment, selectStoredSignIn, verifyRuntimeIdentity } from "./copilot-account";
 
 const copilotHome = process.env.MODEL_CHAT_COPILOT_HOME ? path.resolve(process.env.MODEL_CHAT_COPILOT_HOME) : path.join(dataDirectory, "copilot");
@@ -54,7 +54,13 @@ export async function copilotAccount(): Promise<{ login: string; source: string 
   const { login, source } = await copilotCredential();
   return { login, source };
 }
-export async function createClient(refreshCredential = false) {
+/** For coding sessions only: the token is handed to the runtime over RPC per session, never through its environment. */
+export async function copilotSessionToken(): Promise<{ login: string; token: string }> {
+  const { login, token } = await copilotCredential();
+  return { login, token };
+}
+export function copilotHomeDirectory() { return copilotHome; }
+export async function createClient(refreshCredential = false, environment?: Record<string, string | undefined>) {
   const cwd = path.join(copilotHome, "empty-workspace");
   await mkdir(cwd, { recursive: true, mode: 0o700 });
   const credential = await copilotCredential(refreshCredential);
@@ -62,7 +68,7 @@ export async function createClient(refreshCredential = false) {
     mode: "empty",
     baseDirectory: copilotHome,
     workingDirectory: cwd,
-    env: isolatedRuntimeEnvironment(copilotHome),
+    env: environment ?? isolatedRuntimeEnvironment(copilotHome),
     // Only the app's own stored sign-in; useLoggedInUser:false stops any fallback to gh or environment tokens.
     gitHubToken: credential.token,
     useLoggedInUser: false,
@@ -190,6 +196,8 @@ export interface ReplyInput {
   toolInstruction?: string;
   reasoningEffort?: ReasoningEffort;
   onReasoning?: (text: string, replace: boolean) => void;
+  /** Coding mode: a command, file change or approval card was created or updated. */
+  onCodeEvent?: (event: CodeEvent) => void;
 }
 export type ReplyRunner = (input: ReplyInput) => Promise<void>;
 // Without an explicit level the runtime requests no reasoning; "medium" lets models think when a question warrants it.

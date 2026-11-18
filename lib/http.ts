@@ -1,11 +1,12 @@
 import { z } from "zod";
-import { getAuth } from "./auth";
-import { origin } from "./config";
+import { authFor } from "./auth";
+import { expectedOrigin } from "./config";
 import { AppError } from "./errors";
 import { AccessService } from "./access";
 import { getStore } from "./store";
 
 export function assertLocalRequest(request: Request) {
+  const origin = expectedOrigin(request);
   const expected = new URL(origin);
   if (request.headers.get("host") !== expected.host) throw new AppError(403, "Use the app's exact configured URL.");
   const requestOrigin = request.headers.get("origin");
@@ -18,7 +19,7 @@ export async function requireUser(request: Request) {
 }
 export async function requireAccess(request: Request, recover = false) {
   assertLocalRequest(request);
-  const session = await (await getAuth()).api.getSession({ headers: request.headers });
+  const session = await (await authFor(request)).api.getSession({ headers: request.headers });
   if (!session) throw new AppError(401, "Please sign in again.");
   const service = new AccessService(getStore());
   const access = service.resolve(session.user.id, session.session.id, recover);

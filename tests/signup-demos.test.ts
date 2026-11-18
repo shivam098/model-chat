@@ -27,7 +27,7 @@ test("draft migration preserves an old database's chats and owners", () => {
   try {
     db.exec("CREATE TABLE user(id TEXT PRIMARY KEY); INSERT INTO user VALUES ('alice'); CREATE TABLE app_chat(id TEXT PRIMARY KEY,userId TEXT NOT NULL,title TEXT NOT NULL,model TEXT NOT NULL DEFAULT '',createdAt INTEGER NOT NULL,updatedAt INTEGER NOT NULL); INSERT INTO app_chat VALUES ('old','alice','Keep me','old-model',1,2)");
     const store = new Store(db);
-    assert.deepEqual(store.chat("alice", "old"), { id: "old", title: "Keep me", model: "old-model", createdAt: 1, updatedAt: 2, draft: "" });
+    assert.deepEqual(store.chat("alice", "old"), { id: "old", title: "Keep me", model: "old-model", createdAt: 1, updatedAt: 2, draft: "", mode: "chat", projectPath: null });
     new Store(db);
     assert.equal(store.listChats("alice").length, 1);
   } finally { db.close(); }

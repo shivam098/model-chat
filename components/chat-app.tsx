@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { ArrowDown, ArrowRight, ArrowUp, BookOpen, Brain, ChevronDown, Code2, Eye, FileText, Leaf, LoaderCircle, LogOut, Menu, MessageSquare, Mic, PanelLeft, Pencil, Plus, RefreshCw, Settings2, ShieldCheck, Square, SquarePen, Trash2, Volume2, X } from "lucide-react";
+import { ArrowDown, ArrowRight, ArrowUp, BookOpen, Brain, ChevronDown, Code2, Eye, FileText, FolderOpen, Leaf, LoaderCircle, LogOut, Menu, MessageSquare, Mic, PanelLeft, PanelRight, Pencil, Plus, RefreshCw, Settings2, ShieldCheck, Square, SquarePen, Trash2, Volume2, X } from "lucide-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { FILE_ACCEPT, LIMITS, type Attachment, type Chat, type ChatDetail, type Model, type StreamEvent } from "@/lib/contracts";
@@ -9,6 +9,7 @@ import { dictationConstructor, voiceError, type Dictation, type VoiceWindow } fr
 import { DEMOS, type DemoId } from "@/lib/demos";
 import type { AccountView, AppUser } from "@/lib/access";
 import { AdminPanel } from "./admin-panel";
+import { CodeCard, CodePanel, ProjectPicker, folderName, mergeCodeEvent, type CodingStatus, type Decision, type PanelTab } from "./code-mode";
 
 type User = AppUser;
 type Transfer = { id: string; name: string; progress: number; fileId?: string; error?: string; active: boolean };
@@ -122,6 +123,10 @@ export function ChatApp() {
   const [voiceDialog, setVoiceDialog] = useState(false);
   const [rail, setRail] = useState(false);
   const [openThinking, setOpenThinking] = useState<Set<string>>(() => new Set());
+  const [codeStatus, setCodeStatus] = useState<CodingStatus | null>(null);
+  const [projectPicker, setProjectPicker] = useState(false);
+  const [codePanel, setCodePanel] = useState<PanelTab | null>(null);
+  const [deciding, setDeciding] = useState<Set<string>>(() => new Set());
   const bottom = useRef<HTMLDivElement>(null);
   const scroller = useRef<HTMLDivElement>(null);
   const follow = useRef(true);
@@ -162,6 +167,9 @@ export function ChatApp() {
   const newImageCount = readyPending.reduce((count, file) => count + (file.mimeType?.startsWith("image/") ? 1 : file.frameCount || 0), 0);
   const imageLimit = models.find(model => model.id === selectedModel)?.maxImages || 0;
   const extraImageRequests = imageLimit ? Math.ceil(Math.max(0, newImageCount - imageLimit) / imageLimit) : 0;
+  const codeChat = detail?.chat.mode === "code";
+  const codeReady = Boolean(codeStatus?.available) && !acting;
+  const codeBlocked = codeChat && !codeReady;
   function api<T>(url: string, init?: RequestInit) {
     const subject = userRef.current?.id;
     return requestJson<T>(url, { ...init, headers: { ...(subject ? { "x-model-chat-subject": subject } : {}), ...init?.headers } });
@@ -175,6 +183,7 @@ export function ChatApp() {
     setUser(account.user); setActor(account.actor); setDetail(null); setChats([]); setDraft(""); setSelectedModel("");
     setAdmin(false); setMenu(false); setSidebar(false); setSettings(false); setDraftState("saved");
     setFilePreview(null);
+    setCodeStatus(null); setProjectPicker(false); setCodePanel(null);
     setTransfers([]); setStreamStage("Waiting for the model");
     if (chatId !== undefined) window.history.replaceState(null, "", chatId ? `?chat=${chatId}` : "/");
   }
@@ -258,6 +267,9 @@ export function ChatApp() {
     api<NonNullable<typeof sandboxInfo>>("/api/sandbox-status")
       .then(result => { if (alive) setSandboxInfo(result); })
       .catch(error => { if (alive) setSandboxInfo({ ready: false, message: message(error), libraries: [], limits: null }); });
+    api<CodingStatus>("/api/code/status")
+      .then(result => { if (alive) setCodeStatus(result); })
+      .catch(() => { if (alive) setCodeStatus(null); });
     return () => { alive = false; };
     // Account changes reset and reload this account's data only.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -266,7 +278,7 @@ export function ChatApp() {
   useEffect(() => {
     if (!detail?.messages.length) { if (scroller.current) scroller.current.scrollTop = 0; return; }
     if (follow.current) bottom.current?.scrollIntoView({ behavior: busy ? "instant" : "smooth" });
-  }, [detail?.messages, busy, interim]);
+  }, [detail?.messages, detail?.codeEvents, busy, interim]);
 
   useEffect(() => {
     if (!remoteBusy || busy || !detail) return;
@@ -331,6 +343,7 @@ export function ChatApp() {
     setDraft(""); setBusy(false); setUploading(false); setTransfers([]); setSettings(false); setSidebar(false);
     setMenu(false); setHow(false); setDemoLoading(false);
     setActor(null); setAdmin(false); setSwitching(false);
+    setCodeStatus(null); setProjectPicker(false); setCodePanel(null);
     setFilePreview(null); setStreamStage("Waiting for the model");
     setSpeaking(null); setInterim(""); setVoiceConsent(false); setConnectionError("");
     window.history.replaceState(null, "", "/");
@@ -338,6 +351,7 @@ export function ChatApp() {
   async function openChat(chat: Chat) {
     const request = ++selection.current;
     setLoadingChat(true); setNotice(""); setSidebar(false); follow.current = true;
+    if (detailRef.current?.chat.id !== chat.id) setCodePanel(null);
     stopSpeaking();
     stopDictation();
     try {
@@ -425,7 +439,7 @@ export function ChatApp() {
       setSwitching(true);
       try { await flushDraft(true); } catch (error) { report(error); setSwitching(false); return; }
     }
-    selection.current++; setDetail(null); detailRef.current = null; setDraft(""); setNotice(""); setSidebar(false);
+    selection.current++; setDetail(null); detailRef.current = null; setDraft(""); setNotice(""); setSidebar(false); setCodePanel(null);
     draftRef.current = ""; draftSaved.current = null;
     stopSpeaking(); stopDictation();
     window.history.replaceState(null, "", "/");
@@ -505,6 +519,7 @@ export function ChatApp() {
   async function send(event?: FormEvent, textOnly = false) {
     event?.preventDefault();
     if (locked || !modelAvailable || !draft.trim()) return;
+    if (codeBlocked) { setNotice(codeStatus?.reason || "Coding mode isn't available here."); return; }
     if (!textOnly && (pending.length !== readyPending.length || transfers.some(transfer => transfer.error))) {
       setNotice("Some attached files are still processing or could not be uploaded. Nothing was sent. Wait or retry/remove those files, or explicitly choose Send text only.");
       return;
@@ -515,7 +530,7 @@ export function ChatApp() {
     const epoch = workspaceEpoch.current;
     // Clear the composer now so anything typed while this reply streams becomes the next draft, not this turn.
     draftRef.current = ""; setDraft(""); setDraftState("saving");
-    setBusy(true); setNotice(""); setStreamStage("Preparing attachments"); follow.current = true;
+    setBusy(true); setNotice(""); setStreamStage(detailRef.current?.chat.mode === "code" ? "Working in the project" : "Preparing attachments"); follow.current = true;
     const controller = new AbortController();
     generation.current = controller;
     let chatId: string | undefined;
@@ -563,6 +578,8 @@ export function ChatApp() {
         } else if (item.type === "reasoning") {
           setDetail(previous => previous && previous.chat.id === chatId ? ({ ...previous, messages: previous.messages.map((m, index) => index === previous.messages.length - 1 ?
             { ...m, reasoning: item.replace ? item.text : (m.reasoning || "") + item.text } : m) }) : previous);
+        } else if (item.type === "code") {
+          setDetail(previous => previous && previous.chat.id === chatId ? { ...previous, codeLive: true, codeEvents: mergeCodeEvent(previous.codeEvents || [], item.event) } : previous);
         } else if (item.type === "done") {
           done = true;
           setDetail(previous => previous && previous.chat.id === chatId ? ({ ...previous, messages: previous.messages.map(m => m.id === item.message.id ? item.message : m) }) : previous);
@@ -602,8 +619,37 @@ export function ChatApp() {
     try { await api(`/api/chats/${detail.chat.id}/stop`, { method: "POST" }); }
     catch (error) { report(error); }
   }
+  async function chooseCode() {
+    if (composeLocked || !codeReady) return;
+    try { await flushDraft(true); } catch (error) { report(error); return; }
+    setProjectPicker(true);
+  }
+  function openCodeChat(chat: Chat) {
+    stopDictation(); stopSpeaking();
+    // A request typed into an unsaved new chat moves with the switch; drafts of saved chats stay with them.
+    const carried = detailRef.current ? "" : draftRef.current;
+    selection.current++;
+    const next: ChatDetail = { chat, messages: [], attachments: [], codeEvents: [], codeLive: false };
+    detailRef.current = next; draftRef.current = carried;
+    draftSaved.current = { userId: userRef.current!.id, chatId: chat.id, draft: "", model: modelRef.current };
+    setDetail(next); setDraft(carried); setDraftState(carried ? "saving" : "saved");
+    setChats(previous => [chat, ...previous.filter(item => item.id !== chat.id)]);
+    setProjectPicker(false); setCodePanel(null); setSidebar(false); setNotice("");
+    window.history.replaceState(null, "", `?chat=${chat.id}`);
+    composer.current?.focus();
+  }
+  async function decide(id: string, decision: Decision) {
+    setDeciding(previous => new Set(previous).add(id));
+    try { await api(`/api/code/approvals/${id}`, { method: "POST", body: JSON.stringify({ decision }) }); }
+    catch (error) {
+      report(error);
+      const chatId = detailRef.current?.chat.id;
+      if (chatId) void refreshChat(chatId).catch(report);
+    } finally { setDeciding(previous => { const next = new Set(previous); next.delete(id); return next; }); }
+  }
   async function upload(files: FileList | File[] | null) {
     if (!files?.length) return;
+    if (detailRef.current?.chat.mode === "code") { setNotice("Coding chats work on the project folder. Put files in the project instead of attaching them."); return; }
     if (uploadLocked) { setNotice("Finish the current file transfer before adding another selection of files."); return; }
     const selected = Array.from(files).map(file => ({ file, id: crypto.randomUUID() }));
     for (const item of selected) transferControllers.current.set(item.id, new AbortController());
@@ -875,7 +921,7 @@ export function ChatApp() {
       <nav className="chat-list" aria-label="Chat history">
         {chats.length === 0 && <p className="history-empty">No conversations yet</p>}
         {chats.map(chat => <div className={`chat-item ${detail?.chat.id === chat.id ? "selected" : ""}`} key={chat.id}>
-          <button className="chat-select" onClick={() => void openChat(chat)} disabled={locked}><span>{chat.title}</span></button>
+          <button className="chat-select" onClick={() => void openChat(chat)} disabled={locked}>{chat.mode === "code" && <Code2 size={14} className="chat-mode-icon" aria-label="Coding chat" />}<span>{chat.title}</span></button>
           <div className="chat-actions">
             <IconButton label={`Rename ${chat.title}`} disabled={locked} onClick={() => { setEditingTitle(chat.title); setRename(chat); }}><Pencil size={16} /></IconButton>
             <IconButton label={`Delete ${chat.title}`} disabled={locked} onClick={() => setDeleteChat(chat)}><Trash2 size={16} /></IconButton>
@@ -890,7 +936,8 @@ export function ChatApp() {
     <main className={`main-panel ${welcome ? "empty" : ""}`}>
       <header className="topbar">
         <IconButton label="Open sidebar" onClick={() => setSidebar(true)}><Menu size={18} /></IconButton>
-        {detail?.messages.length ? <span className="topbar-title">{detail.chat.title}</span> : <span className="topbar-brand"><Brand /></span>}
+        {detail?.messages.length || codeChat ? <span className="topbar-title">{detail!.chat.title}</span> : <span className="topbar-brand"><Brand /></span>}
+        {codeChat && <button type="button" className="topbar-action" aria-label="Workspace" aria-pressed={Boolean(codePanel)} title="Changes, terminal output, preview and background processes" onClick={() => setCodePanel(tab => tab ? null : "changes")}><PanelRight size={16} /><span>Workspace</span></button>}
       </header>
       {acting && <div className="acting-banner" role="status"><div><strong>Acting as {user.name}</strong><span>{user.email} · Signed in as {actor?.email}. Actions are audited.</span></div><button onClick={() => void returnToSelf()} disabled={locked}>Return to my workspace</button>{(busy || remoteBusy) && <small>Stop the current reply before returning.</small>}</div>}
       {connectionError && <div className="connection-banner" role="status"><ShieldCheck size={16} /><span>{connectionError}</span><button onClick={() => setSettings(true)}>Setup</button></div>}
@@ -900,7 +947,10 @@ export function ChatApp() {
         if (node) follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 120;
       }}>
         {loadingChat ? <div className="loading-chat"><LoaderCircle className="spin" /> Opening conversation...</div> :
-          welcome ? <div className="welcome">
+          welcome ? codeChat ? <div className="welcome">
+            <h1>Code in {folderName(detail!.chat.projectPath)}</h1>
+            <p>{codeBlocked ? codeStatus?.reason || "Coding mode isn't available here." : <>Ask for a change, a fix or a new app in <code title={detail!.chat.projectPath || ""}>{detail!.chat.projectPath}</code>. Commands and file changes wait for your approval.</>}</p>
+          </div> : <div className="welcome">
             <h1>Start with a question or a file</h1>
             <p>{pending.length ? processing ? "Your files are processing. You can keep writing meanwhile." : readyPending.length ? "Your files are ready. Ask about them below." : "Some uploads need attention before you send." : "Choose any of your Copilot models in the box below. Switch models mid-conversation and the context carries over."}</p>
           </div> : <div className="message-list">
@@ -919,6 +969,8 @@ export function ChatApp() {
                 <div className="reply-body">
                   <div className="reply-meta"><span className="model-tag">{models.find(m => m.id === item.model)?.name || item.model}</span><time className="hover-time" dateTime={new Date(item.createdAt).toISOString()}>{time}</time></div>
                   {item.reasoning && <Thinking text={item.reasoning} live={streaming && !item.content} open={openThinking.has(item.id)} onToggle={() => toggleThinking(item.id)} />}
+                  {codeChat && <div className="code-cards">{(detail!.codeEvents || []).filter(event => event.messageId === item.id).map(event =>
+                    <CodeCard key={event.id} event={event} live={Boolean(detail!.codeLive) || streaming} deciding={deciding.has(String((event.data.approval as { id?: string } | undefined)?.id))} onDecide={(id, decision) => void decide(id, decision)} />)}</div>}
                   <div className="markdown">
                     {item.content ? <Md text={item.content} /> : streaming ? <span className="pending-reply"><i /><i /><i />{busy ? streamStage : "Processing attachments or generating reply"}</span> : <p className="muted">No answer was generated.</p>}
                   </div>
@@ -975,7 +1027,7 @@ export function ChatApp() {
           {pending.some(file => file.processingStatus && file.processingStatus !== "ready") && <p className="file-guidance">Send will include every attached file once ready. Wait or retry/remove unfinished files, or choose Send text only to leave them for later.</p>}
           {extraImageRequests > 0 && <p className="file-guidance" role="status">These images/frames need up to {extraImageRequests} additional Copilot {extraImageRequests === 1 ? "request" : "requests"} with this model, using extra quota. Each is analyzed separately at its supplied detail; one reply combines the results. Analyses are saved for later turns.</p>}
           <label className="sr-only" htmlFor="message">Message</label>
-          <textarea id="message" ref={composer} rows={1} placeholder={listening ? "Listening" : "Ask Model Chat"} value={draft}
+          <textarea id="message" ref={composer} rows={1} placeholder={listening ? "Listening" : codeChat ? "Describe a change, a fix or an app to build" : "Ask Model Chat"} value={draft}
             onChange={event => { draftRef.current = event.target.value; setDraft(event.target.value); setDraftState("saving"); }} maxLength={LIMITS.inputCharacters} disabled={composeLocked}
             onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send(); } }}
             onPaste={event => { if (event.clipboardData.files.length) { event.preventDefault(); void upload(event.clipboardData.files); } }} />
@@ -983,10 +1035,15 @@ export function ChatApp() {
           <div className="composer-tools">
             <div className="tool-group">
               <input type="file" accept={FILE_ACCEPT} multiple ref={fileInput} className="sr-only" tabIndex={-1} onChange={event => void upload(event.target.files)} />
-              <button type="button" className="icon-button tool" aria-label="Attach files" title="Attach files. You can also drop files here or paste images; Send includes all of them." onClick={() => fileInput.current?.click()} disabled={uploadLocked}>{uploading ? <LoaderCircle className="spin" size={18} /> : <Plus size={20} />}</button>
+              {codeChat ? <button type="button" className="project-chip" title={`${detail!.chat.projectPath}. Open the workspace panel.`} onClick={() => setCodePanel(tab => tab ? null : "changes")}><FolderOpen size={16} /><span>{folderName(detail!.chat.projectPath)}</span></button>
+                : <button type="button" className="icon-button tool" aria-label="Attach files" title="Attach files. You can also drop files here or paste images; Send includes all of them." onClick={() => fileInput.current?.click()} disabled={uploadLocked}>{uploading ? <LoaderCircle className="spin" size={18} /> : <Plus size={20} />}</button>}
               <button type="button" className={`icon-button tool ${listening ? "active" : ""}`} aria-label={listening ? "Stop dictation" : "Dictate"} disabled={composeLocked || !dictationAvailable}
                 title={!dictationAvailable ? "Dictation unavailable in this browser; text chat works." : listening ? "Stop dictation" : "Dictate with your browser's speech service"}
                 onClick={() => listening ? recognition.current?.stop() : startDictation()}><Mic size={18} /></button>
+              {codeReady && <div className="mode-switch" role="group" aria-label="Mode">
+                <button type="button" aria-pressed={!codeChat} disabled={composeLocked} title="Ordinary chat: no access to this computer" onClick={() => { if (codeChat) void newChat(); }}>Chat</button>
+                <button type="button" aria-pressed={codeChat} disabled={composeLocked} title="Work on a project folder on this computer, with your approval for each command and change" onClick={() => { if (!codeChat) void chooseCode(); }}>Code</button>
+              </div>}
               {(uploading || pending.length > readyPending.length) && <span className="upload-status">{uploading ? `${transfers.filter(item => item.active).length} uploading` : `${readyPending.length} of ${pending.length} ready`}</span>}
               {uploading && <button type="button" className="text-button" onClick={() => uploadController.current?.abort()}>Cancel upload</button>}
               {(pending.length > readyPending.length || transfers.some(transfer => transfer.error)) && <button type="button" className="text-button" disabled={!draft.trim() || locked || !modelAvailable} onClick={() => void send(undefined, true)}>Send text only</button>}
@@ -1001,11 +1058,15 @@ export function ChatApp() {
                 <ChevronDown size={14} aria-hidden="true" />
               </label>
               {busy || remoteBusy ? <button type="button" className="send-button stop" aria-label="Stop reply" title="Stop reply. Partial text is kept." onClick={() => void stop()}><Square size={14} fill="currentColor" /></button> :
-                <button type="submit" className="send-button" aria-label="Send message" title="Send (Enter). Shift + Enter adds a new line." disabled={!draft.trim() || locked || !modelAvailable}><ArrowUp size={18} /></button>}
+                <button type="submit" className="send-button" aria-label="Send message" title="Send (Enter). Shift + Enter adds a new line." disabled={!draft.trim() || locked || !modelAvailable || codeBlocked}><ArrowUp size={18} /></button>}
             </div>
           </div>
         </form>
-        {welcome && pending.length === 0 && <div className="suggestions">
+        {welcome && codeChat && !codeBlocked && <div className="suggestions">
+          <button title="A small page with a live preview" onClick={() => suggest("Create a small web page with a counter button. Start it on 127.0.0.1 in the background and tell me the URL so I can preview it.")}><Code2 size={16} /><span>Build a small web app</span></button>
+          <button title="The model reads the folder and summarises it" onClick={() => suggest("Explain what this project contains and how to build and run it.")}><FileText size={16} /><span>Explain this project</span></button>
+        </div>}
+        {welcome && !codeChat && pending.length === 0 && <div className="suggestions">
           <button title="The model starts by asking you one question" onClick={() => suggest("Help me think through an idea. Ask me one useful question to get started.")}><MessageSquare size={16} /><span>Think something through</span></button>
           <button title="CSV, PDF, Word, Excel, images or recordings" onClick={() => fileInput.current?.click()} disabled={uploadLocked}><FileText size={16} /><span>Explore a document</span></button>
           <button title="The model asks what you want to say first" onClick={() => suggest("Help me write something clear and concise. Ask what I want to communicate.")}><Pencil size={16} /><span>Write something</span></button>
@@ -1013,11 +1074,17 @@ export function ChatApp() {
         </div>}
         <div className="composer-caption">
           {draftState === "error" ? <span className="caption-warning" role="status">Draft not saved, retry before leaving</span> : <span className="sr-only" role="status">{draftState === "saving" ? "Saving draft…" : "Draft saved"}</span>}
-          <span>{replyRunning ? "Reply in progress. Keep writing; Send returns when it finishes or you press Stop." : "Models can make mistakes. Prompts and file text are sent to GitHub Copilot."}</span>
+          <span>{replyRunning ? "Reply in progress. Keep writing; Send returns when it finishes or you press Stop." : codeBlocked ? codeStatus?.reason || "Coding mode isn't available here." : codeChat ? "Commands and file changes wait for your approval. Model Chat's data and credentials are off limits." : "Models can make mistakes. Prompts and file text are sent to GitHub Copilot."}</span>
           <button type="button" onClick={() => setSettings(true)}>Files &amp; privacy</button>
         </div>
       </div>
     </main>
+    {codeChat && codePanel && detail && <CodePanel chatId={detail.chat.id} project={detail.chat.projectPath || ""} events={detail.codeEvents || []} live={Boolean(detail.codeLive) || replyRunning}
+      tab={codePanel} appPort={codeStatus?.localUrl.split(":").pop() || "3210"} api={api} onTab={setCodePanel} onClose={() => setCodePanel(null)}
+      onChanged={() => void refreshChat(detail.chat.id).catch(report)} onError={report} />}
+    {projectPicker && <Dialog title="Open a project" onClose={() => setProjectPicker(false)}>
+      <ProjectPicker api={api} root={codeStatus?.projectsRoot || null} onOpen={openCodeChat} />
+    </Dialog>}
     {settings && <Dialog title="Account & connection" onClose={() => setSettings(false)}>
       <div className="settings-account"><span className="avatar">{user.name.slice(0, 1).toUpperCase()}</span><div><strong>{user.name}</strong><p>{user.email}</p></div></div>
       <div className="settings-section"><h3><ShieldCheck size={16} /> {access.tunnelMode ? "Temporary remote access" : "Personal, local-only"}</h3><p>{access.tunnelMode ? "A temporary Cloudflare HTTPS tunnel is active. Anyone with the link can create an email/password account without OTP. This link uses the app's password login, not Cloudflare Access. Cloudflare relays the traffic. Stop the tunnel when finished." : "This app listens on 127.0.0.1 only. Use only the app's explicit temporary-tunnel mode for remote access; do not otherwise expose it through a proxy, LAN or the internet."} App accounts have separate histories and files, but all use the host owner&apos;s Copilot account and usage limits.</p><p>Histories and original files stay in this app&apos;s local SQLite database. Prompts, chat context and extracted file text go to GitHub Copilot when you send. These are not end-to-end encrypted; people with access to your Windows account or backups can read local data.</p></div>
@@ -1030,6 +1097,7 @@ export function ChatApp() {
         <p>Download originals from message chips. X removes unsent files; deleting a chat removes its files and saved image analyses. Histories and drafts survive user/chat switches. Up to 100 chats and 100 turns per chat remain.</p>
       </div>
       <div className="settings-section"><h3><Code2 size={16} /> Code runner</h3><p>{sandboxInfo?.message || "Checking the code runner..."}</p>{sandboxInfo?.ready && <><p>Ask for a PDF report, chart, GIF/MP4 animation, or Word/Excel/PowerPoint file. The model writes Python that runs in a disposable Linux sandbox on this computer (WSL). Each run has <strong>no internet or network access</strong>, cannot install packages, cannot see Windows, other chats or other users, and is deleted afterwards. Only files from this chat that the model selects are copied in.{sandboxInfo.limits && <> Limits per run: about {sandboxInfo.limits.wallSeconds} seconds, {sandboxInfo.limits.cpus} CPUs, {Math.round(sandboxInfo.limits.memoryBytes / 1024 ** 3)} GB memory, {Math.round(sandboxInfo.limits.workBytes / 1024 ** 2)} MB scratch space and {sandboxInfo.limits.outputFiles} output files; up to 8 runs per reply.</>}</p><p>Available libraries: {sandboxInfo.libraries.join(", ")}. Only the host owner can add libraries, using a command on this computer; they cannot be installed from chat.</p><p>Results are attached to the reply as downloads. PNG/JPEG/GIF/WebP images, MP4/WebM videos and PDFs also get previews; other types such as HTML or SVG are download-only. Generated code can be wrong; check important results. Runs use the host owner&apos;s Copilot quota like any message.</p></>}</div>
+      {actor?.appRole === "superuser" && !acting && codeStatus && <div className="settings-section"><h3><FolderOpen size={16} /> Coding mode</h3><p>{codeStatus.available ? <>Available in this browser. Choose Code in the message box to work on a project folder{codeStatus.projectsRoot ? <> (new projects go in <code>{codeStatus.projectsRoot}</code>)</> : null}. The model uses this computer&apos;s own tools; every command, file change and web fetch waits for your approval, and Model Chat&apos;s data, .env files and credentials are always blocked.</> : codeStatus.reason}</p><p>Only the superuser account can use it, never while acting as someone else. It works only from a browser on this computer{codeStatus.remoteEnabled ? "; remote use is turned on and needs two-step verification" : ", not through the shared link"}.</p></div>}
       <div className="settings-section"><h3><Mic size={16} /> Local audio/video processing</h3><p>{mediaInfo?.message || "Checking local media configuration..."} {mediaInfo?.ready && <>Whisper model: {mediaInfo.model}, running on this computer&apos;s CPU.</>}</p><p>MP3, WAV, M4A, AAC, FLAC, OGG, OPUS, MP4, MOV, WEBM, MKV and AVI are accepted when their streams are decodable. Speech becomes a machine transcript; video also supplies up to four still frames. Copilot receives those extracted inputs when you press Send, not native audio/video. Transcription can be imperfect, and unsampled visual events may be missed.</p><p>One recording and one document can process at a time; others wait in a durable queue. No media-duration or overall-processing deadline is imposed. Long recordings are decoded/transcribed in bounded-memory windows, and processing may take a long time. Closing the browser does not discard accepted uploads. Interrupted jobs resume from the beginning after a server restart. Administrator-created delegated jobs stop if that administrator loses access or signs out. Transcription uses installed local packages/cached weights, without a speech API key. Public-link uploads pass through Cloudflare.</p></div>
       <div className="settings-section"><h3><ShieldCheck size={16} /> Administrator access</h3><p>The app superuser can view users&apos; chat sessions and files and act as a user to send messages or modify chats. An audit log records the real actor, effective user, action, object IDs, time and outcome—not prompt/file contents or credentials. {acting && <>You are still signed in as {actor?.email}; signing out ends that real login session.</>}</p></div>
       <div className="settings-section"><h3><Mic size={16} /> Voice and passwords</h3><p>Dictation uses browser speech recognition, not a realtime audio model. Your browser may send microphone audio to its speech provider. Read-aloud uses your browser&apos;s voices, which may also use an online service. Text works without either feature.</p><p>No email verification, password reset, or recovery service is configured. Use a unique password and keep a local backup. A temporary shared preview is not production hosting.</p></div>
