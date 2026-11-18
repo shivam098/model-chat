@@ -5,25 +5,75 @@ import path from "node:path";
 import { dataDirectory } from "./config";
 import { AppError } from "./errors";
 import { systemInstruction } from "./context";
-import { runtimeEnvironment } from "./runtime-env.mjs";
 import type { NativeImage } from "./contracts";
+import { expectedCopilotLogin, isAccountError, isolatedRuntimeEnvironment, selectStoredSignIn, verifyRuntimeIdentity } from "./copilot-account";
 
-const copilotHome = path.join(dataDirectory, "copilot");
-export async function createClient() {
+const copilotHome = process.env.MODEL_CHAT_COPILOT_HOME ? path.resolve(process.env.MODEL_CHAT_COPILOT_HOME) : path.join(dataDirectory, "copilot");
+interface CopilotCredential { login: string; source: string; token: string; at: number }
+const credentialState = globalThis as typeof globalThis & {
+  modelChatCopilotCredential?: CopilotCredential;
+  modelChatCopilotCredentialPending?: Promise<CopilotCredential>;
+};
+const CREDENTIAL_TTL_MS = 10 * 60_000;
+export function forgetCopilotCredential() {
+  credentialState.modelChatCopilotCredential = undefined;
+}
+// The token stays in this process's memory; it is never logged or written by the app.
+async function copilotCredential(refresh = false): Promise<CopilotCredential> {
+  const expected = expectedCopilotLogin(copilotHome);
+  const cached = credentialState.modelChatCopilotCredential;
+  if (!refresh && cached && cached.login.toLowerCase() === expected.login.toLowerCase() && Date.now() - cached.at < CREDENTIAL_TTL_MS) return cached;
+  if (credentialState.modelChatCopilotCredentialPending) return credentialState.modelChatCopilotCredentialPending;
+  credentialState.modelChatCopilotCredentialPending = (async () => {
+    forgetCopilotCredential();
+    const cwd = path.join(copilotHome, "empty-workspace");
+    await mkdir(cwd, { recursive: true, mode: 0o700 });
+    // Only "copilot-cli" mode may read the OS credential store where `copilot login` keeps the app's sign-in
+    // ("empty" mode disables it). This client only reads the account roster and never creates a session.
+    const broker = new CopilotClient({
+      mode: "copilot-cli",
+      baseDirectory: copilotHome,
+      workingDirectory: cwd,
+      env: isolatedRuntimeEnvironment(copilotHome),
+      useLoggedInUser: true,
+      logLevel: "error",
+    });
+    try {
+      await deadline(broker.start(), 30_000);
+      const signIn = selectStoredSignIn(await deadline(broker.rpc.account.getAllUsers(), 15_000), expected.login);
+      const credential = { ...signIn, source: expected.source, at: Date.now() };
+      credentialState.modelChatCopilotCredential = credential;
+      return credential;
+    } finally { await closeClient(broker); }
+  })().finally(() => { credentialState.modelChatCopilotCredentialPending = undefined; });
+  return credentialState.modelChatCopilotCredentialPending;
+}
+/** The account the app is using, for owner diagnostics. */
+export async function copilotAccount(): Promise<{ login: string; source: string }> {
+  const { login, source } = await copilotCredential();
+  return { login, source };
+}
+export async function createClient(refreshCredential = false) {
   const cwd = path.join(copilotHome, "empty-workspace");
   await mkdir(cwd, { recursive: true, mode: 0o700 });
+  const credential = await copilotCredential(refreshCredential);
   const client = new CopilotClient({
     mode: "empty",
     baseDirectory: copilotHome,
     workingDirectory: cwd,
-    env: runtimeEnvironment(),
-    useLoggedInUser: true,
+    env: isolatedRuntimeEnvironment(copilotHome),
+    // Only the app's own stored sign-in; useLoggedInUser:false stops any fallback to gh or environment tokens.
+    gitHubToken: credential.token,
+    useLoggedInUser: false,
     sessionIdleTimeoutSeconds: 300,
     logLevel: "error",
   });
-  try { await deadline(client.start(), 30_000); }
-  catch (error) {
+  try {
+    await deadline(client.start(), 30_000);
+    verifyRuntimeIdentity(await deadline(client.rpc.account.getCurrentAuth(), 15_000), credential.login);
+  } catch (error) {
     await closeClient(client);
+    if (isAccountError(error)) forgetCopilotCredential();
     throw error;
   }
   return client;
@@ -48,6 +98,7 @@ export function copilotError(error: unknown): AppError {
   if (error instanceof AppError) return error;
   const message = error instanceof Error ? error.message : "";
   if (/auth|sign.?in|token|401|403|entitle|subscription/i.test(message)) {
+    forgetCopilotCredential();
     return new AppError(503, "Copilot authentication or entitlement is unavailable. Run npm run copilot:login on this machine, then refresh the connection.", { cause: error });
   }
   if (/model.*(not|invalid|unavailable)|quota|rate.limit|429|402|budget/i.test(message)) {
@@ -70,10 +121,8 @@ export async function listModels(refresh = false): Promise<ModelInfo[]> {
   if (!refresh && catalogState.modelChatCatalog && Date.now() - catalogState.modelChatCatalog.at < 60_000) return catalogState.modelChatCatalog.models;
   if (catalogState.modelChatCatalogPending) return catalogState.modelChatCatalogPending;
   catalogState.modelChatCatalogPending = (async () => {
-    const client = await createClient();
+    const client = await createClient(refresh);
     try {
-      const auth = await deadline(client.getAuthStatus(), 15_000);
-      if (!auth.isAuthenticated) throw new AppError(503, "No usable Copilot sign-in was found in this app's isolated runtime. Run npm run copilot:login on this machine, then refresh the connection.");
       const allowed = (await deadline(client.listModels(), 30_000)).filter(m => m.policy?.state !== "disabled");
       const models = allowed.filter(model => (modelPromptTokens(model.capabilities.limits) ?? 0) > 8192);
       if (models.length !== allowed.length) console.warn("[model-chat] Omitted catalog entries without a usable advertised context limit:", allowed.length - models.length);

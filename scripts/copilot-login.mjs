@@ -5,7 +5,9 @@ import env from "@next/env";
 import { runtimeEnvironment } from "../lib/runtime-env.mjs";
 
 env.loadEnvConfig(process.cwd());
-const home = path.join(path.resolve(process.env.MODEL_CHAT_DATA_DIR || ".local"), "copilot");
+const home = process.env.MODEL_CHAT_COPILOT_HOME
+  ? path.resolve(process.env.MODEL_CHAT_COPILOT_HOME)
+  : path.join(path.resolve(process.env.MODEL_CHAT_DATA_DIR || ".local"), "copilot");
 mkdirSync(home, { recursive: true, mode: 0o700 });
 console.log("Signing in using the supported Copilot CLI. App runtime config stays in:", home);
 const child = spawn("copilot", ["login"], {

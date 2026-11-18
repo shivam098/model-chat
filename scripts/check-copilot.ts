@@ -1,11 +1,12 @@
 import env from "@next/env";
 
 env.loadEnvConfig(process.cwd());
-const { listModels, runCopilotReply } = await import("../lib/copilot");
+const { listModels, runCopilotReply, copilotAccount } = await import("../lib/copilot");
 
 try {
   const models = await listModels(true);
-  console.log(`Copilot authenticated. ${models.length} models available.`);
+  const account = await copilotAccount();
+  console.log(`Copilot authenticated as ${account.login} (configured by ${account.source}; the GitHub CLI's active account is not used). ${models.length} models available.`);
   console.log(models.map(m => `${m.id} (${m.name})`).join("\n"));
   if (process.argv.includes("--chat")) {
     const model = [...models].filter(m => m.id !== "auto").sort((a, b) => (a.billing?.multiplier ?? 1) - (b.billing?.multiplier ?? 1))[0];

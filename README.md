@@ -93,21 +93,42 @@ Limitations:
 
 ### Copilot sign-in
 
-The backend uses the official SDK's **stored CLI / supported GitHub CLI credential fallback**. It never reads, exports, or copies credentials itself. SDK/runtime configuration and sessions are isolated under this app's data directory. Authentication can reuse this machine's existing sign-in; it is not guaranteed that a desktop-app sign-in alone is sufficient.
+The backend uses **only this app's own Copilot sign-in**, created with `npm run copilot:login`. It never uses the GitHub CLI's active account, `gh` tokens, or `GH_TOKEN`/`GITHUB_TOKEN`/`COPILOT_GITHUB_TOKEN` variables, so switching or signing out accounts in `gh` does not affect the app. SDK/runtime configuration and sessions are isolated under this app's data directory.
 
-Check the connection without a model call:
+How it works, with the official SDK:
+
+- `copilot login` stores the sign-in in the Windows credential store (Credential Manager). Generation runs in the SDK's `empty` mode, which cannot read that store. A short-lived SDK client in `copilot-cli` mode therefore reads the app's stored sign-in for the configured account through the SDK account API. It never creates a session.
+- Its token is passed to generation clients through the SDK's `gitHubToken` option, with logged-in-user fallback off. The runtime also gets an empty, app-owned GitHub CLI config. The token is held in memory only and re-read every 10 minutes or on **Refresh connection**; the app never logs, prints, or writes it.
+- Before each model list or reply, the app checks that the runtime resolved the credential to the configured account. Any mismatch blocks the request.
+
+Choose the account in `.env.local`. Otherwise it is the account last signed in with `npm run copilot:login`:
+
+```dotenv
+MODEL_CHAT_COPILOT_LOGIN=your-github-login
+```
+
+Check the connection and the account in use, without a model call:
 
 ```powershell
 npm run check:copilot
 ```
 
-If sign-in is unavailable:
+If sign-in is unavailable, or `check:copilot` reports a missing or different account:
 
 ```powershell
 npm run copilot:login
 ```
 
-This launches the installed `copilot login` command with an app-specific `COPILOT_HOME`. Follow its official browser/device sign-in flow, then use **Refresh connection** in the app. If `copilot` is not installed, install the official [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/copilot-cli) first. The SDK itself bundles the matching runtime for generation. Corporate policy, subscription entitlements, network access, and usage limits still apply.
+This launches the installed `copilot login` command with an app-specific `COPILOT_HOME`. Sign in as the configured account through its official browser/device flow, then use **Refresh connection** in the app. If `copilot` is not installed, install the official [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/copilot-cli) first. The SDK itself bundles the matching runtime for generation. Corporate policy, subscription entitlements, network access, and usage limits still apply.
+
+App users see only a generic "missing or does not match its configured account" message; account names appear only in the owner's `check:copilot` output.
+
+Limitations:
+- The credential store entry is per Windows user and per account. Signing that account out with `copilot logout`, in any Copilot CLI on this PC, removes it for the app too. Run `npm run copilot:login` again afterwards.
+- The account roster API is marked experimental in SDK 1.0.28 and may change with SDK updates.
+- `MODEL_CHAT_COPILOT_HOME` moves the app's Copilot runtime folder; the browser tests use it to share this sign-in.
+
+`npm run test:copilot-account` proves the isolation without changing your real `gh` state. It points the GitHub CLI config at a fake one with a different active account and fake tokens, then checks that the app still lists models as the configured account and that a mismatched account fails. It lists models only and makes no model request.
 
 `npm run check:copilot -- --chat` additionally makes **one small, real, billable model request**. The UI and scripts never produce pretend model answers. Model choices come from `client.listModels()`, filtered by policy and a usable advertised context limit; entries reporting only zero/unknown capacity (including the current Auto routing entry) are omitted rather than inventing a context size. Choices can differ from those in the desktop app. A failed connection, model restriction, empty answer, or exhausted allowance is shown explicitly.
 
