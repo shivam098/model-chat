@@ -63,8 +63,15 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
         security.record(access, "account.security", null, "denied", "acting_security_change", true);
         throw new AppError(403, "Return to your own workspace before changing authentication.");
       }
-      if (!((method === "POST" && ["sign-up/email", "sign-in/email", "sign-out"].includes(endpoint)) ||
+      const twoFactorManage = ["two-factor/enable", "two-factor/disable"].includes(endpoint);
+      if (!((method === "POST" && ["sign-up/email", "sign-in/email", "sign-out", "two-factor/verify-totp", "two-factor/verify-backup-code"].includes(endpoint)) ||
+          (method === "POST" && twoFactorManage) ||
           (method === "GET" && endpoint === "get-session"))) throw new AppError(404, "Endpoint not found.");
+      // Only the superuser manages two-step verification (it guards remote coding); verifying a code is part of anyone's sign-in.
+      if (twoFactorManage && (!access || security.check(access).appRole !== "superuser")) {
+        if (access) security.record(access, "account.two_factor", null, "denied", "not_superuser", true);
+        throw new AppError(access ? 403 : 401, access ? "Only the superuser account uses two-step verification." : "Sign in first.");
+      }
       if (method === "POST") {
         const body = endpoint === "sign-up/email"
           ? JSON.stringify(await readJson(request, signupSchema, 16 * 1024))
@@ -74,6 +81,9 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
         request = new Request(request.url, { method, headers, body });
       }
       const response = await auth.handler(request);
+      if (response.ok && access && (twoFactorManage || (endpoint === "two-factor/verify-totp" && session))) {
+        security.record(access, endpoint === "two-factor/enable" ? "account.two_factor.setup" : endpoint === "two-factor/disable" ? "account.two_factor.off" : "account.two_factor.on", access.actor.id, "allowed", null, true);
+      }
       if (response.ok && session && endpoint === "sign-out") {
         if (access?.delegationId) security.record(access, "acting.stop", access.subject.id, "allowed", "logout", true);
         security.logout(session.user.id, session.session.id);

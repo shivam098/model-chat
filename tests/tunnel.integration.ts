@@ -12,6 +12,7 @@ import os from "node:os";
 import Database from "better-sqlite3";
 import { Store } from "../lib/store";
 import { AccessService } from "../lib/access";
+import { totp } from "./totp";
 
 function directRequest(url: string, init: { method?: string; headers?: Record<string, string>; body?: string } = {}): Promise<Response> {
   return new Promise((resolve, reject) => {
@@ -244,6 +245,49 @@ test("tunnel mode allows email/password signup without OTP and preserves secure 
     assert.equal((await (await fetch(local + "/api/code/status", { headers: { cookie: userCookie } })).json()).available, false);
     assert.equal((await fetch(local + "/api/code/projects", { headers: { cookie: userCookie } })).status, 403, "Ordinary accounts can't use coding mode, even locally");
     assert.equal((await fetch(local + `/api/chats/${codeChatId}`, { headers: { cookie: userCookie } })).status, 404);
+
+    // Remote coding: once the owner turns it on, it still needs two-step verification and a sign-in that used it.
+    writeFileSync(path.join(directory, "coding-remote.json"), JSON.stringify({ enabled: true }));
+    const needsFactor = await (await directRequest(local + "/api/code/status", { headers: { ...headers, cookie } })).json();
+    assert.equal(needsFactor.available, false);
+    assert.match(needsFactor.reason, /two-step verification on your account/);
+    assert.equal((await fetch(local + "/api/auth/two-factor/enable", { method: "POST", headers: { ...json, cookie: userCookie }, body: JSON.stringify({ password }) })).status, 403, "Ordinary accounts don't manage two-step verification");
+    const enable = await fetch(local + "/api/auth/two-factor/enable", { method: "POST", headers: { ...json, cookie: ownerCookie }, body: JSON.stringify({ password }) });
+    assert.equal(enable.status, 200, await enable.clone().text());
+    const { totpURI, backupCodes } = await enable.json() as { totpURI: string; backupCodes: string[] };
+    const secret = new URL(totpURI).searchParams.get("secret")!;
+    assert.ok(secret && backupCodes.length >= 8);
+    const turnedOn = await fetch(local + "/api/auth/two-factor/verify-totp", { method: "POST", headers: { ...json, cookie: ownerCookie }, body: JSON.stringify({ code: totp(secret) }) });
+    assert.equal(turnedOn.status, 200, await turnedOn.clone().text());
+    const stale = await (await directRequest(local + "/api/code/status", { headers: { ...headers, cookie } })).json();
+    assert.equal(stale.twoFactorEnabled, true);
+    assert.equal(stale.available, false, "A session from before two-step verification doesn't count");
+    assert.match(stale.reason, /Sign out and sign in again/);
+    const pending = await directRequest(local + "/api/auth/sign-in/email", { method: "POST", headers, body: JSON.stringify({ email: "tunnel-test@example.test", password }) });
+    assert.equal(pending.status, 200);
+    assert.equal((await pending.json()).twoFactorRedirect, true, "A password alone no longer signs in");
+    const challenge = pending.headers.getSetCookie().map(value => value.split(";")[0]).filter(value => /two_factor=./.test(value)).join("; ");
+    assert.ok(challenge);
+    assert.equal((await directRequest(local + "/api/account", { headers: { ...headers, cookie: challenge } })).status, 401);
+    const wrong = String((Number(totp(secret)) + 500_000) % 1_000_000).padStart(6, "0");
+    assert.notEqual((await directRequest(local + "/api/auth/two-factor/verify-totp", { method: "POST", headers: { ...headers, cookie: challenge }, body: JSON.stringify({ code: wrong }) })).status, 200);
+    const verified = await directRequest(local + "/api/auth/two-factor/verify-totp", { method: "POST", headers: { ...headers, cookie: challenge }, body: JSON.stringify({ code: totp(secret) }) });
+    assert.equal(verified.status, 200, await verified.clone().text());
+    const factorCookie = verified.headers.getSetCookie().map(value => value.split(";")[0]).filter(value => /session_token=./.test(value)).join("; ");
+    const verifiedStatus = await (await directRequest(local + "/api/code/status", { headers: { ...headers, cookie: factorCookie } })).json();
+    assert.equal(verifiedStatus.available, true, JSON.stringify(verifiedStatus));
+    assert.equal((await directRequest(local + "/api/code/projects", { headers: { ...headers, cookie: factorCookie } })).status, 200);
+    assert.equal((await directRequest(local + "/api/code/projects", { headers: { ...headers, cookie } })).status, 403);
+    writeFileSync(path.join(directory, "coding-remote.json"), JSON.stringify({ enabled: false }));
+    assert.equal((await directRequest(local + "/api/code/projects", { headers: { ...headers, cookie: factorCookie } })).status, 403, "Turning remote coding off refuses it again");
+    // Turning two-step verification off ends what the verified session allowed.
+    writeFileSync(path.join(directory, "coding-remote.json"), JSON.stringify({ enabled: true }));
+    const disabled = await directRequest(local + "/api/auth/two-factor/disable", { method: "POST", headers: { ...headers, cookie: factorCookie }, body: JSON.stringify({ password }) });
+    assert.equal(disabled.status, 200);
+    const rotated = disabled.headers.getSetCookie().map(value => value.split(";")[0]).filter(value => /session_token=./.test(value)).join("; ");
+    assert.equal((await directRequest(local + "/api/code/projects", { headers: { ...headers, cookie: factorCookie } })).status, 401, "The verified session is replaced");
+    assert.ok(rotated, "Turning it off keeps you signed in with a new session");
+    assert.equal((await directRequest(local + "/api/code/projects", { headers: { ...headers, cookie: rotated } })).status, 403, "...which can't use remote coding");
   } finally {
     await stop();
     await rm(directory, { recursive: true, force: true });

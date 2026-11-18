@@ -9,7 +9,7 @@ import { dictationConstructor, voiceError, type Dictation, type VoiceWindow } fr
 import { DEMOS, type DemoId } from "@/lib/demos";
 import type { AccountView, AppUser } from "@/lib/access";
 import { AdminPanel } from "./admin-panel";
-import { CodeCard, CodePanel, ProjectPicker, folderName, mergeCodeEvent, type CodingStatus, type Decision, type PanelTab } from "./code-mode";
+import { CodeCard, CodePanel, ProjectPicker, TwoFactorSettings, folderName, mergeCodeEvent, type CodingStatus, type Decision, type PanelTab } from "./code-mode";
 
 type User = AppUser;
 type Transfer = { id: string; name: string; progress: number; fileId?: string; error?: string; active: boolean };
@@ -1080,7 +1080,7 @@ export function ChatApp() {
       </div>
     </main>
     {codeChat && codePanel && detail && <CodePanel chatId={detail.chat.id} project={detail.chat.projectPath || ""} events={detail.codeEvents || []} live={Boolean(detail.codeLive) || replyRunning}
-      tab={codePanel} appPort={codeStatus?.localUrl.split(":").pop() || "3210"} api={api} onTab={setCodePanel} onClose={() => setCodePanel(null)}
+      tab={codePanel} appPort={codeStatus?.localUrl.split(":").pop() || "3210"} remote={codeStatus?.via === "tunnel"} api={api} onTab={setCodePanel} onClose={() => setCodePanel(null)}
       onChanged={() => void refreshChat(detail.chat.id).catch(report)} onError={report} />}
     {projectPicker && <Dialog title="Open a project" onClose={() => setProjectPicker(false)}>
       <ProjectPicker api={api} root={codeStatus?.projectsRoot || null} onOpen={openCodeChat} />
@@ -1098,6 +1098,7 @@ export function ChatApp() {
       </div>
       <div className="settings-section"><h3><Code2 size={16} /> Code runner</h3><p>{sandboxInfo?.message || "Checking the code runner..."}</p>{sandboxInfo?.ready && <><p>Ask for a PDF report, chart, GIF/MP4 animation, or Word/Excel/PowerPoint file. The model writes Python that runs in a disposable Linux sandbox on this computer (WSL). Each run has <strong>no internet or network access</strong>, cannot install packages, cannot see Windows, other chats or other users, and is deleted afterwards. Only files from this chat that the model selects are copied in.{sandboxInfo.limits && <> Limits per run: about {sandboxInfo.limits.wallSeconds} seconds, {sandboxInfo.limits.cpus} CPUs, {Math.round(sandboxInfo.limits.memoryBytes / 1024 ** 3)} GB memory, {Math.round(sandboxInfo.limits.workBytes / 1024 ** 2)} MB scratch space and {sandboxInfo.limits.outputFiles} output files; up to 8 runs per reply.</>}</p><p>Available libraries: {sandboxInfo.libraries.join(", ")}. Only the host owner can add libraries, using a command on this computer; they cannot be installed from chat.</p><p>Results are attached to the reply as downloads. PNG/JPEG/GIF/WebP images, MP4/WebM videos and PDFs also get previews; other types such as HTML or SVG are download-only. Generated code can be wrong; check important results. Runs use the host owner&apos;s Copilot quota like any message.</p></>}</div>
       {actor?.appRole === "superuser" && !acting && codeStatus && <div className="settings-section"><h3><FolderOpen size={16} /> Coding mode</h3><p>{codeStatus.available ? <>Available in this browser. Choose Code in the message box to work on a project folder{codeStatus.projectsRoot ? <> (new projects go in <code>{codeStatus.projectsRoot}</code>)</> : null}. The model uses this computer&apos;s own tools; every command, file change and web fetch waits for your approval, and Model Chat&apos;s data, .env files and credentials are always blocked.</> : codeStatus.reason}</p><p>Only the superuser account can use it, never while acting as someone else. It works only from a browser on this computer{codeStatus.remoteEnabled ? "; remote use is turned on and needs two-step verification" : ", not through the shared link"}.</p></div>}
+      {actor?.appRole === "superuser" && !acting && codeStatus && <div className="settings-section"><h3><ShieldCheck size={16} /> Two-step verification</h3><TwoFactorSettings status={codeStatus} api={api} onChanged={() => void api<CodingStatus>("/api/code/status").then(setCodeStatus).catch(report)} /></div>}
       <div className="settings-section"><h3><Mic size={16} /> Local audio/video processing</h3><p>{mediaInfo?.message || "Checking local media configuration..."} {mediaInfo?.ready && <>Whisper model: {mediaInfo.model}, running on this computer&apos;s CPU.</>}</p><p>MP3, WAV, M4A, AAC, FLAC, OGG, OPUS, MP4, MOV, WEBM, MKV and AVI are accepted when their streams are decodable. Speech becomes a machine transcript; video also supplies up to four still frames. Copilot receives those extracted inputs when you press Send, not native audio/video. Transcription can be imperfect, and unsampled visual events may be missed.</p><p>One recording and one document can process at a time; others wait in a durable queue. No media-duration or overall-processing deadline is imposed. Long recordings are decoded/transcribed in bounded-memory windows, and processing may take a long time. Closing the browser does not discard accepted uploads. Interrupted jobs resume from the beginning after a server restart. Administrator-created delegated jobs stop if that administrator loses access or signs out. Transcription uses installed local packages/cached weights, without a speech API key. Public-link uploads pass through Cloudflare.</p></div>
       <div className="settings-section"><h3><ShieldCheck size={16} /> Administrator access</h3><p>The app superuser can view users&apos; chat sessions and files and act as a user to send messages or modify chats. An audit log records the real actor, effective user, action, object IDs, time and outcome—not prompt/file contents or credentials. {acting && <>You are still signed in as {actor?.email}; signing out ends that real login session.</>}</p></div>
       <div className="settings-section"><h3><Mic size={16} /> Voice and passwords</h3><p>Dictation uses browser speech recognition, not a realtime audio model. Your browser may send microphone audio to its speech provider. Read-aloud uses your browser&apos;s voices, which may also use an online service. Text works without either feature.</p><p>No email verification, password reset, or recovery service is configured. Use a unique password and keep a local backup. A temporary shared preview is not production hosting.</p></div>
@@ -1127,17 +1128,44 @@ function AuthScreen({ onSuccess, notice, access, onMenu }: { onSuccess: (account
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  // After a correct password on an account with two-step verification, the server waits for a code before creating a session.
+  const [challenge, setChallenge] = useState<null | "totp" | "backup">(null);
+  const [code, setCode] = useState("");
   async function submit(event: FormEvent) {
     event.preventDefault(); setBusy(true); setError("");
     try {
-      await requestJson(`/api/auth/${signup ? "sign-up" : "sign-in"}/email`, {
-        method: "POST", body: JSON.stringify({ email: email.trim(), password }),
-      });
+      if (challenge) {
+        await requestJson(`/api/auth/two-factor/${challenge === "totp" ? "verify-totp" : "verify-backup-code"}`, {
+          method: "POST", body: JSON.stringify({ code: code.replace(/\s/g, "") }),
+        });
+      } else {
+        const signedIn = await requestJson<{ twoFactorRedirect?: boolean }>(`/api/auth/${signup ? "sign-up" : "sign-in"}/email`, {
+          method: "POST", body: JSON.stringify({ email: email.trim(), password }),
+        });
+        if (signedIn?.twoFactorRedirect) { setChallenge("totp"); setCode(""); setPassword(""); return; }
+      }
       const result = await requestJson<AccountView>("/api/account");
-      setPassword(""); onSuccess(result);
+      setPassword(""); setCode(""); setChallenge(null); onSuccess(result);
     } catch (cause) { setError(message(cause)); }
     finally { setBusy(false); }
   }
+  if (challenge) return <main className="auth-page">
+    <section className="auth-side auth-only">
+      <form className="auth-card" onSubmit={submit}>
+        <div className="auth-mobile-brand"><Brand /></div>
+        <h2>Two-step verification</h2>
+        <p>{challenge === "totp" ? "Enter the 6-digit code from your authenticator app." : "Enter one of your backup codes. Each one works once."}</p>
+        {error && <div className="auth-error" role="alert">{error}</div>}
+        <label htmlFor="code">{challenge === "totp" ? "Authentication code" : "Backup code"}</label>
+        <input id="code" autoComplete="one-time-code" inputMode={challenge === "totp" ? "numeric" : "text"} autoFocus value={code} onChange={event => setCode(event.target.value)} required maxLength={32} placeholder={challenge === "totp" ? "123456" : "Backup code"} />
+        <button className="primary-button auth-submit" disabled={busy || !code.trim()}>{busy ? <LoaderCircle className="spin" size={16} aria-label="Verifying" /> : "Verify"}</button>
+        <div className="auth-toggle">
+          <button type="button" onClick={() => { setChallenge(challenge === "totp" ? "backup" : "totp"); setCode(""); setError(""); }}>{challenge === "totp" ? "Use a backup code" : "Use your authenticator app"}</button>
+          <button type="button" onClick={() => { setChallenge(null); setCode(""); setError(""); }}>Back to sign in</button>
+        </div>
+      </form>
+    </section>
+  </main>;
   return <main className="auth-page">
     <button className="menu-button auth-menu" type="button" onClick={onMenu}><Menu size={16} /><span>Menu</span></button>
     <section className="auth-story">

@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { Activity, Ban, Check, ExternalLink, FileDiff, FolderOpen, FolderPlus, Globe, LoaderCircle, RefreshCw, ShieldAlert, Square, Terminal, X } from "lucide-react";
 import type { CodeEvent } from "@/lib/contracts";
 
-export interface CodingStatus { available: boolean; reason: string | null; via: string; remoteEnabled: boolean; platform: string; projectsRoot: string | null; localUrl: string }
+export interface CodingStatus { available: boolean; reason: string | null; via: string; remoteEnabled: boolean; twoFactorEnabled: boolean; secondFactorVerified: boolean; platform: string; projectsRoot: string | null; localUrl: string }
 export type Decision = "once" | "session" | "deny";
 export type PanelTab = "changes" | "terminal" | "preview" | "processes";
 type Api = <T>(url: string, init?: RequestInit) => Promise<T>;
@@ -83,8 +83,8 @@ export function CodeCard({ event, live, deciding, onDecide }: { event: CodeEvent
   </div>;
 }
 
-export function CodePanel({ chatId, project, events, live, tab, appPort, api, onTab, onClose, onChanged, onError }: {
-  chatId: string; project: string; events: CodeEvent[]; live: boolean; tab: PanelTab; appPort: string; api: Api;
+export function CodePanel({ chatId, project, events, live, tab, appPort, remote, api, onTab, onClose, onChanged, onError }: {
+  chatId: string; project: string; events: CodeEvent[]; live: boolean; tab: PanelTab; appPort: string; remote: boolean; api: Api;
   onTab: (tab: PanelTab) => void; onClose: () => void; onChanged: () => void; onError: (error: unknown) => void;
 }) {
   const [processes, setProcesses] = useState<Process[] | null>(null);
@@ -148,7 +148,7 @@ export function CodePanel({ chatId, project, events, live, tab, appPort, api, on
         <header><Terminal size={16} aria-hidden="true" /><code>{text(event.data.command)}</code><Badge status={statusOf(event, live)} /></header>
         {text(event.data.output) && <pre className="terminal-output">{text(event.data.output)}</pre>}
       </section>) : <p className="panel-empty">Commands and their output appear here.</p>)}
-      {tab === "preview" && <div className="preview-pane">
+      {tab === "preview" && (remote ? <p className="panel-empty">Previews open only in a browser on the computer running Model Chat, so they aren&apos;t available over the shared link. Ask the model for test output or screenshots instead.</p> : <div className="preview-pane">
         {ports.length > 0 && <div className="preview-ports">{ports.map(value => <button key={value} type="button" className="secondary-button" disabled={opening} onClick={() => void open(value)}><Globe size={16} /> Port {value}</button>)}</div>}
         <form className="preview-form" onSubmit={submitPort}>
           <label htmlFor="preview-port">Dev server port</label>
@@ -162,7 +162,7 @@ export function CodePanel({ chatId, project, events, live, tab, appPort, api, on
           </div>
           <iframe key={frame} className="preview-frame" title={`Preview of port ${preview.port}`} src={preview.url} sandbox="allow-scripts allow-forms allow-same-origin allow-popups allow-modals" />
         </> : <p className="panel-empty">Previews show a dev server running on this computer, through a private address only this browser can open. Ask the model to start one, then pick its port.</p>}
-      </div>}
+      </div>)}
       {tab === "processes" && <div>
         <div className="preview-bar"><span>Background commands</span><button type="button" className="icon-button" aria-label="Refresh processes" title="Refresh" disabled={loading} onClick={() => void loadProcesses()}><RefreshCw size={16} /></button></div>
         {!live && <p className="panel-empty">No coding session is running for this chat, so nothing is running in the background.</p>}
@@ -220,5 +220,64 @@ export function ProjectPicker({ api, root, onOpen }: { api: Api; root: string | 
       <div><input id="project-folder" placeholder="Full path of an existing folder" value={folder} maxLength={1024} onChange={event => setFolder(event.target.value)} />
         <button type="submit" className="secondary-button" disabled={working || !folder.trim()}><FolderOpen size={16} /> Open</button></div>
     </form>
+  </div>;
+}
+
+/** Superuser two-step verification: authenticator-app codes plus one-time backup codes. Remote coding requires it. */
+export function TwoFactorSettings({ status, api, onChanged }: { status: CodingStatus; api: Api; onChanged: () => void }) {
+  const [step, setStep] = useState<"idle" | "password-on" | "scan" | "codes" | "password-off">("idle");
+  const [password, setPassword] = useState("");
+  const [code, setCode] = useState("");
+  const [setup, setSetup] = useState<{ uri: string; secret: string; backupCodes: string[] } | null>(null);
+  const [error, setError] = useState("");
+  const [working, setWorking] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const run = async (action: () => Promise<void>) => {
+    setWorking(true); setError("");
+    try { await action(); } catch (cause) { setError(problem(cause)); } finally { setWorking(false); }
+  };
+  const start = (event: FormEvent) => { event.preventDefault(); void run(async () => {
+    const result = await api<{ totpURI: string; backupCodes: string[] }>("/api/auth/two-factor/enable", { method: "POST", body: JSON.stringify({ password }) });
+    setSetup({ uri: result.totpURI, secret: new URL(result.totpURI).searchParams.get("secret") || "", backupCodes: result.backupCodes });
+    setPassword(""); setCode(""); setStep("scan");
+  }); };
+  const confirm = (event: FormEvent) => { event.preventDefault(); void run(async () => {
+    await api("/api/auth/two-factor/verify-totp", { method: "POST", body: JSON.stringify({ code: code.replace(/\s/g, "") }) });
+    setCode(""); setStep("codes"); onChanged();
+  }); };
+  const turnOff = (event: FormEvent) => { event.preventDefault(); void run(async () => {
+    await api("/api/auth/two-factor/disable", { method: "POST", body: JSON.stringify({ password }) });
+    setPassword(""); setStep("idle"); onChanged();
+  }); };
+  const passwordForm = (label: string, onSubmit: (event: FormEvent) => void) => <form className="project-form" onSubmit={onSubmit}>
+    <label htmlFor="two-factor-password">Your Model Chat password</label>
+    <div><input id="two-factor-password" type="password" autoComplete="current-password" value={password} onChange={event => setPassword(event.target.value)} required maxLength={128} />
+      <button type="submit" className="secondary-button" disabled={working || !password}>{working ? <LoaderCircle className="spin" size={16} /> : null}{label}</button></div>
+  </form>;
+  return <div className="two-factor">
+    {error && <p className="auth-error" role="alert">{error}</p>}
+    {step === "scan" && setup ? <>
+      <p>In your authenticator app (for example Microsoft Authenticator: <strong>Add account → Other account → Enter code manually</strong>), add <strong>Model Chat</strong> with this key:</p>
+      <code className="totp-key" aria-label="Setup key">{setup.secret.match(/.{1,4}/g)?.join(" ")}</code>
+      <p><a href={setup.uri}>Open in an authenticator app</a> (on a phone with one installed).</p>
+      <form className="project-form" onSubmit={confirm}>
+        <label htmlFor="two-factor-code">Then enter the 6-digit code it shows</label>
+        <div><input id="two-factor-code" inputMode="numeric" autoComplete="one-time-code" value={code} onChange={event => setCode(event.target.value)} required maxLength={12} placeholder="123456" />
+          <button type="submit" className="secondary-button" disabled={working || !code.trim()}>Turn on</button></div>
+      </form>
+    </> : step === "codes" && setup ? <>
+      <p><strong>Two-step verification is on.</strong> Save these backup codes somewhere safe. Each one signs you in once if you lose your phone. They won&apos;t be shown again.</p>
+      <ol className="backup-codes">{setup.backupCodes.map(item => <li key={item}><code>{item}</code></li>)}</ol>
+      <div className="approval-actions">
+        <button type="button" onClick={() => void navigator.clipboard?.writeText(setup.backupCodes.join("\n")).then(() => setCopied(true))}>{copied ? "Copied" : "Copy codes"}</button>
+        <button type="button" onClick={() => { setSetup(null); setStep("idle"); }}>Done</button>
+      </div>
+    </> : status.twoFactorEnabled ? <>
+      <p>Two-step verification is <strong>on</strong>: signing in to this account asks for a code from your authenticator app. {status.secondFactorVerified ? "This session was signed in with a code." : "This session was signed in before it was turned on. Sign out and back in to use it for remote coding."}</p>
+      {step === "password-off" ? passwordForm("Turn off", turnOff) : <button type="button" className="secondary-button" onClick={() => { setStep("password-off"); setError(""); }}>Turn off two-step verification</button>}
+    </> : <>
+      <p>Two-step verification is <strong>off</strong>. Turn it on to require a code from an authenticator app each time this account signs in. Remote coding needs it.</p>
+      {step === "password-on" ? passwordForm("Continue", start) : <button type="button" className="secondary-button" onClick={() => { setStep("password-on"); setError(""); }}>Turn on two-step verification</button>}
+    </>}
   </div>;
 }

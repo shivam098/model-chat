@@ -89,7 +89,28 @@ export class Store {
         seq INTEGER NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS app_code_event_chat ON app_code_event(chatId, seq);`);
+    // Sessions created by a verified second factor (authenticator or backup code); remote coding requires one.
+    db.exec("CREATE TABLE IF NOT EXISTS app_second_factor (sessionId TEXT PRIMARY KEY, userId TEXT NOT NULL, verifiedAt INTEGER NOT NULL)");
     installUploadSchema(db);
+  }
+  markSecondFactor(sessionId: string, userId: string) {
+    this.db.transaction(() => {
+      this.db.prepare("DELETE FROM app_second_factor WHERE sessionId NOT IN (SELECT id FROM session)").run();
+      this.db.prepare("INSERT OR REPLACE INTO app_second_factor(sessionId,userId,verifiedAt) VALUES (?,?,?)").run(sessionId, userId, Date.now());
+    })();
+  }
+  clearSecondFactor(userId: string) {
+    this.db.prepare("DELETE FROM app_second_factor WHERE userId=?").run(userId);
+  }
+  /** Whether two-step verification is on for the account (false before the auth tables have that column). */
+  twoFactorEnabled(userId: string) {
+    try { return Boolean((this.db.prepare("SELECT twoFactorEnabled AS on_ FROM user WHERE id=?").get(userId) as { on_: number | null } | undefined)?.on_); }
+    catch { return false; }
+  }
+  /** True only for a live session of this account that was created by a verified second factor while two-step verification is on. */
+  secondFactorVerified(userId: string, sessionId: string) {
+    if (!this.twoFactorEnabled(userId)) return false;
+    return Boolean(this.db.prepare("SELECT 1 FROM app_second_factor f JOIN session s ON s.id=f.sessionId WHERE f.sessionId=? AND f.userId=? AND s.userId=?").get(sessionId, userId, userId));
   }
   recoverInterrupted() {
     this.db.prepare("UPDATE app_message SET status='error', error=? WHERE status='streaming'")

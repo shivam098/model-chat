@@ -1,7 +1,27 @@
-import { betterAuth, type BetterAuthOptions } from "better-auth";
+import { betterAuth, type BetterAuthOptions, type BetterAuthPlugin } from "better-auth";
+import { createAuthMiddleware } from "better-auth/api";
 import { getMigrations } from "better-auth/db/migration";
+import { twoFactor } from "better-auth/plugins";
 import { authSecret, localOrigin, origin, requestVia, tunnelMode } from "./config";
 import { getStore } from "./store";
+
+// Sessions created by a successful authenticator or backup code are recorded, so remote coding can require them.
+const secondFactorSessions = {
+  id: "model-chat-second-factor",
+  hooks: { after: [{
+    matcher: context => context.path === "/two-factor/verify-totp" || context.path === "/two-factor/verify-backup-code",
+    handler: createAuthMiddleware(async ctx => {
+      const created = ctx.context.newSession;
+      if (created) getStore().markSecondFactor(created.session.id, created.user.id);
+    }),
+  }, {
+    matcher: context => context.path === "/two-factor/disable",
+    handler: createAuthMiddleware(async ctx => {
+      const userId = ctx.context.session?.user.id;
+      if (userId) getStore().clearSecondFactor(userId);
+    }),
+  }] },
+} satisfies BetterAuthPlugin;
 
 // "public" serves the configured origin (the HTTPS tunnel in tunnel mode); "local" serves this computer's own
 // browser at the loopback origin. Both share one user/session database but use cookies for their own host only.
@@ -27,6 +47,8 @@ function authOptions(kind: AuthKind) {
       "/sign-in/email": { window: 60, max: 10 },
       "/sign-up/email": { window: 60, max: 5 },
     } },
+    // Two-step verification (authenticator app codes plus one-time backup codes). Only the superuser can turn it on.
+    plugins: [twoFactor({ issuer: "Model Chat" }), secondFactorSessions],
   } satisfies BetterAuthOptions;
 }
 type Auth = ReturnType<typeof betterAuth<ReturnType<typeof authOptions>>>;
