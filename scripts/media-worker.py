@@ -121,8 +121,12 @@ def extract_frames(file, extension, duration):
             return frames
         stream = streams[0]
         width, height = stream.codec_context.width, stream.codec_context.height
-        if not width or not height or max(width, height) > 4096 or width * height > 16_000_000:
-            raise MediaError("Video exceeds the supported 4096-pixel or 16-megapixel frame limits.")
+        if not width or not height:
+            raise MediaError("The video's frame size could not be read. Re-export it as a standard MP4 and upload that.")
+        # Frames are decoded one at a time and shrunk to 960 x 540 at once, so 8K (UHD and DCI) is safe.
+        if max(width, height) > 8192 or width * height > 36_000_000:
+            raise MediaError(f"This video is {width:,} x {height:,} pixels. Model Chat samples frames from videos up to 8K "
+                             "(8,192 pixels on the longest side, 36 megapixels). Export a 4K or 8K copy and upload that.")
         if duration is None or duration <= 0:
             raise MediaError("The video duration could not be determined. Re-export it as a standard MP4.")
         stream.codec_context.thread_count = 2

@@ -4,6 +4,83 @@ import { open, readFile, stat, writeFile } from "node:fs/promises";
 import { freemem } from "node:os";
 
 const maximumText = 30_000;
+// Shown to the user as written; any other image-decoder error is replaced by a plain message.
+class ImageRejection extends Error {}
+const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "webp", "gif"];
+// 16,383 x 16,383, libvips' own default: covers 200 MP phone cameras and very wide panoramas.
+const MAX_IMAGE_PIXELS = 268_402_689;
+// The largest side JPEG, PNG and GIF can encode.
+const MAX_IMAGE_SIDE = 65_535;
+// Progressive JPEG, interlaced PNG, WebP and GIF are decoded whole; baseline JPEG and PNG are decoded in strips.
+const WHOLE_IMAGE_BUDGET = Math.min(1024 ** 3, freemem() / 4);
+// Above 16 MP, an image that would expand to more than 4,096 times its file size is treated as a decompression bomb.
+const BOMB_MIN_PIXELS = 16_000_000;
+const BOMB_EXPANSION = 4096;
+const IMAGE_SECONDS = 120;
+const UNREADABLE_IMAGE = "This image couldn't be read. It may be damaged, cut off during upload, or use an encoding Model Chat can't decode. Open it and export it again as JPEG or PNG, then upload that.";
+const count = value => value.toLocaleString("en-US");
+const megapixels = pixels => `${pixels < 10_000_000 ? (pixels / 1e6).toFixed(1) : count(Math.round(pixels / 1e6))} megapixels`;
+const size = bytes => bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(1)} GB` : bytes >= 1024 ** 2 ? `${Math.round(bytes / 1024 ** 2)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+function wholeImageBytes(kind, meta, pixels) {
+  const channels = meta.channels || 3;
+  if (kind === "jpeg") {
+    if (!meta.isProgressive) return 0;
+    // libjpeg keeps every 16-bit DCT coefficient of a progressive JPEG until its last scan.
+    const samples = { "4:2:0": 1.5, "4:2:2": 2, "4:4:0": 2, "4:2:0:4": 2.5 }[meta.chromaSubsampling] ?? channels;
+    return pixels * samples * 2;
+  }
+  if (kind === "png") return meta.isProgressive ? pixels * channels * ((meta.bitsPerSample || 8) > 8 ? 2 : 1) : 0;
+  return pixels * 4;
+}
+async function imageInput(extension, bytes) {
+  const kind = extension === "jpg" || extension === "jpeg" ? "jpeg" : extension;
+  const valid = kind === "png" ? bytes.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10])) :
+    kind === "jpeg" ? bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff :
+    kind === "gif" ? ["GIF87a", "GIF89a"].includes(bytes.subarray(0, 6).toString("ascii")) :
+    bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP";
+  if (!valid) throw new ImageRejection(`The image bytes do not match the .${extension} extension. Open it and export it again as JPEG or PNG, then upload that.`);
+  const { default: sharp } = await import("sharp");
+  const source = workerData.inputPath || bytes;
+  const fileBytes = workerData.inputPath ? (await stat(workerData.inputPath)).size : source.length;
+  let meta;
+  // Reads only the header, so the limits below are checked before any pixels are decoded.
+  try { meta = await sharp(source, { limitInputPixels: false, animated: false }).metadata(); }
+  catch { throw new ImageRejection(UNREADABLE_IMAGE); }
+  const { width, height } = meta;
+  if (!width || !height) throw new ImageRejection(UNREADABLE_IMAGE);
+  if ((meta.pages || 1) !== 1) throw new ImageRejection("Animated images are not supported. Upload a still PNG or JPEG frame.");
+  const pixels = width * height;
+  const dimensions = `${count(width)} × ${count(height)} pixels (${megapixels(pixels)})`;
+  if (pixels > MAX_IMAGE_PIXELS || width > MAX_IMAGE_SIDE || height > MAX_IMAGE_SIDE) {
+    throw new ImageRejection(`This image is ${dimensions}. Model Chat accepts up to 268 megapixels and 65,535 pixels per side, enough for 200 MP phone photos and most panoramas. Export a smaller copy and upload that.`);
+  }
+  if (pixels > BOMB_MIN_PIXELS && pixels * (meta.channels || 3) > fileBytes * BOMB_EXPANSION) {
+    throw new ImageRejection(`This file is only ${size(fileBytes)} but claims to hold ${dimensions}. Files like this are usually built to exhaust memory, so it was not opened. If it's a real picture, export it again as JPEG and upload that.`);
+  }
+  const whole = wholeImageBytes(kind, meta, pixels);
+  if (whole > WHOLE_IMAGE_BUDGET) {
+    const format = kind === "jpeg" ? "progressive JPEG" : kind === "png" ? "interlaced PNG" : kind.toUpperCase();
+    throw new ImageRejection(`This ${format} is ${dimensions} and must be decoded all at once, which needs about ${size(whole)} of memory (the limit is ${size(WHOLE_IMAGE_BUDGET)}). Export it as a standard JPEG or a smaller copy and upload that.`);
+  }
+  const image = sharp(source, { limitInputPixels: MAX_IMAGE_PIXELS, failOn: "error", animated: false }).timeout({ seconds: IMAGE_SECONDS });
+  let analysisBytes;
+  try {
+    // A square box gives the same result before or after orientation, so libvips can shrink while decoding.
+    if (workerData.inputPath) analysisBytes = await image.autoOrient().resize(2048, 2048, { fit: "inside", withoutEnlargement: true }).flatten({ background: "white" }).jpeg({ quality: 85 }).toBuffer();
+    else await image.resize(32, 32, { fit: "inside" }).toBuffer();
+  } catch (error) {
+    if (/timeout/i.test(error instanceof Error ? error.message : "")) {
+      throw new ImageRejection(`Decoding this image took longer than ${IMAGE_SECONDS / 60} minutes, so it was stopped. Export a smaller JPEG copy and upload that.`);
+    }
+    throw new ImageRejection(UNREADABLE_IMAGE);
+  }
+  const shown = meta.autoOrient || { width, height };
+  return { text: `[Native image input: ${shown.width} x ${shown.height}. Its pixels are supplied separately to a vision-capable model.]`,
+    notes: analysisBytes
+      ? `Native Copilot image input, sent to the model as a copy at most 2048 pixels on its longest side. A vision-capable model is required; the original file is kept.`
+      : "Native Copilot image input. A vision-capable model is required; original bytes are retained.",
+    mimeType: `image/${kind}`, ...(analysisBytes ? { analysisBytes } : {}) };
+}
 function bounded(text) {
   if (!workerData.outputPath && text.length > maximumText) throw new Error("The extracted file exceeds 30,000 characters. Upload a smaller excerpt.");
   return text;
@@ -59,7 +136,7 @@ async function checkArchive(buffer, expected) {
 async function extract() {
   const extension = workerData.extension;
   let bytes;
-  if (workerData.inputPath && ["png", "jpg", "jpeg", "webp", "gif"].includes(extension)) {
+  if (workerData.inputPath && IMAGE_EXTENSIONS.includes(extension)) {
     const file = await open(workerData.inputPath, "r");
     try { bytes = Buffer.alloc(32); await file.read(bytes, 0, 32, 0); } finally { await file.close(); }
   } else if (workerData.inputPath) {
@@ -67,26 +144,7 @@ async function extract() {
     if (info.size > Math.min(freemem() / 8, 512 * 1024 * 1024)) throw new Error("This document cannot be decoded within the isolated parser's available-memory budget. The original upload is retained.");
     bytes = await readFile(workerData.inputPath);
   } else bytes = Buffer.from(workerData.bytes);
-  if (["png", "jpg", "jpeg", "webp", "gif"].includes(extension)) {
-    const kind = extension === "jpg" || extension === "jpeg" ? "jpeg" : extension;
-    const valid = kind === "png" ? bytes.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10])) :
-      kind === "jpeg" ? bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff :
-      kind === "gif" ? ["GIF87a", "GIF89a"].includes(bytes.subarray(0, 6).toString("ascii")) :
-      bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP";
-    if (!valid) throw new Error("The image bytes do not match the file extension.");
-    const { default: sharp } = await import("sharp");
-    const image = sharp(workerData.inputPath || bytes, { limitInputPixels: 16_000_000, failOn: "error", animated: false });
-    const meta = await image.metadata();
-    if (!meta.width || !meta.height || meta.width > 8192 || meta.height > 8192 || meta.width * meta.height > 16_000_000) throw new Error("The image exceeds the 16-megapixel or 8192-pixel dimension limit.");
-    if ((meta.pages || 1) !== 1) throw new Error("Animated images are not supported. Upload a still PNG or JPEG frame.");
-    const analysisBytes = workerData.inputPath
-      ? await image.rotate().resize(2048, 2048, { fit: "inside", withoutEnlargement: true }).flatten({ background: "white" }).jpeg({ quality: 85 }).toBuffer()
-      : undefined;
-    if (!analysisBytes) await image.resize(32, 32, { fit: "inside" }).toBuffer();
-    return { text: `[Native image input: ${meta.width} x ${meta.height}. Its pixels are supplied separately to a vision-capable model.]`,
-      notes: "Native Copilot image input. A vision-capable model is required; original bytes are retained.",
-      mimeType: `image/${kind}`, ...(analysisBytes ? { analysisBytes } : {}) };
-  }
+  if (IMAGE_EXTENSIONS.includes(extension)) return imageInput(extension, bytes);
   if (["txt", "md", "csv", "json", "log", "yaml", "yml", "xml"].includes(extension)) {
     let text;
     try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
@@ -172,5 +230,6 @@ try {
 } catch (error) {
   const known = error instanceof Error ? error.message : "";
   const safe = /limit|exceed|not |must |need OCR|No selectable|UTF-8|empty|binary|macros|damaged|encrypted/i.test(known);
-  parentPort.postMessage({ ok: false, error: safe ? known.slice(0, 220) : "The file could not be read. It may be damaged, encrypted, or unsupported." });
+  parentPort.postMessage({ ok: false, error: error instanceof ImageRejection ? known.slice(0, 400)
+    : safe ? known.slice(0, 220) : "The file could not be read. It may be damaged, encrypted, or unsupported." });
 }

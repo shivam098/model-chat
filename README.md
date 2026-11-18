@@ -205,7 +205,7 @@ Three examples are provided: **Explore a sample budget** (small synthetic CSV), 
 |---|---|
 | Text | `.txt`, `.md`, `.csv`, `.json`; UTF-8 only; syntax is treated as text |
 | Additional text | `.log`, `.yaml`, `.yml`, `.xml`; treated as UTF-8 data, never executed |
-| Native images | PNG, JPEG, WebP, static GIF; decoded-image safety limit 16 megapixels / 8192 pixels per dimension; normalized JPEG for model input; requires a vision model |
+| Native images | PNG, JPEG, WebP, static GIF up to 268 megapixels and 65,535 pixels per side (covers 200 MP phone photos and wide panoramas); EXIF orientation applied; the model gets a JPEG copy at most 2048 pixels on its longest side, the original is kept; requires a vision model. See "Large images" below |
 | Audio | MP3, WAV, M4A, AAC, FLAC, OGG and OPUS; local machine transcript with approximate timestamps |
 | Video | MP4, MOV, WEBM, MKV and AVI with decodable streams; speech transcript plus up to 4 sampled JPEG frames; requires a vision model |
 | PDF | Selectable text; page markers included; isolated parser memory budget applies |
@@ -215,10 +215,31 @@ Three examples are provided: **Explore a sample budget** (small synthetic CSV), 
 | Storage | Actual host disk capacity, with a 1 GiB reserve/write-overhead allowance; at most 100 chats / 100 turns per chat |
 | Messages | 8,000 input characters; 32,000 output characters; full context capped at 100,000 UTF-8 bytes and a conservative model-specific budget |
 | Processing | One document lane, 512 MB JS worker heap; archive preflight: 2,000 entries, bounded compression ratio, expanded size within available-memory/128 MiB safety budget; no overall deadline |
-| Media processing | One local worker; bounded-memory audio windows, no duration/deadline cutoff; video dimensions at most 4096 / 16 MP; up to 4 sampled frames, each at most 512 KB |
+| Media processing | One local worker; bounded-memory audio windows, no duration/deadline cutoff; video up to 8K (8,192 pixels on the longest side, 36 megapixels), decoded one frame at a time; up to 4 sampled frames, each at most 512 KB |
 | Generation | One reply per account/actor, two per app; sequential overflow-analysis requests stay inside that reply slot; four-minute deadline per model request, cancellable as one turn |
 
 Images use the official SDK's native base64 blob attachments. Original bytes remain in owned SQLite storage; current images use the existing normalized model-input representation. Legacy images remain unchanged. Model-specific MIME, per-request count and byte limits are checked. Prior images use retained evidence instead of consuming the new turn's image allowance. Cancelling or losing delegated access stops all remaining analysis/synthesis requests, keeps accepted chat history, and preserves only completed authorized analyses.
+
+### Large images
+
+Uploads are decoded in the background in an isolated worker, one image at a time. The header is checked before any pixels are decoded:
+
+- **Size:** at most 268 megapixels (16,383 x 16,383, libvips' own default) and 65,535 pixels per side, the most JPEG, PNG and GIF can store. Phones top out at about 200 MP, and panoramas such as 60,000 x 4,000 fit.
+- **Memory:** baseline JPEG and ordinary PNG are decoded in strips, and JPEG shrinks while decoding. Progressive JPEG, interlaced PNG, WebP and GIF must be decoded all at once, so their estimated decode memory must stay under 1 GB, or a quarter of free memory if that is lower.
+- **Decompression bombs:** above 16 MP, a file that would expand to more than 4,096 times its size is rejected. Photos expand tens of times and flat screenshots rarely reach 1,000 times; crafted files expand far more.
+- **Time:** decoding stops after 2 minutes.
+
+Measured on this PC (whole process, including about 125 MB for Node.js):
+
+| Image | Time | Peak memory |
+|---|---|---|
+| 48 MP baseline JPEG | 1.5 s | 0.23 GB |
+| 200 MP baseline JPEG | 1.6 s | 0.22 GB |
+| 268 MP PNG | 5 s | 0.57 GB |
+| 60,000 x 4,000 PNG panorama | 2.6 s | 0.84 GB |
+| 268 MP progressive JPEG | 2.4 s | 1.0 GB |
+
+Rejections say what is wrong and what to do, for example "export a smaller copy" or "export it again as JPEG". Library error text is never shown.
 
 Scanned PDFs need OCR, which is **not** included. Password-protected documents, executable/ZIP uploads, network playlists, legacy `.doc`/`.xls`, charts and animated images are **not** supported. Media containers/codecs must be decodable by the installed PyAV. Files are never executed, and decoding disallows network protocols and external media references. The installed Copilot SDK's native input is still images; the app now supplies local transcripts and sampled video frames for audio/video files. Spreadsheet formulas are not executed; missing cached formula results are omitted. Extraction may lose information, so check answers against the original.
 
