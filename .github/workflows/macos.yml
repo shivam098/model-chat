@@ -44,11 +44,15 @@ jobs:
           node -e 'const s = require("./status.json"); console.log(s.autoRestart); if (!s.autoRestart.installed) process.exit(1)'
           node scripts/tunnel.mjs autorestart-off
           test ! -f ~/Library/LaunchAgents/com.modelchat.autorestart.plist
-      - name: Remote coding switch refuses without two-step verification
+      - name: Remote coding switch needs --yes, then turns on and off
         run: |
           node scripts/code-remote.mjs status
-          if node scripts/code-remote.mjs on --yes; then exit 1; fi
+          if node scripts/code-remote.mjs on; then exit 1; fi
+          node scripts/code-remote.mjs status | grep -q '"remoteCoding": "off"'
+          node scripts/code-remote.mjs on --yes
+          node scripts/code-remote.mjs status | grep -q '"remoteCoding": "on"'
           node scripts/code-remote.mjs off
+          node scripts/code-remote.mjs status | grep -q '"remoteCoding": "off"'
 
   ios:
     name: iOS app from the coding-mode template (Simulator)

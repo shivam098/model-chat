@@ -46,7 +46,7 @@ if (command === "status" || !command) {
   if (!flags.includes("--yes")) {
     console.error([
       "Remote coding lets the superuser run commands and change files on this computer from anywhere the shared link reaches, with only the superuser's password.",
-      "Anyone who learns that password could do the same with this Windows account's rights; approvals don't stop them, because they approve as you.",
+      "Anyone who learns that password could do the same with the rights of the account running Model Chat; approvals don't stop them, because they approve as you.",
       "If that's what you want, run: npm run code:remote -- on --yes",
     ].join("\n"));
     process.exit(1);
