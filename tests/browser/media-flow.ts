@@ -2,6 +2,7 @@ import { expect, type Page } from "@playwright/test";
 import { copyFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
+import { selectModel } from "./helpers";
 
 export async function runMediaFlow(page: Page, other: Page) {
   let modelRequests = 0;
@@ -69,7 +70,7 @@ export async function runMediaFlow(page: Page, other: Page) {
     const { models } = await (await page.request.get("/api/models")).json() as { models: { id: string; vision?: boolean }[] };
     const model = models.find(item => item.vision);
     expect(model).toBeTruthy();
-    await page.getByRole("combobox", { name: "Select model" }).selectOption(model!.id);
+    await selectModel(page, model!.id);
     await page.getByLabel("Message", { exact: true }).fill("Using both attached recordings, state the notebook price and the dominant colors visible in the sampled video frames. Keep the answer to one short sentence.");
     await page.getByRole("button", { name: "Send message", exact: true }).click();
     modelRequests = 1;

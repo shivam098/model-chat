@@ -1,6 +1,6 @@
 import { LIMITS, type Message } from "./contracts";
 import { AppError } from "./errors";
-import { WEB_INSTRUCTION } from "./web-search";
+import { NO_PAGE_READING, PAGE_READING, WEB_INSTRUCTION } from "./web-search";
 
 const NO_TOOLS = "You have no tools, file access, shell, browsing or access to other chats.";
 const BASE_INSTRUCTION = `You are the assistant in Model Chat, a personal text conversation and file-analysis app.
@@ -15,12 +15,15 @@ Prior assistant entries marked cancelled or error are incomplete, not finished a
 Respect user privacy and safety. Do not disclose secrets or facilitate harmful conduct. Do not output raw HTML, remote images, or scripts.`;
 // Space kept free in every prompt budget for the optional code-runner instruction and tool schema.
 export const TOOL_INSTRUCTION_RESERVE = 6144;
-export function systemInstruction(toolInstruction?: string, webSearch = false) {
+export function systemInstruction(toolInstruction?: string, webSearch = false, pageReader = false) {
   if (!webSearch) return toolInstruction ? BASE_INSTRUCTION.replace(NO_TOOLS, toolInstruction) : BASE_INSTRUCTION;
-  // Web-enabled chats: search and cite; everything else (files, shell, other chats) stays unavailable.
-  const tools = toolInstruction ? `${toolInstruction}\n${WEB_INSTRUCTION}` : `${WEB_INSTRUCTION}\nYou have no other tools, file access, shell or access to other chats.`;
+  // Web-enabled chats: search and cite; everything else (files, shell, other chats) stays unavailable. Deep research can also read pages in full.
+  const web = pageReader ? WEB_INSTRUCTION.replace(NO_PAGE_READING, PAGE_READING) : WEB_INSTRUCTION;
+  const tools = toolInstruction ? `${toolInstruction}\n${web}` : `${web}\nYou have no other tools, file access, shell or access to other chats.`;
   return BASE_INSTRUCTION.replace(NO_TOOLS, tools)
-    .replace("Never pretend to execute code, open a URL, or read beyond the supplied text and images.", "Never pretend to execute code, open a URL, or read beyond the supplied text, images and web search results.");
+    .replace("Never pretend to execute code, open a URL, or read beyond the supplied text and images.", pageReader
+      ? "Never pretend to execute code or to have read a page you did not read with read_page."
+      : "Never pretend to execute code, open a URL, or read beyond the supplied text, images and web search results.");
 }
 export const SYSTEM_INSTRUCTION = BASE_INSTRUCTION;
 

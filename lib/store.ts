@@ -3,11 +3,27 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { dataDirectory, ensureDataDirectory } from "./config";
 import { AppError } from "./errors";
-import { LIMITS, PREVIEW_TYPES, type Chat, type CodeEvent, type Message, type MessageStatus, type Attachment, type ImageSource, type ImageAnalysis, type WebSource } from "./contracts";
+import { LIMITS, PREVIEW_TYPES, type Chat, type CodeEvent, type Message, type MessageStatus, type Attachment, type ImageSource, type ImageAnalysis, type WebSource, type ResearchEntry, type ResearchState, type ResearchView } from "./contracts";
 import type { MediaFrame } from "./media";
 import { installUploadSchema, fileTextPage, fileContextExcerpt } from "./upload-store";
 
 export type FileRecord = Attachment & { text: string; bytes: Buffer };
+export interface ResearchRow {
+  id: string; chatId: string; messageId: string; userId: string; actorId: string; model: string; thinking: string | null; question: string;
+  state: ResearchState; title: string; plan: string; log: string; counts: string; sources: string; error: string | null;
+  createdAt: number; updatedAt: number; startedAt: number | null; finishedAt: number | null;
+}
+export const RESEARCH_LIMITS = { searches: 12, pages: 10, minutes: 15, logEntries: 80 };
+const parsed = <T,>(text: string, fallback: T): T => { try { return JSON.parse(text) as T; } catch { return fallback; } };
+export function researchView(row: ResearchRow): ResearchView {
+  const counts = parsed<Partial<ResearchView["counts"]>>(row.counts, {});
+  return {
+    id: row.id, state: row.state, title: row.title, plan: parsed<string[]>(row.plan, []), log: parsed<ResearchEntry[]>(row.log, []).slice(-RESEARCH_LIMITS.logEntries),
+    counts: { searches: counts.searches ?? 0, pages: counts.pages ?? 0, failedPages: counts.failedPages ?? 0, requests: counts.requests ?? 0, userRequests: counts.userRequests ?? 0 },
+    limits: { searches: RESEARCH_LIMITS.searches, pages: RESEARCH_LIMITS.pages, minutes: RESEARCH_LIMITS.minutes },
+    sources: parsed<ResearchView["sources"]>(row.sources, []), error: row.error, createdAt: row.createdAt, startedAt: row.startedAt, finishedAt: row.finishedAt,
+  };
+}
 export const GENERATED_CONTEXT_FILES = 40;
 // Coding cards keep a bounded record: long command output and large diffs are trimmed to their ends.
 function boundedJson(data: Record<string, unknown>) {
@@ -84,6 +100,19 @@ export class Store {
     const chatColumns = db.pragma("table_info(app_chat)") as { name: string }[];
     if (!chatColumns.some(column => column.name === "mode")) db.exec("ALTER TABLE app_chat ADD COLUMN mode TEXT NOT NULL DEFAULT 'chat'");
     if (!chatColumns.some(column => column.name === "projectPath")) db.exec("ALTER TABLE app_chat ADD COLUMN projectPath TEXT");
+    // Reasoning level chosen for the chat and the level each reply was requested with (NULL: the default).
+    if (!chatColumns.some(column => column.name === "thinking")) db.exec("ALTER TABLE app_chat ADD COLUMN thinking TEXT");
+    if (!messageColumns.some(column => column.name === "thinking")) db.exec("ALTER TABLE app_message ADD COLUMN thinking TEXT");
+    // Deep research runs: plan, progress and sources for the reply they produce; the report itself is the reply text.
+    db.exec(`CREATE TABLE IF NOT EXISTS app_research (
+        id TEXT PRIMARY KEY, chatId TEXT NOT NULL REFERENCES app_chat(id) ON DELETE CASCADE,
+        messageId TEXT NOT NULL UNIQUE REFERENCES app_message(id) ON DELETE CASCADE,
+        userId TEXT NOT NULL, actorId TEXT NOT NULL, model TEXT NOT NULL, thinking TEXT, question TEXT NOT NULL,
+        state TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', plan TEXT NOT NULL DEFAULT '[]', log TEXT NOT NULL DEFAULT '[]',
+        counts TEXT NOT NULL DEFAULT '{}', sources TEXT NOT NULL DEFAULT '[]', error TEXT,
+        createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL, startedAt INTEGER, finishedAt INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS app_research_chat ON app_research(chatId);`);
     // Coding-mode activity (commands, file changes, approvals) shown with each reply; never sent back as model context.
     db.exec(`CREATE TABLE IF NOT EXISTS app_code_event (
         id TEXT PRIMARY KEY, chatId TEXT NOT NULL REFERENCES app_chat(id) ON DELETE CASCADE,
@@ -91,7 +120,7 @@ export class Store {
         seq INTEGER NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS app_code_event_chat ON app_code_event(chatId, seq);`);
-    // Sessions created by a verified second factor (authenticator or backup code); remote coding requires one.
+    // Sessions created by a verified second factor (authenticator or backup code), shown in settings.
     db.exec("CREATE TABLE IF NOT EXISTS app_second_factor (sessionId TEXT PRIMARY KEY, userId TEXT NOT NULL, verifiedAt INTEGER NOT NULL)");
     installUploadSchema(db);
   }
@@ -117,12 +146,14 @@ export class Store {
   recoverInterrupted() {
     this.db.prepare("UPDATE app_message SET status='error', error=? WHERE status='streaming'")
       .run("The server restarted before this reply finished. Any saved partial text is shown.");
+    this.db.prepare("UPDATE app_research SET state='error', error=?, finishedAt=?, updatedAt=? WHERE state IN ('planning','awaiting_start','running','writing')")
+      .run("The server restarted before this research finished. Start it again from a new message.", Date.now(), Date.now());
   }
   listChats(userId: string): Chat[] {
-    return this.db.prepare("SELECT id,title,model,createdAt,updatedAt,mode,projectPath FROM app_chat WHERE userId=? ORDER BY updatedAt DESC").all(userId) as Chat[];
+    return this.db.prepare("SELECT id,title,model,thinking,createdAt,updatedAt,mode,projectPath FROM app_chat WHERE userId=? ORDER BY updatedAt DESC").all(userId) as Chat[];
   }
   chat(userId: string, chatId: string): Chat {
-    const row = this.db.prepare("SELECT id,title,model,draft,createdAt,updatedAt,mode,projectPath FROM app_chat WHERE userId=? AND id=?").get(userId, chatId) as Chat | undefined;
+    const row = this.db.prepare("SELECT id,title,model,thinking,draft,createdAt,updatedAt,mode,projectPath FROM app_chat WHERE userId=? AND id=?").get(userId, chatId) as Chat | undefined;
     if (!row) throw new AppError(404, "Chat not found.");
     return row;
   }
@@ -165,12 +196,12 @@ export class Store {
     this.db.prepare("UPDATE app_chat SET title=?,updatedAt=? WHERE id=? AND userId=?").run(title, Date.now(), chatId, userId);
     return this.chat(userId, chatId);
   }
-  saveDraft(userId: string, chatId: string, draft: string, model?: string) {
+  saveDraft(userId: string, chatId: string, draft: string, model?: string, thinking?: string) {
     // Drafts may change while a reply streams; they belong to the next turn and never to the in-flight one.
     if (draft.length > LIMITS.inputCharacters) throw new AppError(400, "The draft exceeds the message length limit.");
     const chat = this.chat(userId, chatId);
-    if (chat.draft === draft && (model === undefined || chat.model === model)) return;
-    this.db.prepare("UPDATE app_chat SET draft=?,model=COALESCE(?,model),updatedAt=? WHERE id=? AND userId=?").run(draft, model ?? null, Date.now(), chatId, userId);
+    if (chat.draft === draft && (model === undefined || chat.model === model) && (thinking === undefined || chat.thinking === thinking)) return;
+    this.db.prepare("UPDATE app_chat SET draft=?,model=COALESCE(?,model),thinking=COALESCE(?,thinking),updatedAt=? WHERE id=? AND userId=?").run(draft, model ?? null, thinking ?? null, Date.now(), chatId, userId);
   }
   deleteChat(userId: string, chatId: string) {
     this.assertIdle(userId, chatId);
@@ -179,10 +210,38 @@ export class Store {
   messages(userId: string, chatId: string): Message[] {
     this.chat(userId, chatId);
     const rows = this.db.prepare("SELECT * FROM app_message WHERE chatId=? ORDER BY createdAt,rowid").all(chatId) as (Omit<Message, "sources"> & { sources?: string | null })[];
+    const research = this.researchViews(chatId);
     return rows.map(({ sources, ...row }) => {
-      if (!sources) return row;
-      try { return { ...row, sources: JSON.parse(sources) as WebSource[] }; } catch { return row; }
+      const item: Message = { ...row, ...(research.has(row.id) ? { research: research.get(row.id) } : {}) };
+      if (item.thinking == null) delete item.thinking;
+      if (!sources) return item;
+      try { return { ...item, sources: JSON.parse(sources) as WebSource[] }; } catch { return item; }
     });
+  }
+  /** Deep research runs of a chat, keyed by the reply they produce. */
+  researchViews(chatId: string): Map<string, ResearchView> {
+    const rows = this.db.prepare("SELECT * FROM app_research WHERE chatId=?").all(chatId) as ResearchRow[];
+    return new Map(rows.map(row => [row.messageId, researchView(row)]));
+  }
+  createResearch(row: Omit<ResearchRow, "plan" | "log" | "counts" | "sources" | "title" | "error" | "startedAt" | "finishedAt" | "updatedAt">) {
+    this.db.prepare("INSERT INTO app_research(id,chatId,messageId,userId,actorId,model,thinking,question,state,createdAt,updatedAt) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+      .run(row.id, row.chatId, row.messageId, row.userId, row.actorId, row.model, row.thinking, row.question, row.state, row.createdAt, row.createdAt);
+  }
+  research(userId: string, chatId: string, researchId: string): ResearchRow {
+    this.chat(userId, chatId);
+    const row = this.db.prepare("SELECT * FROM app_research WHERE id=? AND chatId=? AND userId=?").get(researchId, chatId, userId) as ResearchRow | undefined;
+    if (!row) throw new AppError(404, "Research run not found.");
+    return row;
+  }
+  updateResearch(id: string, patch: Partial<{ state: ResearchState; title: string; plan: string[]; log: ResearchEntry[]; counts: ResearchView["counts"]; sources: ResearchView["sources"]; error: string | null; startedAt: number; finishedAt: number }>) {
+    const fields: string[] = [], values: unknown[] = [];
+    for (const [key, value] of Object.entries(patch)) {
+      if (value === undefined) continue;
+      fields.push(`${key}=?`);
+      values.push(["plan", "log", "counts", "sources"].includes(key) ? JSON.stringify(value) : value);
+    }
+    if (!fields.length) return;
+    this.db.prepare(`UPDATE app_research SET ${fields.join(",")},updatedAt=? WHERE id=?`).run(...values, Date.now(), id);
   }
   attachments(userId: string, chatId: string): Attachment[] {
     this.chat(userId, chatId);
@@ -289,22 +348,22 @@ export class Store {
       }));
     });
   }
-  beginTurn(userId: string, chatId: string, content: string, model: string, fileIds: string[]) {
+  beginTurn(userId: string, chatId: string, content: string, model: string, fileIds: string[], thinking?: string | null) {
     return this.db.transaction(() => {
       this.assertIdle(userId, chatId);
       this.contextFiles(userId, chatId, fileIds);
       if (this.messages(userId, chatId).length >= LIMITS.messagesPerChat) throw new AppError(400, "This chat has reached 100 turns. Start a new chat.");
       const now = Date.now();
       const user: Message = { id: randomUUID(), chatId, role: "user", content, model, status: "complete", error: null, createdAt: now, reasoning: "" };
-      const assistant: Message = { ...user, id: randomUUID(), role: "assistant", content: "", status: "streaming", createdAt: now + 1 };
-      const insert = this.db.prepare("INSERT INTO app_message(id,chatId,role,content,model,status,error,createdAt,reasoning) VALUES (@id,@chatId,@role,@content,@model,@status,@error,@createdAt,@reasoning)");
-      insert.run(user);
-      insert.run(assistant);
+      const assistant: Message = { ...user, id: randomUUID(), role: "assistant", content: "", status: "streaming", createdAt: now + 1, ...(thinking ? { thinking } : {}) };
+      const insert = this.db.prepare("INSERT INTO app_message(id,chatId,role,content,model,status,error,createdAt,reasoning,thinking) VALUES (@id,@chatId,@role,@content,@model,@status,@error,@createdAt,@reasoning,@thinking)");
+      insert.run({ ...user, thinking: null });
+      insert.run({ ...assistant, thinking: thinking ?? null });
       for (const id of fileIds) this.db.prepare("UPDATE app_file SET messageId=? WHERE chatId=? AND id=?").run(user.id, chatId, id);
       // Keep a draft typed after this message was sent; clear it only when it is the text being sent.
       const draft = this.chat(userId, chatId).draft || "";
-      this.db.prepare("UPDATE app_chat SET model=?,updatedAt=?,draft=?,title=CASE WHEN title='New chat' THEN ? ELSE title END WHERE id=? AND userId=?")
-        .run(model, now, draft.trim() === content.trim() ? "" : draft, content.slice(0, 64) || "File analysis", chatId, userId);
+      this.db.prepare("UPDATE app_chat SET model=?,thinking=COALESCE(?,thinking),updatedAt=?,draft=?,title=CASE WHEN title='New chat' THEN ? ELSE title END WHERE id=? AND userId=?")
+        .run(model, thinking ?? null, now, draft.trim() === content.trim() ? "" : draft, content.slice(0, 64) || "File analysis", chatId, userId);
       return { user, assistant };
     })();
   }

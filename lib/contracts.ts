@@ -26,6 +26,8 @@ export interface Chat {
   id: string;
   title: string;
   model: string;
+  /** Reasoning level chosen for this chat (null: the default, medium). */
+  thinking?: string | null;
   createdAt: number;
   updatedAt: number;
   draft?: string;
@@ -56,8 +58,28 @@ export interface Message {
   reasoning: string;
   /** Web pages found by web search for this reply (cited ones first); absent when the reply didn't search. */
   sources?: WebSource[];
+  /** Reasoning level the reply was requested with (absent for replies from before levels were chosen). */
+  thinking?: string | null;
+  /** Deep research run that produces this reply. */
+  research?: ResearchView;
 }
 export interface WebSource { url: string; title: string; cited?: boolean }
+export type ResearchState = "planning" | "awaiting_start" | "running" | "writing" | "complete" | "cancelled" | "error";
+export interface ResearchEntry { kind: "plan" | "search" | "read" | "skip" | "write" | "note"; text: string; url?: string; at: number }
+export interface ResearchView {
+  id: string;
+  state: ResearchState;
+  title: string;
+  plan: string[];
+  log: ResearchEntry[];
+  counts: { searches: number; pages: number; failedPages: number; requests: number; userRequests: number };
+  limits: { searches: number; pages: number; minutes: number };
+  sources: { n: number; url: string; title: string }[];
+  error: string | null;
+  createdAt: number;
+  startedAt: number | null;
+  finishedAt: number | null;
+}
 export interface Attachment {
   id: string;
   chatId: string;
@@ -94,6 +116,8 @@ export interface Model {
   multiplier?: number;
   vision?: boolean;
   maxImages?: number;
+  /** Reasoning levels the model supports, in order (none…max); absent when it has no adjustable reasoning. */
+  levels?: string[];
 }
 export type StreamEvent =
   | { type: "start"; user: Message; assistant: Message }

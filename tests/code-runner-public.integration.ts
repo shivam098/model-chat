@@ -9,6 +9,7 @@ import env from "@next/env";
 import { setTimeout as delay } from "node:timers/promises";
 import { Store } from "../lib/store";
 import { AccessService } from "../lib/access";
+import { selectModel } from "./browser/helpers";
 
 env.loadEnvConfig(process.cwd());
 const data = path.resolve(process.env.MODEL_CHAT_DATA_DIR || ".local");
@@ -59,7 +60,7 @@ try {
   const model = models.find(item => /^claude-sonnet/.test(item.id)) || models[0];
   const page = alice.page;
   await page.goto(origin);
-  await page.getByRole("combobox", { name: "Select model" }).selectOption(model.id);
+  await selectModel(page, model.id);
   await page.locator('input[type="file"]').setInputFiles({ name: "sales.csv", mimeType: "text/csv", buffer: Buffer.from(csv) });
   await expect(page.getByRole("button", { name: "Preview extracted text for sales.csv", exact: true })).toBeEnabled({ timeout: 60_000 });
   const chatId = new URL(page.url()).searchParams.get("chat")!;
@@ -105,7 +106,7 @@ try {
   await expect(admin.page.locator(".acting-banner")).toContainText(alice.user.email);
   await expect(admin.page.locator(".file-chip").filter({ hasText: "sales.csv" }).first()).toBeVisible({ timeout: 30_000 });
   assert.equal(new URL(admin.page.url()).searchParams.get("chat"), chatId, "The acting browser must have the owner's chat open before sending");
-  await admin.page.getByRole("combobox", { name: "Select model" }).selectOption(model.id);
+  await selectModel(admin.page, model.id);
   await sendAndWait(admin.page, "Use run_python with sales.csv to make a pie chart named pie.png, then reply in one short sentence.");
   const after = await (await alice.context.request.get(`/api/chats/${chatId}`)).json();
   const adminReply = after.messages.at(-1);

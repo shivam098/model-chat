@@ -58,9 +58,9 @@ test("capture every screen for design review", async ({ page, browser }) => {
   await page.setViewportSize(desktop);
   // The isolated test runtime has no Copilot sign-in; show a realistic model list so screens look as users see them.
   const models = [
-    { id: "claude-sonnet-5.5", name: "Claude Sonnet 5.5", vision: true, multiplier: 1, maxImages: 20 },
-    { id: "gpt-6-sol", name: "GPT-6 Sol", vision: true, multiplier: 1, maxImages: 10 },
-    { id: "claude-haiku-5.5", name: "Claude Haiku 5.5", vision: true, multiplier: 0.33, maxImages: 20 },
+    { id: "claude-sonnet-5.5", name: "Claude Sonnet 5.5", vision: true, multiplier: 1, maxImages: 20, levels: ["low", "medium", "high", "xhigh", "max"] },
+    { id: "gpt-6-sol", name: "GPT-6 Sol", vision: true, multiplier: 1, maxImages: 10, levels: ["none", "low", "medium", "high", "xhigh", "max"] },
+    { id: "claude-haiku-5.5", name: "Claude Haiku 5.5", vision: true, multiplier: 0.33, maxImages: 20, levels: ["low", "medium", "high", "xhigh", "max"] },
   ];
   await page.route("**/api/models", route => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ models, authenticated: true }) }));
   const [modelA, modelB] = [models[0].id, models[1].id];

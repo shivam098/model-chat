@@ -5,6 +5,7 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { Store } from "../../lib/store";
 import { AccessService } from "../../lib/access";
+import { selectModel } from "./helpers";
 
 // Real Copilot replies with live web search, so it's opt-in (about four Copilot turns).
 test.skip(process.env.MODEL_CHAT_WEB_E2E !== "1", "Set MODEL_CHAT_WEB_E2E=1 to run the real web search flow.");
@@ -49,7 +50,7 @@ test("web search: the owner's chats search and cite sources; ordinary users and 
   await expect(page.locator(".web-chip")).toBeVisible();
   const models = (await (await page.request.get("/api/models")).json()).models as { id: string }[];
   const model = models.find(item => item.id === (process.env.MODEL_CHAT_WEB_MODEL || "gpt-6-luna"))?.id || models[0].id;
-  await page.getByLabel("Select model").selectOption(model);
+  await selectModel(page, model);
 
   let sawSearching = false;
   const first = await ask(page, "What is the latest stable release of Node.js, and when was it released? Please check the web and cite your sources.", async () => {
@@ -87,7 +88,7 @@ test("web search: the owner's chats search and cite sources; ordinary users and 
   const status = await (await other.request.get("/api/web-status")).json();
   expect(status.enabled).toBe(false);
   await expect(other.locator(".web-chip")).toHaveCount(0);
-  await other.getByLabel("Select model").selectOption(model);
+  await selectModel(other, model);
   const plain = await ask(other, "What is the latest stable release of Node.js? Please search the web for it.");
   await expect(plain.locator(".web-sources")).toHaveCount(0);
   const plainText = await plain.locator(".markdown").innerText();

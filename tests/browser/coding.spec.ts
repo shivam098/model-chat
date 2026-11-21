@@ -6,6 +6,7 @@ import net from "node:net";
 import path from "node:path";
 import { Store } from "../../lib/store";
 import { AccessService } from "../../lib/access";
+import { selectModel } from "./helpers";
 
 // One real Copilot turn that runs commands on this computer, so it's opt-in.
 test.skip(process.env.MODEL_CHAT_CODING_E2E !== "1", "Set MODEL_CHAT_CODING_E2E=1 and MODEL_CHAT_PROJECTS_DIR to run the real coding-mode flow.");
@@ -61,7 +62,7 @@ test("coding mode from this computer's browser: approvals, deny, diffs, live pre
   const port = await freePort();
   const models = (await (await page.request.get("/api/models")).json()).models as { id: string }[];
   const model = models.find(item => item.id === process.env.MODEL_CHAT_CODING_MODEL)?.id || models[0].id;
-  await page.getByLabel("Select model").selectOption(model);
+  await selectModel(page, model);
   await shot(page, "03-code-chat-new");
 
   let serverPid: number | null = null;

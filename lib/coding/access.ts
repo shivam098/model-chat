@@ -11,14 +11,14 @@ export interface CodingStatus {
   reason: string | null;
   via: Via;
   remoteEnabled: boolean;
-  /** Whether the superuser has two-step verification on, and whether this session was signed in with it. */
+  /** Whether the superuser has optional two-step verification on, and whether this session was signed in with it (shown in settings; not required for coding). */
   twoFactorEnabled: boolean;
   secondFactorVerified: boolean;
   platform: NodeJS.Platform;
   projectsRoot: string | null;
   localUrl: string;
 }
-// Remote coding is off unless the owner turns it on with `npm run code:remote -- on --yes` on the host, and it also needs two-step verification.
+// Remote coding is off unless the owner turns it on with `npm run code:remote -- on --yes` on the host; then the superuser's ordinary sign-in through the link can use it.
 export function remoteCodingEnabled() {
   const file = path.join(dataDirectory, "coding-remote.json");
   if (!existsSync(file)) return false;
@@ -35,11 +35,6 @@ function evaluate(request: Request, context: AccessContext, service: AccessServi
   if (!superuser) { reason = "Coding mode is available only to the superuser account."; code = "not_superuser"; }
   else if (context.delegationId) { reason = "Return to your own workspace to use coding mode; it never runs as another user."; code = "acting"; }
   else if (via !== "local" && !remoteEnabled) { reason = `Coding mode works only in a browser on the computer running Model Chat (${localOrigin}).`; code = "remote_disabled"; }
-  else if (via !== "local" && !secondFactorVerified) {
-    reason = twoFactorEnabled ? "Remote coding needs a sign-in with your two-step verification code. Sign out and sign in again with it."
-      : "Remote coding needs two-step verification on your account. Turn it on in Account & connection.";
-    code = "second_factor_required";
-  }
   const available = reason === null;
   return { code, status: { available, reason, via, remoteEnabled, twoFactorEnabled, secondFactorVerified, platform: os.platform(), projectsRoot: available ? projectsRoot() : null, localUrl: localOrigin } };
 }

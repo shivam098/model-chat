@@ -5,6 +5,7 @@ import Database from "better-sqlite3";
 import sharp from "sharp";
 import { Store } from "../../lib/store";
 import { AccessService } from "../../lib/access";
+import { modelButton, modelOptions, selectModel } from "./helpers";
 
 const origin = "http://127.0.0.1:3211";
 async function signup(request: APIRequestContext, label: string) {
@@ -39,7 +40,7 @@ test("the composer stays usable during a streaming reply while Send waits, on de
   await page.goto(`/?chat=${chatId}`);
   await expect(page.getByRole("button", { name: "Stop reply" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Send message" })).toHaveCount(0);
-  await expect(page.locator(".composer-caption")).toContainText("Reply in progress");
+  await expect(page.locator(".composer-caption")).not.toContainText(/Reply in progress|Models can make mistakes/);
   const composer = page.getByLabel("Message", { exact: true });
   await expect(composer).toBeEnabled();
   await composer.fill("Next question typed while the reply streams");
@@ -61,11 +62,10 @@ test("the composer stays usable during a streaming reply while Send waits, on de
   await expect(page.getByRole("button", { name: "Preview extracted text for dropped.txt", exact: true })).toBeEnabled({ timeout: 30_000 });
   await page.getByRole("button", { name: "Remove dropped.txt", exact: true }).click();
   await expect(page.locator(".file-job").filter({ hasText: "dropped.txt" })).toHaveCount(0);
-  const picker = page.getByRole("combobox", { name: "Select model" });
-  await expect(picker).toBeEnabled();
-  const options = await picker.locator("option").evaluateAll(items => items.map(item => (item as HTMLOptionElement).value));
+  await expect(modelButton(page)).toBeEnabled();
+  const options = await modelOptions(page);
   const nextModel = options.at(-1)!;
-  await picker.selectOption(nextModel);
+  await selectModel(page, nextModel);
   const dictate = page.getByRole("button", { name: /Dictate/ });
   if (await dictate.isEnabled()) {
     await dictate.click();
@@ -79,7 +79,7 @@ test("the composer stays usable during a streaming reply while Send waits, on de
   await expect(page.getByRole("button", { name: "Stop reply" })).toBeVisible();
   await expect(composer).toHaveValue("Next question typed while the reply streams");
   await expect(page.locator(".file-job")).toHaveCount(2);
-  await expect(picker).toHaveValue(nextModel);
+  await expect(modelButton(page)).toHaveAttribute("data-model", nextModel);
   await page.setViewportSize({ width: 390, height: 844 });
   await composer.fill("Next question typed while the reply streams — edited on mobile");
   await expect(page.getByRole("button", { name: "Attach files" })).toBeEnabled();
@@ -159,9 +159,7 @@ test("Send, a pasted file and draft autosave during a new chat's first request a
   await page.route("**/messages", route => route.fulfill({ status: 400, contentType: "application/json", body: JSON.stringify({ error: "Synthetic test stops before billable generation." }) }));
   await page.goto("/");
   const composer = page.getByLabel("Message", { exact: true });
-  const newPicker = page.getByRole("combobox", { name: "Select model" });
-  await expect(newPicker).toBeEnabled();
-  await expect(newPicker.locator("option").first()).toBeAttached();
+  await expect(modelButton(page)).toBeEnabled();
   await composer.fill("First message");
   await composer.press("Enter");
   await expect.poll(() => creates).toBe(1);

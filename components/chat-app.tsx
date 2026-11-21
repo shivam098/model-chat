@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { ArrowDown, ArrowRight, ArrowUp, BookOpen, Brain, ChevronDown, Code2, Eye, FileText, FolderOpen, Globe, Leaf, LoaderCircle, LogOut, Menu, MessageSquare, Mic, Moon, PanelLeft, PanelRight, Pencil, Plus, RefreshCw, Settings2, ShieldCheck, Square, SquarePen, Sun, Trash2, Volume2, X } from "lucide-react";
+import { ArrowDown, ArrowRight, ArrowUp, BookOpen, Brain, ChevronDown, Code2, Eye, FileText, FolderOpen, Globe, Leaf, LoaderCircle, LogOut, Menu, MessageSquare, Mic, Moon, PanelLeft, PanelRight, Pencil, Plus, RefreshCw, Settings2, ShieldCheck, Square, SquarePen, Sun, Telescope, Trash2, Volume2, X } from "lucide-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { FILE_ACCEPT, LIMITS, type Attachment, type Chat, type ChatDetail, type Model, type StreamEvent, type WebSource } from "@/lib/contracts";
@@ -11,6 +11,9 @@ import type { AccountView, AppUser } from "@/lib/access";
 import { AdminPanel } from "./admin-panel";
 import { CodeCard, CodePanel, ProjectPicker, TwoFactorSettings, folderName, mergeCodeEvent, type CodingStatus, type Decision, type PanelTab } from "./code-mode";
 import { LampLight } from "./lamp-light";
+import { ModelPicker } from "./model-picker";
+import { ACTIVE_RESEARCH, ResearchCard } from "./research-card";
+import { isThinkingLevel, nearestLevel, THINKING_LABELS, type ThinkingLevel } from "@/lib/thinking";
 import { THEME_STORAGE_KEY, type Theme } from "@/lib/theme";
 import { softwareRendering } from "@/lib/render-tier";
 
@@ -121,6 +124,10 @@ export function ChatApp() {
   const [detail, setDetail] = useState<ChatDetail | null>(null);
   const [models, setModels] = useState<Model[]>([]);
   const [selectedModel, setSelectedModel] = useState("");
+  // The thinking level the user asked for (null: the default, medium); each model gets it or its nearest supported level.
+  const [thinking, setThinking] = useState<string | null>(null);
+  const [research, setResearch] = useState(false);
+  const [researchDeciding, setResearchDeciding] = useState<string | null>(null);
   const [modelLoading, setModelLoading] = useState(false);
   const [connectionError, setConnectionError] = useState("");
   const [loadingChat, setLoadingChat] = useState(false);
@@ -179,24 +186,28 @@ export function ChatApp() {
   const demoLaunch = useRef(false);
   const workspaceEpoch = useRef(0);
   const modelRef = useRef(selectedModel);
+  const thinkingRef = useRef<string | null>(null);
   const busyRef = useRef(busy);
   const draftWrite = useRef<Promise<void> | null>(null);
   const chatCreation = useRef<{ owner?: string; epoch: number; promise: Promise<Chat> } | null>(null);
-  const draftSaved = useRef<{ userId: string; chatId?: string; draft: string; model: string } | null>(null);
+  const draftSaved = useRef<{ userId: string; chatId?: string; draft: string; model: string; thinking?: string | null } | null>(null);
   userRef.current = user;
   detailRef.current = detail;
   draftRef.current = draft;
   modelRef.current = selectedModel;
+  thinkingRef.current = thinking;
   busyRef.current = busy;
   const pending = detail?.attachments.filter(f => !f.messageId) || [];
   const readyPending = pending.filter(file => !file.processingStatus || file.processingStatus === "ready");
   const processing = detail?.attachments.some(file => ["uploading", "queued", "processing"].includes(file.processingStatus || "")) || false;
-  const remoteBusy = Boolean(detail?.messages.some(m => m.status === "streaming"));
+  // A deep research run works in the background: it blocks sending in its own chat but never switching chats or accounts.
+  const researchActive = Boolean(detail?.messages.some(m => m.research && ACTIVE_RESEARCH.includes(m.research.state)));
+  const remoteBusy = Boolean(detail?.messages.some(m => m.status === "streaming" && !m.research));
   const locked = busy || uploading || loadingChat || remoteBusy || demoLoading || switching;
   // The composer stays usable while a reply streams; only sending (and workspace switches) wait for it.
   const composeLocked = loadingChat || demoLoading || switching;
   const uploadLocked = uploading || composeLocked;
-  const replyRunning = busy || remoteBusy;
+  const replyRunning = busy || remoteBusy || researchActive;
   const acting = Boolean(actor && user && actor.id !== user.id);
   const modelAvailable = models.some(m => m.id === selectedModel);
   const newImageCount = readyPending.reduce((count, file) => count + (file.mimeType?.startsWith("image/") ? 1 : file.frameCount || 0), 0);
@@ -205,6 +216,11 @@ export function ChatApp() {
   const codeChat = detail?.chat.mode === "code";
   const codeReady = Boolean(codeStatus?.available) && !acting;
   const codeBlocked = codeChat && !codeReady;
+  const currentModel = models.find(model => model.id === selectedModel);
+  const thinkingLevel = nearestLevel(currentModel?.levels, thinking);
+  // Deep research needs web search for this account (never while acting) and works in ordinary chats.
+  const researchAvailable = Boolean(webInfo?.enabled) && !codeChat && !acting;
+  const researchMode = research && researchAvailable;
   function api<T>(url: string, init?: RequestInit) {
     const subject = userRef.current?.id;
     return requestJson<T>(url, { ...init, headers: { ...(subject ? { "x-model-chat-subject": subject } : {}), ...init?.headers } });
@@ -213,9 +229,9 @@ export function ChatApp() {
     workspaceEpoch.current++;
     selection.current++;
     generation.current?.abort(); uploadController.current?.abort(); stopDictation(); stopSpeaking();
-    userRef.current = account.user; detailRef.current = null; draftRef.current = ""; modelRef.current = "";
+    userRef.current = account.user; detailRef.current = null; draftRef.current = ""; modelRef.current = ""; thinkingRef.current = null;
     draftSaved.current = null;
-    setUser(account.user); setActor(account.actor); setDetail(null); setChats([]); setDraft(""); setSelectedModel("");
+    setUser(account.user); setActor(account.actor); setDetail(null); setChats([]); setDraft(""); setSelectedModel(""); setThinking(null);
     setAdmin(false); setMenu(false); setSidebar(false); setSettings(false); setDraftState("saved");
     setFilePreview(null);
     setCodeStatus(null); setProjectPicker(false); setCodePanel(null); setWebInfo(null);
@@ -261,7 +277,7 @@ export function ChatApp() {
     const timer = setTimeout(() => { void flushDraft().catch(report); }, 500);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [draft, selectedModel, user?.id, detail?.chat.id, composeLocked]);
+  }, [draft, selectedModel, thinking, user?.id, detail?.chat.id, composeLocked]);
 
   useEffect(() => {
     const saveOnLeave = () => {
@@ -271,7 +287,7 @@ export function ChatApp() {
       void fetch("/api/drafts", {
         method: "POST", keepalive: true,
         headers: { "Content-Type": "application/json", "x-model-chat-subject": owner.id },
-        body: JSON.stringify({ chatId: current.chat.id, draft: draftRef.current, model: modelRef.current }),
+        body: JSON.stringify({ chatId: current.chat.id, draft: draftRef.current, model: modelRef.current, ...(isThinkingLevel(thinkingRef.current) ? { thinking: thinkingRef.current } : {}) }),
       }).catch(error => console.error("Draft save on page exit failed:", error.name));
     };
     window.addEventListener("pagehide", saveOnLeave);
@@ -319,7 +335,7 @@ export function ChatApp() {
   }, [detail?.messages, detail?.codeEvents, busy, interim]);
 
   useEffect(() => {
-    if (!remoteBusy || busy || !detail) return;
+    if ((!remoteBusy && !researchActive) || busy || !detail) return;
     const id = detail.chat.id;
     const timer = setInterval(() => {
       api<ChatDetail>(`/api/chats/${id}`).then(result => {
@@ -327,7 +343,7 @@ export function ChatApp() {
       }).catch(error => setNotice(message(error)));
     }, 1500);
     return () => clearInterval(timer);
-  }, [remoteBusy, busy, detail?.chat.id]);
+  }, [remoteBusy, researchActive, busy, detail?.chat.id]);
 
   useEffect(() => {
     if (!processing || !detail) return;
@@ -377,7 +393,7 @@ export function ChatApp() {
     userRef.current = null;
     workspaceEpoch.current++; detailRef.current = null; draftRef.current = ""; draftSaved.current = null;
     selection.current++;
-    setUser(null); setChats([]); setDetail(null); setModels([]); setSelectedModel("");
+    setUser(null); setChats([]); setDetail(null); setModels([]); setSelectedModel(""); setThinking(null);
     setDraft(""); setBusy(false); setUploading(false); setTransfers([]); setSettings(false); setSidebar(false);
     setMenu(false); setHow(false); setDemoLoading(false);
     setActor(null); setAdmin(false); setSwitching(false);
@@ -397,11 +413,12 @@ export function ChatApp() {
       const result = await api<ChatDetail>(`/api/chats/${chat.id}`);
       if (request !== selection.current) return;
       detailRef.current = result; draftRef.current = result.chat.draft || "";
-      draftSaved.current = { userId: userRef.current!.id, chatId: result.chat.id, draft: result.chat.draft || "", model: result.chat.model || modelRef.current };
+      draftSaved.current = { userId: userRef.current!.id, chatId: result.chat.id, draft: result.chat.draft || "", model: result.chat.model || modelRef.current, thinking: result.chat.thinking ?? thinkingRef.current };
       setDetail(result);
       setDraft(result.chat.draft || "");
       setDraftState("saved");
       if (result.chat.model) setSelectedModel(result.chat.model);
+      if (result.chat.thinking) { thinkingRef.current = result.chat.thinking; setThinking(result.chat.thinking); }
       window.history.replaceState(null, "", `?chat=${chat.id}`);
     } catch (error) { if (request === selection.current) report(error); }
     finally { if (request === selection.current) setLoadingChat(false); }
@@ -441,14 +458,15 @@ export function ChatApp() {
     const chatId = detailRef.current?.chat.id;
     const text = draftRef.current;
     const model = modelRef.current;
+    const level = thinkingRef.current;
     const saved = draftSaved.current;
-    if ((!chatId && !text) || (saved?.userId === owner && saved.chatId === chatId && saved.draft === text && saved.model === model)) { setDraftState("saved"); return; }
+    if ((!chatId && !text) || (saved?.userId === owner && saved.chatId === chatId && saved.draft === text && saved.model === model && (saved.thinking ?? null) === level)) { setDraftState("saved"); return; }
     setDraftState("saving");
     const operation = (async () => {
       try {
         const result = await requestJson<{ chat: Chat | null }>("/api/drafts", {
           method: "POST", headers: { "x-model-chat-subject": owner },
-          body: JSON.stringify({ chatId, draft: text, model }),
+          body: JSON.stringify({ chatId, draft: text, model, ...(isThinkingLevel(level) ? { thinking: level } : {}) }),
         });
         if (epoch !== workspaceEpoch.current || owner !== userRef.current?.id) return;
         if (result.chat) {
@@ -463,7 +481,7 @@ export function ChatApp() {
             setDetail(previous => previous && previous.chat.id === chat.id ? { ...previous, chat } : previous);
           }
           setChats(previous => previous.some(item => item.id === chat.id) ? previous.map(item => item.id === chat.id ? chat : item) : [chat, ...previous]);
-          draftSaved.current = { userId: owner, chatId: chat.id, draft: text, model };
+          draftSaved.current = { userId: owner, chatId: chat.id, draft: text, model, thinking: level };
         }
         setDraftState("saved");
       } catch (error) { setDraftState("error"); throw error; }
@@ -556,12 +574,13 @@ export function ChatApp() {
   }
   async function send(event?: FormEvent, textOnly = false) {
     event?.preventDefault();
-    if (locked || !modelAvailable || !draft.trim()) return;
+    if (locked || researchActive || !modelAvailable || !draft.trim()) return;
     if (codeBlocked) { setNotice(codeStatus?.reason || "Coding mode isn't available here."); return; }
     if (!textOnly && (pending.length !== readyPending.length || transfers.some(transfer => transfer.error))) {
       setNotice("Some attached files are still processing or could not be uploaded. Nothing was sent. Wait or retry/remove those files, or explicitly choose Send text only.");
       return;
     }
+    if (researchMode) return planResearch(textOnly);
     stopDictation();
     const content = draft.trim();
     const ownerId = userRef.current?.id;
@@ -582,7 +601,7 @@ export function ChatApp() {
       const response = await fetch(`/api/chats/${chat.id}/messages`, {
         method: "POST", signal: controller.signal,
         headers: { "Content-Type": "application/json", "x-model-chat-subject": ownerId! },
-        body: JSON.stringify({ content, model: selectedModel, fileIds: selectedFiles.map(f => f.id) }),
+        body: JSON.stringify({ content, model: selectedModel, ...(thinkingLevel ? { thinking: thinkingLevel } : {}), fileIds: selectedFiles.map(f => f.id) }),
       });
       if (!response.ok) {
         const data = await response.json();
@@ -657,8 +676,52 @@ export function ChatApp() {
   }
   async function stop() {
     if (!detail) return;
-    try { await api(`/api/chats/${detail.chat.id}/stop`, { method: "POST" }); }
+    try { await api(`/api/chats/${detail.chat.id}/stop`, { method: "POST" }); if (researchActive) await refreshChat(detail.chat.id); }
     catch (error) { report(error); }
+  }
+  // Deep research: the server drafts a plan in the background; the chat's polling shows it, and Start runs the research there.
+  async function planResearch(textOnly: boolean) {
+    stopDictation();
+    const content = draft.trim();
+    const ownerId = userRef.current?.id;
+    const epoch = workspaceEpoch.current;
+    const selectedFiles = textOnly ? [] : pending;
+    draftRef.current = ""; setDraft(""); setDraftState("saving");
+    setBusy(true); setNotice(""); follow.current = true;
+    let chatId: string | undefined;
+    let accepted = false;
+    try {
+      await flushDraft(true);
+      const chat = await ensureChat();
+      chatId = chat.id;
+      await api(`/api/chats/${chat.id}/research`, { method: "POST", body: JSON.stringify({ content, model: selectedModel, ...(thinkingLevel ? { thinking: thinkingLevel } : {}), fileIds: selectedFiles.map(file => file.id) }) });
+      accepted = true;
+      setResearch(false);
+    } catch (error) {
+      if (userRef.current?.id === ownerId && workspaceEpoch.current === epoch) {
+        report(error);
+        if (!accepted) {
+          const restored = draftRef.current.trim() ? `${content}\n\n${draftRef.current}` : content;
+          draftRef.current = restored; setDraft(restored); setDraftState("saving");
+        }
+      }
+    } finally {
+      if (chatId && userRef.current?.id === ownerId && workspaceEpoch.current === epoch) {
+        try { await refreshChat(chatId); } catch (error) { report(error); }
+      }
+      setBusy(false);
+      composer.current?.focus();
+    }
+  }
+  async function startResearchRun(researchId: string, plan?: string[]) {
+    if (!detail) return;
+    const chatId = detail.chat.id;
+    setResearchDeciding(researchId);
+    try {
+      await api(`/api/chats/${chatId}/research/${researchId}/start`, { method: "POST", body: JSON.stringify(plan ? { plan } : {}) });
+      await refreshChat(chatId);
+    } catch (error) { report(error); }
+    finally { setResearchDeciding(null); }
   }
   async function chooseCode() {
     if (composeLocked || !codeReady) return;
@@ -916,8 +979,9 @@ export function ChatApp() {
           <li>Sign in, choose an available Copilot model, and write a question or load an example below.</li>
           <li>Press Send for a real streamed answer. Stop keeps any partial reply. Ordinary accounts have separate chats; the app superuser can view chats/files and act as users, with an audit log.</li>
           <li>Attach supported documents to ask questions about them. Reopen chats or switch models without losing their saved context.</li>
-          <li>Ask for a PDF, chart, GIF/MP4 animation or Word/Excel/PowerPoint file. The model runs Python in an offline, disposable sandbox on the host and attaches the results; the sandbox has no internet access and can&apos;t install software. See Files &amp; privacy for its libraries and limits.</li>
-          <li>Where the host owner has turned on web search (a <strong>Web</strong> chip shows in the message box), the model can search the web for current information and lists its sources under the reply.</li>
+          <li>Ask for a PDF, chart, GIF/MP4 animation or Word/Excel/PowerPoint file. The model runs Python in an offline, disposable sandbox on the host and attaches the results; the sandbox has no internet access and can&apos;t install software. See Account &amp; connection for its libraries and limits.</li>
+          <li>Where the host owner has turned on web search (a <strong>Web</strong> chip shows in the message box), the model can search the web for current information and lists its sources under the reply. <strong>Deep research</strong> plans a research run you review, then searches, reads full pages and writes a long cited report in the background.</li>
+          <li>The model button sets the model and, for models that support it, how much it thinks (Off to Max).</li>
         </ol>
         <p>All accounts use the host owner&apos;s Copilot quota. Prompts and extracted file text are sent to Copilot; availability and usage limits apply.</p>
       </div>
@@ -1010,13 +1074,14 @@ export function ChatApp() {
               return <article key={item.id} className={`message assistant ${streaming ? "streaming" : ""}`} aria-label="Assistant message">
                 <span className="reply-mark" aria-hidden="true"><Leaf size={14} /></span>
                 <div className="reply-body">
-                  <div className="reply-meta"><span className="model-tag">{models.find(m => m.id === item.model)?.name || item.model}</span><time className="hover-time" dateTime={new Date(item.createdAt).toISOString()}>{time}</time></div>
+                  <div className="reply-meta"><span className="model-tag">{models.find(m => m.id === item.model)?.name || item.model}</span>{item.thinking && <span className="thinking-tag" title="Thinking level for this reply">{THINKING_LABELS[item.thinking as ThinkingLevel] || item.thinking}</span>}<time className="hover-time" dateTime={new Date(item.createdAt).toISOString()}>{time}</time></div>
+                  {item.research && <ResearchCard research={item.research} deciding={researchDeciding === item.research.id} onStart={plan => void startResearchRun(item.research!.id, plan)} onCancel={() => void stop()} />}
                   {item.reasoning && <Thinking text={item.reasoning} live={streaming && !item.content} open={openThinking.has(item.id)} onToggle={() => toggleThinking(item.id)} />}
                   {codeChat && <div className="code-cards">{(detail!.codeEvents || []).filter(event => event.messageId === item.id).map(event =>
                     <CodeCard key={event.id} event={event} live={Boolean(detail!.codeLive) || streaming} showImages={codeReady} deciding={deciding.has(String((event.data.approval as { id?: string } | undefined)?.id))} onDecide={(id, decision) => void decide(id, decision)} />)}</div>}
-                  <div className="markdown">
+                  {item.research && !item.content ? null : <div className="markdown">
                     {item.content ? <Md text={item.content} /> : streaming ? <span className="pending-reply">{busy && /web/i.test(streamStage) ? <Globe size={14} className="stage-globe" aria-hidden="true" /> : <><i /><i /><i /></>}{busy ? streamStage : "Processing attachments or generating reply"}</span> : <p className="muted">No answer was generated.</p>}
-                  </div>
+                  </div>}
                   {streaming && busy && item.content && <div className="tool-stage" role="status">{/web/i.test(streamStage) ? <Globe size={16} className="stage-globe" aria-hidden="true" /> : <LoaderCircle className="spin" size={16} />}{streamStage}</div>}
                   {item.sources && item.sources.length > 0 && <Sources sources={item.sources} />}
                   {files.filter(f => f.preview).map(file => {
@@ -1073,7 +1138,7 @@ export function ChatApp() {
           {pending.some(file => file.processingStatus && file.processingStatus !== "ready") && <p className="file-guidance">Send will include every attached file once ready. Wait or retry/remove unfinished files, or choose Send text only to leave them for later.</p>}
           {extraImageRequests > 0 && <p className="file-guidance" role="status">These images/frames need up to {extraImageRequests} additional Copilot {extraImageRequests === 1 ? "request" : "requests"} with this model, using extra quota. Each is analyzed separately at its supplied detail; one reply combines the results. Analyses are saved for later turns.</p>}
           <label className="sr-only" htmlFor="message">Message</label>
-          <textarea id="message" ref={composer} rows={1} placeholder={listening ? "Listening" : codeChat ? "Describe a change, a fix or an app to build" : "Ask Model Chat"} value={draft}
+          <textarea id="message" ref={composer} rows={1} placeholder={listening ? "Listening" : codeChat ? "Describe a change, a fix or an app to build" : researchMode ? "What should I research?" : "Ask Model Chat"} value={draft}
             onChange={event => { draftRef.current = event.target.value; setDraft(event.target.value); setDraftState("saving"); }} maxLength={LIMITS.inputCharacters} disabled={composeLocked}
             onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send(); } }}
             onPaste={event => { if (event.clipboardData.files.length) { event.preventDefault(); void upload(event.clipboardData.files); } }} />
@@ -1088,6 +1153,9 @@ export function ChatApp() {
                 onClick={() => listening ? recognition.current?.stop() : startDictation()}><Mic size={18} /></button>
               {webInfo?.enabled && !codeChat && <span className="web-chip" title="Web search is on: the model can search the web for current information and cite its sources.">
                 <Globe size={14} aria-hidden="true" /><span>Web</span></span>}
+              {researchAvailable && <button type="button" className="research-chip" aria-pressed={researchMode} disabled={composeLocked}
+                title={researchMode ? "Deep research is on for this message: you'll review a plan, then it searches, reads full pages and writes a cited report in the background." : "Deep research: plan, search, read full pages and write a cited report. Runs in the background; you review the plan first."}
+                onClick={() => { setResearch(value => !value); composer.current?.focus(); }}><Telescope size={14} aria-hidden="true" /><span>Deep research</span></button>}
               {codeReady && <div className="mode-switch" role="group" aria-label="Mode">
                 <button type="button" aria-pressed={!codeChat} disabled={composeLocked} title="Ordinary chat: no access to this computer" onClick={() => { if (codeChat) void newChat(); }}>Chat</button>
                 <button type="button" aria-pressed={codeChat} disabled={composeLocked} title="Work on a project folder on this computer, with your approval for each command and change" onClick={() => { if (!codeChat) void chooseCode(); }}>Code</button>
@@ -1097,16 +1165,10 @@ export function ChatApp() {
               {(pending.length > readyPending.length || transfers.some(transfer => transfer.error)) && <button type="button" className="text-button" disabled={!draft.trim() || locked || !modelAvailable} onClick={() => void send(undefined, true)}>Send text only</button>}
             </div>
             <div className="send-group">{draft.length > 7000 && <small>{draft.length}/{LIMITS.inputCharacters}</small>}
-              <label className="model-pill" title="Model for the next message">
-                <select aria-label="Select model" value={selectedModel} disabled={composeLocked || modelLoading || !models.length} onChange={event => { setSelectedModel(event.target.value); setDraftState("saving"); }}>
-                  {!selectedModel && <option value="">{modelLoading ? "Connecting..." : "No models"}</option>}
-                  {selectedModel && !modelAvailable && <option value={selectedModel}>{selectedModel} (unavailable)</option>}
-                  {models.map(model => <option value={model.id} key={model.id}>{model.name}{model.vision ? " · vision" : ""}{model.multiplier !== undefined && model.multiplier !== 1 ? ` · ${model.multiplier}x` : ""}</option>)}
-                </select>
-                <ChevronDown size={14} aria-hidden="true" />
-              </label>
-              {busy || remoteBusy ? <button type="button" className="send-button stop" aria-label="Stop reply" title="Stop reply. Partial text is kept." onClick={() => void stop()}><Square size={14} fill="currentColor" /></button> :
-                <button type="submit" className="send-button" aria-label="Send message" title="Send (Enter). Shift + Enter adds a new line." disabled={!draft.trim() || locked || !modelAvailable || codeBlocked}><ArrowUp size={18} /></button>}
+              <ModelPicker models={models} value={selectedModel} thinking={thinking} loading={modelLoading} disabled={composeLocked || modelLoading || !models.length}
+                onModel={id => { setSelectedModel(id); setDraftState("saving"); }} onThinking={level => { setThinking(level); setDraftState("saving"); }} />
+              {busy || remoteBusy || researchActive ? <button type="button" className="send-button stop" aria-label={researchActive ? "Stop research" : "Stop reply"} title={researchActive ? "Stop the research run. Pages read so far stay in its details." : "Stop the reply; partial text is kept. You can keep writing meanwhile."} onClick={() => void stop()}><Square size={14} fill="currentColor" /></button> :
+                <button type="submit" className="send-button" aria-label={researchMode ? "Plan research" : "Send message"} title={researchMode ? "Draft a research plan (Enter). You review it before research starts." : "Send (Enter). Shift + Enter adds a new line."} disabled={!draft.trim() || locked || !modelAvailable || codeBlocked}><ArrowUp size={18} /></button>}
             </div>
           </div>
         </form>
@@ -1123,8 +1185,7 @@ export function ChatApp() {
         </div>}
         <div className="composer-caption">
           {draftState === "error" ? <span className="caption-warning" role="status">Draft not saved, retry before leaving</span> : <span className="sr-only" role="status">{draftState === "saving" ? "Saving draft…" : "Draft saved"}</span>}
-          <span>{replyRunning ? "Reply in progress. Keep writing; Send returns when it finishes or you press Stop." : codeBlocked ? codeStatus?.reason || "Coding mode isn't available here." : codeChat ? "Commands and file changes wait for your approval. Model Chat's data and credentials are off limits." : webInfo?.enabled ? "Models can make mistakes. Prompts, file text and web searches go to GitHub Copilot." : "Models can make mistakes. Prompts and file text are sent to GitHub Copilot."}</span>
-          <button type="button" onClick={() => setSettings(true)}>Files &amp; privacy</button>
+          {codeBlocked && <span className="caption-warning">{codeStatus?.reason || "Coding mode isn't available here."}</span>}
         </div>
       </div>
     </main>
@@ -1143,7 +1204,7 @@ export function ChatApp() {
         </div>
         <p>Dark is the default. Your choice is saved in this browser only. The lamp-light effect on the sign-in and new-chat screens stays still if your device asks for reduced motion, and on phones.</p>
       </div>
-      <div className="settings-section"><h3><ShieldCheck size={16} /> {access.tunnelMode ? "Temporary remote access" : "Personal, local-only"}</h3><p>{access.tunnelMode ? "A temporary Cloudflare HTTPS tunnel is active. Anyone with the link can create an email/password account without OTP. This link uses the app's password login, not Cloudflare Access. Cloudflare relays the traffic. Stop the tunnel when finished." : "This app listens on 127.0.0.1 only. Use only the app's explicit temporary-tunnel mode for remote access; do not otherwise expose it through a proxy, LAN or the internet."} App accounts have separate histories and files, but all use the host owner&apos;s Copilot account and usage limits.</p><p>Histories and original files stay in this app&apos;s local SQLite database. Prompts, chat context and extracted file text go to GitHub Copilot when you send. These are not end-to-end encrypted; people with access to your Windows account or backups can read local data.</p></div>
+      <div className="settings-section"><h3><ShieldCheck size={16} /> {access.tunnelMode ? "Temporary remote access" : "Personal, local-only"}</h3><p>{access.tunnelMode ? "A temporary Cloudflare HTTPS tunnel is active. Anyone with the link can create an email/password account without OTP. This link uses the app's password login, not Cloudflare Access. Cloudflare relays the traffic. Stop the tunnel when finished." : "This app listens on 127.0.0.1 only. Use only the app's explicit temporary-tunnel mode for remote access; do not otherwise expose it through a proxy, LAN or the internet."} App accounts have separate histories and files, but all use the host owner&apos;s Copilot account and usage limits.</p><p>Histories and original files stay in this app&apos;s local SQLite database. Prompts, chat context, extracted file text and web searches go to GitHub Copilot when you send. These are not end-to-end encrypted; people with access to your Windows account or backups can read local data.</p><p>Models can make mistakes. Check important answers.</p></div>
       <div className="settings-section"><h3><span className={`status-dot ${connectionError ? "offline" : ""}`} /> Copilot connection</h3><p>{connectionError || `${models.length} models discovered from the Copilot SDK. Availability may differ from the desktop app and can change with your plan.`}</p><p>Already signed-in CLI credentials are reused through supported SDK authentication. If sign-in is needed, run this from the app folder:</p><code className="command">npm run copilot:login</code><button className="secondary-button" onClick={() => void refreshModels()} disabled={modelLoading}><RefreshCw size={16} /> Refresh connection</button></div>
       <div className="settings-section"><h3><FileText size={16} /> Files and model context</h3>
         <p>Select multiple supported files together, add another selection, drag files onto the composer or paste images. Three files can transfer concurrently per account, six across the app. Each shows progress and can be removed. Processing continues in the background.</p>
@@ -1158,7 +1219,11 @@ export function ChatApp() {
         : `Off for this account. ${webInfo.reason ?? ""} Replies use only the model's training and what you share.`}</p>
         {actor?.appRole === "superuser" && !acting && <p>Who can use it: {webInfo.scope === "everyone" ? "every account" : webInfo.scope === "off" ? "nobody (turned off)" : "only your own chats"}. Change it on the host with <code>npm run web:search -- owner | everyone --yes | off</code>. It is never offered while acting as another user. Each use is recorded in the audit log, without the search text.</p>}
       </div>}
-      {actor?.appRole === "superuser" && !acting && codeStatus && <div className="settings-section"><h3><FolderOpen size={16} /> Coding mode</h3><p>{codeStatus.available ? <>Available in this browser. Choose Code in the message box to work on a project folder{codeStatus.projectsRoot ? <> (new projects go in <code>{codeStatus.projectsRoot}</code>)</> : null}. The model uses this computer&apos;s own tools; every command, file change and web fetch waits for your approval, and Model Chat&apos;s data, .env files and credentials are always blocked.</> : codeStatus.reason}</p><p>Only the superuser account can use it, never while acting as someone else. It works only from a browser on this computer{codeStatus.remoteEnabled ? "; remote use is turned on and needs two-step verification" : ", not through the shared link"}.</p></div>}
+      {webInfo?.enabled && <div className="settings-section"><h3><Telescope size={16} /> Deep research</h3>
+        <p>Turn on <strong>Deep research</strong> in the message box for one message. The model drafts a plan for you to review or edit; after you start it, it searches the web, reads full pages and writes a long report with numbered citations and a sources list. It runs on the server, so you can close the tab or open other chats and come back to the result. Stop ends it.</p>
+        <p>Each run uses up to 12 searches, 10 full pages, 45 model requests and 15 minutes, with your chosen model and thinking level (the plan uses at most Medium). Searches run on GitHub&apos;s servers; <strong>full pages are downloaded by this computer</strong> from public internet addresses only, never local or private ones, without cookies or saved sign-ins. Pages that need JavaScript, PDFs and sites blocked by this computer&apos;s network protection can&apos;t be read. Start, finish and counts are audited, without search text or page contents.</p>
+      </div>}
+      {actor?.appRole === "superuser" && !acting && codeStatus && <div className="settings-section"><h3><FolderOpen size={16} /> Coding mode</h3><p>{codeStatus.available ? <>Available in this browser. Choose Code in the message box to work on a project folder{codeStatus.projectsRoot ? <> (new projects go in <code>{codeStatus.projectsRoot}</code>)</> : null}. The model uses this computer&apos;s own tools; every command, file change and web fetch waits for your approval, and Model Chat&apos;s data, .env files and credentials are always blocked.</> : codeStatus.reason}</p><p>Only the superuser account can use it, never while acting as someone else. {codeStatus.remoteEnabled ? "It also works through the shared link with your normal sign-in (remote coding is on); live previews still open only in a browser on this computer." : "It works only from a browser on this computer, not through the shared link."}</p></div>}
       {actor?.appRole === "superuser" && !acting && codeStatus && <div className="settings-section"><h3><ShieldCheck size={16} /> Two-step verification</h3><TwoFactorSettings status={codeStatus} api={api} onChanged={() => void api<CodingStatus>("/api/code/status").then(setCodeStatus).catch(report)} /></div>}
       <div className="settings-section"><h3><Mic size={16} /> Local audio/video processing</h3><p>{mediaInfo?.message || "Checking local media configuration..."} {mediaInfo?.ready && <>Whisper model: {mediaInfo.model}, running on this computer&apos;s CPU.</>}</p><p>MP3, WAV, M4A, AAC, FLAC, OGG, OPUS, MP4, MOV, WEBM, MKV and AVI are accepted when their streams are decodable. Speech becomes a machine transcript; video also supplies up to four still frames. Copilot receives those extracted inputs when you press Send, not native audio/video. Transcription can be imperfect, and unsampled visual events may be missed.</p><p>One recording and one document can process at a time; others wait in a durable queue. No media-duration or overall-processing deadline is imposed. Long recordings are decoded/transcribed in bounded-memory windows, and processing may take a long time. Closing the browser does not discard accepted uploads. Interrupted jobs resume from the beginning after a server restart. Administrator-created delegated jobs stop if that administrator loses access or signs out. Transcription uses installed local packages/cached weights, without a speech API key. Public-link uploads pass through Cloudflare.</p></div>
       <div className="settings-section"><h3><ShieldCheck size={16} /> Administrator access</h3><p>The app superuser can view users&apos; chat sessions and files and act as a user to send messages or modify chats. An audit log records the real actor, effective user, action, object IDs, time and outcome—not prompt/file contents or credentials. {acting && <>You are still signed in as {actor?.email}; signing out ends that real login session.</>}</p></div>

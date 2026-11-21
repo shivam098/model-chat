@@ -5,6 +5,7 @@ import { AppError } from "../errors";
 import { readJson } from "../http";
 import { LIMITS } from "../contracts";
 import { listModels, replyReasoningEffort, type ReplyRunner } from "../copilot";
+import { THINKING_LEVELS } from "../thinking";
 import { createChatStream, type StreamSecurity } from "../stream";
 import { codingStatus, requireCoding } from "./access";
 import { readFileSync, realpathSync, statSync } from "node:fs";
@@ -97,6 +98,7 @@ export async function handleCodeMessage(request: Request, ctx: AccessContext, gu
   const body = await readJson(request, z.object({
     content: z.string().trim().min(1, "Write a message first.").max(LIMITS.inputCharacters),
     model: z.string().min(1).max(128),
+    thinking: z.enum(THINKING_LEVELS).optional(),
     fileIds: z.array(z.uuid()).max(0, "Coding chats work on the project folder. Put files in the project instead of attaching them.").default([]),
   }).strict());
   store.assertIdle(user.id, chatId);
@@ -105,12 +107,12 @@ export async function handleCodeMessage(request: Request, ctx: AccessContext, gu
   if (!model) throw new AppError(400, "That model is no longer available. Refresh the model list and select another.");
   const history = store.messages(user.id, chatId).filter(message => message.content).map(message => ({ role: message.role, content: message.content }));
   const runner = codingRunner({ store, chat, ownerId: user.id, history, audit: (action, objectId, outcome, reason) => guard.record(ctx, action, objectId, outcome, reason, true) });
-  const effort = replyReasoningEffort(model);
+  const effort = replyReasoningEffort(model, body.thinking);
   const wrapped: ReplyRunner = input => runner({ ...input, reasoningEffort: effort });
   // Coding access is re-checked throughout the turn: losing the superuser role or the local browser stops it.
   const codingSecurity: StreamSecurity = { ...security, check: () => {
     security.check();
     if (!codingStatus(request, ctx, guard).available) throw new AppError(403, "Coding access ended.");
   } };
-  return createChatStream(store, user.id, chatId, body.content, body.model, [], body.content, wrapped, request.signal, codingSecurity, undefined, { idleMs: 30 * 60_000 });
+  return createChatStream(store, user.id, chatId, body.content, body.model, [], body.content, wrapped, request.signal, codingSecurity, undefined, { idleMs: 30 * 60_000, thinking: effort ?? null });
 }

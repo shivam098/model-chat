@@ -6,6 +6,7 @@ import Database from "better-sqlite3";
 import { Store } from "../../lib/store";
 import { AccessService } from "../../lib/access";
 import { setTimeout as delay } from "node:timers/promises";
+import { selectModel } from "./helpers";
 
 test("multiple mixed attachments transfer concurrently, survive reload, remove cleanly and submit together", async ({ page, browser }) => {
   test.setTimeout(240000);
@@ -71,7 +72,7 @@ test("multiple mixed attachments transfer concurrently, survive reload, remove c
     const models = (await (await page.request.get("/api/models")).json()).models as { id: string; maxImages?: number; vision?: boolean }[];
     const oneImage = models.find(model => model.vision && model.maxImages === 1);
     expect(oneImage).toBeTruthy();
-    await page.getByRole("combobox", { name: "Select model" }).selectOption(oneImage!.id);
+    await selectModel(page, oneImage!.id);
     await expect(page.locator(".file-guidance")).toContainText("1 additional Copilot request");
     await page.screenshot({ path: "test-results/multi-file-desktop.png", fullPage: true, animations: "disabled" });
     const submissions: { fileIds: string[] }[] = [];

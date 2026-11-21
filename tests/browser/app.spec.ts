@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { runAdminFlow } from "./admin-flow";
 import type { DictationEvent } from "../../lib/voice";
 import { runMediaFlow } from "./media-flow";
+import { modelButton, openAccount, selectModel } from "./helpers";
 
 const origin = "http://127.0.0.1:3211";
 const password = "Test-only password! 48291";
@@ -46,7 +47,7 @@ test("accounts, ownership, files, histories, password validation and responsive 
   await page.reload();
   await expect(page.locator(".file-chip").filter({ hasText: "project-notes.txt" })).toBeVisible();
   await expect(page.getByRole("button", { name: "My private workspace", exact: true })).toBeVisible();
-  await expect(page.getByRole("combobox", { name: "Select model" })).toBeEnabled();
+  await expect(modelButton(page)).toBeEnabled();
   await page.screenshot({ path: "test-results/chat-desktop.png", fullPage: true, animations: "disabled" });
 
   const other = await browser.newContext();
@@ -216,8 +217,8 @@ test("live Copilot streaming and switched-model file context", async ({ page }) 
   const { models } = await response.json() as { models: { id: string; multiplier?: number }[] };
   const choices = models.filter(m => m.id !== "auto").sort((a, b) => (a.multiplier ?? 1) - (b.multiplier ?? 1));
   expect(choices.length).toBeGreaterThan(1);
-  await expect(page.getByRole("combobox", { name: "Select model" })).toBeEnabled();
-  await page.getByRole("combobox", { name: "Select model" }).selectOption(choices[0].id);
+  await expect(modelButton(page)).toBeEnabled();
+  await selectModel(page, choices[0].id);
   await page.locator('input[type="file"]').setInputFiles({ name: "sample.txt", mimeType: "text/plain", buffer: Buffer.from("The project's code word is BIRCH42.") });
   await expect(page.locator(".file-chip").filter({ hasText: "sample.txt" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Preview extracted text for sample.txt", exact: true })).toBeEnabled();
@@ -228,8 +229,8 @@ test("live Copilot streaming and switched-model file context", async ({ page }) 
   await expect(page.getByRole("button", { name: "Stop reply" })).toHaveCount(0, { timeout: 120_000 });
   await page.reload();
   await expect(page.locator(".message.assistant")).toContainText("BIRCH42");
-  await expect(page.getByRole("combobox", { name: "Select model" })).toBeEnabled();
-  await page.getByRole("combobox", { name: "Select model" }).selectOption(choices[1].id);
+  await expect(modelButton(page)).toBeEnabled();
+  await selectModel(page, choices[1].id);
   await page.getByLabel("Message", { exact: true }).fill("Using the same file and earlier conversation, repeat that code word only.");
   await page.getByRole("button", { name: "Send message" }).click();
   await expect(page.locator(".message.assistant").last()).toContainText("BIRCH42", { timeout: 120_000 });
@@ -251,6 +252,6 @@ test("missing Copilot access is explicit and never yields a fake answer", async 
   await page.getByLabel("Message", { exact: true }).fill("Are you connected?");
   await expect(page.getByRole("button", { name: "Send message" })).toBeDisabled();
   await expect(page.locator(".message.assistant")).toHaveCount(0);
-  await page.getByRole("button", { name: "Files & privacy" }).click();
-  await expect(page.getByRole("dialog")).toContainText("npm run copilot:login");
+  await expect(page.locator(".composer-caption")).not.toContainText("Models can make mistakes");
+  await expect(await openAccount(page)).toContainText("npm run copilot:login");
 });

@@ -4,6 +4,7 @@ import path from "node:path";
 import sharp from "sharp";
 import { Store } from "../../lib/store";
 import { AccessService } from "../../lib/access";
+import { selectModel } from "./helpers";
 
 export async function runAdminFlow(page: Page, bob: Page, adminEmail: string, bobEmail: string) {
   const origin = "http://127.0.0.1:3211";
@@ -62,7 +63,7 @@ export async function runAdminFlow(page: Page, bob: Page, adminEmail: string, bo
     if (process.env.MODEL_CHAT_ADMIN_LIVE_TEST === "1") {
       const vision = available.find(item => item.vision);
       expect(vision).toBeTruthy();
-      await page.getByRole("combobox", { name: "Select model" }).selectOption(vision!.id);
+      await selectModel(page, vision!.id);
       await page.getByLabel("Message", { exact: true }).fill("Read the two-character label in the attached image. Reply with just those two characters.");
       await page.getByRole("button", { name: "Send message", exact: true }).click();
       requests = 1;

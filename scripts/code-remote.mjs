@@ -1,6 +1,6 @@
 // Owner-only switch for coding mode over the shared link. Run on the computer hosting Model Chat:
 //   npm run code:remote -- status | on --yes | off
-// Remote coding also needs two-step verification on the superuser account and a sign-in that used it.
+// When it's on, the superuser's ordinary sign-in through the link can use coding mode (two-step verification is optional).
 import Database from "better-sqlite3";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -45,19 +45,15 @@ if (command === "status" || !command) {
 } else if (command === "on") {
   if (!flags.includes("--yes")) {
     console.error([
-      "Remote coding lets the superuser run commands and change files on this computer from anywhere the shared link reaches.",
-      "Use it only on a computer you own (for example your own Mac), never on a managed work PC.",
+      "Remote coding lets the superuser run commands and change files on this computer from anywhere the shared link reaches, with only the superuser's password.",
+      "Anyone who learns that password could do the same with this Windows account's rights; approvals don't stop them, because they approve as you.",
       "If that's what you want, run: npm run code:remote -- on --yes",
     ].join("\n"));
     process.exit(1);
   }
-  const owners = superusers();
-  if (!owners.length || !owners.every(owner => owner.twoFactor)) {
-    console.error("Turn on two-step verification for the superuser account first: open Model Chat in this computer's browser, then Account & connection > Two-step verification.");
-    process.exit(1);
-  }
+  if (!superusers().length) console.warn("No superuser account exists yet, so nobody can use coding mode until one is set up.");
   save(true);
-  console.log("Remote coding is on. Through the link it still needs the superuser to sign in with a two-step verification code. Turn it off with: npm run code:remote -- off");
+  console.log("Remote coding is on. The superuser can use coding mode through the shared link with a normal sign-in; live previews stay on this computer. Turn it off with: npm run code:remote -- off");
 } else {
   console.error("Usage: npm run code:remote -- status | on --yes | off");
   process.exit(1);

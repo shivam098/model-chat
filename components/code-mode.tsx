@@ -234,7 +234,7 @@ export function ProjectPicker({ api, root, platform, onOpen }: { api: Api; root:
   </div>;
 }
 
-/** Superuser two-step verification: authenticator-app codes plus one-time backup codes. Remote coding requires it. */
+/** Optional superuser two-step verification: authenticator-app codes plus one-time backup codes. */
 export function TwoFactorSettings({ status, api, onChanged }: { status: CodingStatus; api: Api; onChanged: () => void }) {
   const [step, setStep] = useState<"idle" | "password-on" | "scan" | "codes" | "password-off">("idle");
   const [password, setPassword] = useState("");
@@ -284,10 +284,10 @@ export function TwoFactorSettings({ status, api, onChanged }: { status: CodingSt
         <button type="button" onClick={() => { setSetup(null); setStep("idle"); }}>Done</button>
       </div>
     </> : status.twoFactorEnabled ? <>
-      <p>Two-step verification is <strong>on</strong>: signing in to this account asks for a code from your authenticator app. {status.secondFactorVerified ? "This session was signed in with a code." : "This session was signed in before it was turned on. Sign out and back in to use it for remote coding."}</p>
+      <p>Two-step verification is <strong>on</strong>: signing in to this account asks for a code from your authenticator app.</p>
       {step === "password-off" ? passwordForm("Turn off", turnOff) : <button type="button" className="secondary-button" onClick={() => { setStep("password-off"); setError(""); }}>Turn off two-step verification</button>}
     </> : <>
-      <p>Two-step verification is <strong>off</strong>. Turn it on to require a code from an authenticator app each time this account signs in. Remote coding needs it.</p>
+      <p>Two-step verification is <strong>off</strong>. Turn it on to require a code from an authenticator app each time this account signs in. It&apos;s optional.</p>
       {step === "password-on" ? passwordForm("Continue", start) : <button type="button" className="secondary-button" onClick={() => { setStep("password-on"); setError(""); }}>Turn on two-step verification</button>}
     </>}
   </div>;

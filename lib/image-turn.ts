@@ -36,7 +36,7 @@ async function collectAnalysis(runner: ReplyRunner, input: ReplyInput) {
   } finally { input.signal.removeEventListener("abort", cancel); }
 }
 
-export function prepareImageTurn(store: Store, userId: string, chatId: string, content: string, fileIds: string[], model: ModelInfo, runner: ReplyRunner, audit?: AnalysisAudit) {
+export function prepareImageTurn(store: Store, userId: string, chatId: string, content: string, fileIds: string[], model: ModelInfo, runner: ReplyRunner, audit?: AnalysisAudit, thinking?: string | null) {
   store.contextFiles(userId, chatId, fileIds, content);
   const messages = store.messages(userId, chatId);
   const attachments = store.attachments(userId, chatId);
@@ -119,7 +119,7 @@ Return only JSON matching {"images":[{"id":"exact supplied image id","analysis":
     input.onProgress?.(batches.length ? "Combining all attachments into one reply" : "Generating reply");
     const finalPrompt = makePrompt(true);
     const images = nativeImages(direct.map(source => store.imageFile(userId, chatId, source)), model);
-    await runner({ ...input, prompt: finalPrompt, images, reasoningEffort: replyReasoningEffort(model) });
+    await runner({ ...input, prompt: finalPrompt, images, reasoningEffort: input.reasoningEffort ?? replyReasoningEffort(model, thinking) });
   };
   return { prompt, runner: planned, additionalRequests: batches.length };
 }

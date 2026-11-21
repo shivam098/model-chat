@@ -7,6 +7,7 @@ import sharp from "sharp";
 import { chromium, expect } from "@playwright/test";
 import env from "@next/env";
 import { setTimeout as delay } from "node:timers/promises";
+import { selectModel } from "./browser/helpers";
 
 env.loadEnvConfig(process.cwd());
 const data = path.resolve(process.env.MODEL_CHAT_DATA_DIR || ".local");
@@ -29,7 +30,7 @@ try {
   const models = (await (await context.request.get("/api/models")).json()).models as { id: string; maxImages?: number; vision?: boolean; multiplier?: number }[];
   const selected = models.filter(model => model.vision && model.maxImages === 1).sort((a, b) => (a.multiplier ?? 1) - (b.multiplier ?? 1))[0];
   assert.ok(selected, "A real vision model advertising one image per request is needed for this check.");
-  await page.getByRole("combobox", { name: "Select model" }).selectOption(selected.id);
+  await selectModel(page, selected.id);
   const picture = async (color: string, label: string) => sharp({ create: { width: 400, height: 220, channels: 3, background: color } })
     .composite([{ input: Buffer.from(`<svg width="400" height="220"><text x="60" y="145" font-size="90" fill="white">${label}</text></svg>`) }]).png().toBuffer();
   await page.locator('input[type="file"]').setInputFiles([

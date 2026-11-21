@@ -29,14 +29,14 @@ export function hasSessionReply(sessionId: string) {
 export function stopSessionReplies(sessionId: string) {
   for (const job of active.values()) if (job.sessionId === sessionId) job.controller.abort();
 }
-export function createChatStream(store: Store, userId: string, chatId: string, content: string, model: string, fileIds: string[], prompt: string, runner: ReplyRunner, requestSignal: AbortSignal, security?: StreamSecurity, images?: NativeImage[], options: { idleMs?: number } = {}) {
+export function createChatStream(store: Store, userId: string, chatId: string, content: string, model: string, fileIds: string[], prompt: string, runner: ReplyRunner, requestSignal: AbortSignal, security?: StreamSecurity, images?: NativeImage[], options: { idleMs?: number; thinking?: string | null } = {}) {
   const idleMs = options.idleMs ?? 240_000;
   if (active.has(chatId)) throw new AppError(409, "A reply is already running in this chat.");
   if (active.size >= 2 || [...active.values()].some(j => j.userId === userId || j.actorId === (security?.actorId ?? userId))) throw new AppError(429, "One reply per account or actor and two per app can run at once. Wait or stop the current reply.");
   const controller = new AbortController();
   const turn = store.db.transaction(() => {
     security?.check();
-    const turn = store.beginTurn(userId, chatId, content, model, fileIds);
+    const turn = store.beginTurn(userId, chatId, content, model, fileIds, options.thinking);
     security?.accepted(turn.user.id, turn.assistant.id);
     return turn;
   })();

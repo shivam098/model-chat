@@ -1,4 +1,4 @@
-import { CopilotClient, type SessionConfig, type CopilotSession, type ModelInfo, type Tool } from "@github/copilot-sdk";
+import { CopilotClient, type SessionConfig, type CopilotSession, type ModelInfo, type SessionEvent, type Tool } from "@github/copilot-sdk";
 type ReasoningEffort = NonNullable<SessionConfig["reasoningEffort"]>;
 import { mkdir, rm } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
@@ -8,6 +8,7 @@ import { AppError } from "./errors";
 import { systemInstruction } from "./context";
 import type { CodeEvent, NativeImage, WebSource } from "./contracts";
 import { WEB_SERVER, WEB_TOOL, extractSources, mergeSources } from "./web-search";
+import { nearestLevel, orderedLevels, type ThinkingLevel } from "./thinking";
 import { expectedCopilotLogin, isAccountError, isolatedRuntimeEnvironment, selectStoredSignIn, verifyRuntimeIdentity } from "./copilot-account";
 
 const copilotHome = process.env.MODEL_CHAT_COPILOT_HOME ? path.resolve(process.env.MODEL_CHAT_COPILOT_HOME) : path.join(dataDirectory, "copilot");
@@ -141,13 +142,14 @@ export async function listModels(refresh = false): Promise<ModelInfo[]> {
   })().catch(error => { throw copilotError(error); }).finally(() => { catalogState.modelChatCatalogPending = undefined; });
   return catalogState.modelChatCatalogPending;
 }
-export function safeSessionConfig(model: string, directory: string, sessionId: string, tools: Tool[] = [], toolInstruction?: string, reasoningEffort?: ReasoningEffort, webSearch = false): SessionConfig {
+export function safeSessionConfig(model: string, directory: string, sessionId: string, tools: Tool[] = [], toolInstruction?: string, reasoningEffort?: ThinkingLevel, webSearch = false, extra: { hooks?: SessionConfig["hooks"]; pageReader?: boolean } = {}): SessionConfig {
   const allowed = new Set(tools.map(tool => tool.name));
   return {
     sessionId,
     model,
     clientName: "Model Chat",
-    ...(reasoningEffort ? { reasoningEffort, reasoningSummary: "detailed" as const } : {}),
+    // "none" (Off) is a catalogue level the SDK's type doesn't list yet; the runtime accepts it and then returns no reasoning.
+    ...(reasoningEffort ? { reasoningEffort: reasoningEffort as ReasoningEffort, ...(reasoningEffort === "none" ? {} : { reasoningSummary: "detailed" as const }) } : {}),
     // Only app-defined tools (and, for web-enabled chats, GitHub's hosted web search) are allow-listed; every other built-in, MCP and custom tool stays excluded.
     availableTools: [...tools.map(tool => `custom:${tool.name}`), ...(webSearch ? [`mcp:${WEB_TOOL}`] : [])],
     excludedTools: webSearch ? (tools.length ? ["builtin:*"] : ["builtin:*", "custom:*"]) : tools.length ? ["builtin:*", "mcp:*"] : ["builtin:*", "mcp:*", "custom:*"],
@@ -158,7 +160,8 @@ export function safeSessionConfig(model: string, directory: string, sessionId: s
     customAgents: [],
     includedBuiltinSkills: [],
     skillDirectories: [],
-    hooks: {},
+    // Only the app's own in-process hooks (deep research uses one to cap searches); nothing is loaded from the environment.
+    hooks: extra.hooks ?? {},
     enableConfigDiscovery: false,
     skipCustomInstructions: true,
     enableOnDemandInstructionDiscovery: false,
@@ -177,7 +180,7 @@ export function safeSessionConfig(model: string, directory: string, sessionId: s
     workingDirectory: directory,
     configDirectory: copilotHome,
     streaming: true,
-    systemMessage: { mode: "replace", content: systemInstruction(tools.length ? toolInstruction : undefined, webSearch) },
+    systemMessage: { mode: "replace", content: systemInstruction(tools.length ? toolInstruction : undefined, webSearch, extra.pageReader) },
     onPermissionRequest: request => (request.kind === "custom-tool" && allowed.has(request.toolName))
       || (webSearch && request.kind === "mcp" && request.serverName === WEB_SERVER && request.toolName === WEB_TOOL)
       ? { kind: "approved" }
@@ -198,21 +201,32 @@ export interface ReplyInput {
   onAttachments?: () => void;
   tools?: Tool[];
   toolInstruction?: string;
-  reasoningEffort?: ReasoningEffort;
+  reasoningEffort?: ThinkingLevel;
   onReasoning?: (text: string, replace: boolean) => void;
   /** Coding mode: a command, file change or approval card was created or updated. */
   onCodeEvent?: (event: CodeEvent) => void;
   /** Offer GitHub's hosted web search in this turn (decided by the server for the account). */
   webSearch?: boolean;
   onWeb?: (update: { searching: boolean; searches: number; sources: WebSource[] }) => void;
+  /** Deep research: the session also has the read_page tool, a tool call can be refused before it runs, and every session event is observed. */
+  pageReader?: boolean;
+  preToolUse?: (toolName: string, args: unknown) => string | null;
+  onSessionEvent?: (event: SessionEvent) => void;
 }
 export type ReplyRunner = (input: ReplyInput) => Promise<void>;
 // Without an explicit level the runtime requests no reasoning; "medium" lets models think when a question warrants it.
-export function replyReasoningEffort(model: ModelInfo): ReasoningEffort | undefined {
+// A chosen level is used when the model supports it, otherwise the nearest one it does.
+export function replyReasoningEffort(model: ModelInfo, requested?: string | null): ThinkingLevel | undefined {
   if (!model.capabilities.supports.reasoningEffort) return undefined;
-  const supported = (model.supportedReasoningEfforts ?? []).filter(level => (level as string) !== "none");
-  if (model.defaultReasoningEffort && supported.includes(model.defaultReasoningEffort)) return model.defaultReasoningEffort;
-  return supported.includes("medium") ? "medium" : supported[0];
+  const levels = model.supportedReasoningEfforts as string[] | undefined;
+  if (!requested && model.defaultReasoningEffort && orderedLevels(levels).includes(model.defaultReasoningEffort as ThinkingLevel)) return model.defaultReasoningEffort as ThinkingLevel;
+  return nearestLevel(levels, requested);
+}
+/** The levels a model offers in the picker, or undefined when it has no adjustable reasoning. */
+export function modelLevels(model: ModelInfo): string[] | undefined {
+  if (!model.capabilities.supports.reasoningEffort) return undefined;
+  const levels = orderedLevels(model.supportedReasoningEfforts as string[] | undefined);
+  return levels.length ? levels : undefined;
 }
 export function verifyToolMetadata(tools: { name: string; mcpServerName?: string; deferLoading?: boolean }[] | null | undefined, expected: string[]) {
   const names = (tools || []).map(tool => tool.name).sort();
@@ -240,7 +254,7 @@ export function unexpectedTool(tools: { name: string; mcpServerName?: string }[]
     ? !(webSearch && tool.mcpServerName === WEB_SERVER && tool.name === WEB_TOOL)
     : !customNames.includes(tool.name))?.name ?? null;
 }
-export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDelta, onReplace, images, authorize, onRequestStart, onProgress, tools = [], toolInstruction, reasoningEffort, onReasoning, webSearch = false, onWeb }) => {
+export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDelta, onReplace, images, authorize, onRequestStart, onProgress, tools = [], toolInstruction, reasoningEffort, onReasoning, webSearch = false, onWeb, pageReader = false, preToolUse, onSessionEvent }) => {
   onRequestStart?.();
   const sessionId = `modelchat-${randomUUID()}`;
   const directory = path.join(copilotHome, "requests", sessionId);
@@ -255,13 +269,20 @@ export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDe
     authorize?.();
     client = await createClient();
     signal.throwIfAborted();
-    session = await deadline(client.createSession(safeSessionConfig(model, directory, sessionId, tools, toolInstruction, reasoningEffort, webSearch)), 30_000);
+    const hooks: SessionConfig["hooks"] = preToolUse ? {
+      onPreToolUse: input => {
+        const reason = preToolUse(input.toolName, input.toolArgs);
+        return reason ? { permissionDecision: "deny", permissionDecisionReason: reason } : undefined;
+      },
+    } : undefined;
+    session = await deadline(client.createSession(safeSessionConfig(model, directory, sessionId, tools, toolInstruction, reasoningEffort, webSearch, { hooks, pageReader })), 30_000);
     signal.throwIfAborted();
     await deadline(session.rpc.tools.initializeAndValidate(), 15_000);
     const metadata = await deadline(session.rpc.tools.getCurrentMetadata(), 15_000);
     verifyToolMetadata(metadata.tools, tools.map(tool => tool.name));
     signal.throwIfAborted();
     authorize?.();
+    if (onSessionEvent) unsubscribe.push(session.on(event => onSessionEvent(event)));
     // A tool-using turn can contain several assistant messages; keep all of them in one saved reply.
     const accumulate = createMessageAccumulator(onDelta, onReplace);
     unsubscribe.push(session.on("assistant.message_delta", event => accumulate(event.data.messageId, event.data.deltaContent, false)));

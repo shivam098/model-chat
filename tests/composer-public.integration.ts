@@ -6,6 +6,7 @@ import Database from "better-sqlite3";
 import { chromium, expect, type BrowserContext } from "@playwright/test";
 import env from "@next/env";
 import { setTimeout as delay } from "node:timers/promises";
+import { modelButton, selectModel } from "./browser/helpers";
 
 // Opt-in live check of the running HTTPS link: exactly two real Copilot replies (one stopped mid-stream).
 env.loadEnvConfig(process.cwd());
@@ -42,8 +43,7 @@ try {
   let posts = 0;
   page.on("request", request => { if (request.method() === "POST" && request.url().endsWith("/messages")) posts++; });
   await page.goto(origin);
-  const picker = page.getByRole("combobox", { name: "Select model" });
-  await picker.selectOption(first.id);
+  await selectModel(page, first.id);
   const composer = page.getByLabel("Message", { exact: true });
   await composer.fill("Write a very long, detailed essay (at least 2000 words, many sections) on the history of bridge engineering from antiquity to today.");
   await page.getByRole("button", { name: "Send message", exact: true }).click();
@@ -65,7 +65,7 @@ try {
   await expect(composer).toHaveValue(draft);
   await page.locator('input[type="file"]').setInputFiles({ name: "notes.txt", mimeType: "text/plain", buffer: Buffer.from(`Meeting notes.\nThe code word is ${codeWord}.\n`) });
   await expect(page.getByRole("button", { name: "Preview extracted text for notes.txt", exact: true })).toBeEnabled({ timeout: 60_000 });
-  await picker.selectOption(second.id);
+  await selectModel(page, second.id);
   const dictate = page.getByRole("button", { name: /Dictate/ });
   if (await dictate.isEnabled()) {
     await dictate.click();
@@ -73,7 +73,7 @@ try {
     await page.getByRole("button", { name: "Keep typing" }).click();
   }
   await expect(page.getByRole("button", { name: "Send message", exact: true })).toHaveCount(0);
-  await expect(page.locator(".composer-caption")).toContainText("Reply in progress");
+  await expect(page.getByRole("button", { name: "Stop reply", exact: true })).toBeVisible();
   assert.equal(posts, 1, "Enter must not send while a reply streams");
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
   await page.screenshot({ path: "test-results/composer-live-mobile.png", fullPage: true, animations: "disabled" });
@@ -88,7 +88,7 @@ try {
   assert.equal(pending.length, 1);
   assert.equal(pending[0].messageId, null, "A file added mid-reply stays pending for the next message");
   await expect(composer).toHaveValue(draft);
-  await expect(picker).toHaveValue(second.id);
+  await expect(modelButton(page)).toHaveAttribute("data-model", second.id);
   await page.setViewportSize({ width: 1280, height: 800 });
   await expect(page.getByRole("button", { name: "Send message", exact: true })).toBeEnabled();
   await page.getByRole("button", { name: "Send message", exact: true }).click();

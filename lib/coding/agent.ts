@@ -8,10 +8,12 @@ import type { Chat, CodeEvent } from "../contracts";
 import { closeClient, copilotError, copilotHomeDirectory, copilotSessionToken, createMessageAccumulator, deadline, type ReplyRunner } from "../copilot";
 import { isolatedRuntimeEnvironment } from "../copilot-account";
 import { AppError } from "../errors";
+import type { ThinkingLevel } from "../thinking";
 import { applyDecision, emptyAllowances, gate, type Allowances, type ApprovalCard, type Decision } from "./policy";
 
 type Audit = (action: string, objectId: string | null, outcome: "allowed" | "denied" | "error", reason: string | null) => void;
-type ReasoningEffort = NonNullable<SessionConfig["reasoningEffort"]>;
+type ReasoningEffort = ThinkingLevel;
+type SdkEffort = NonNullable<SessionConfig["reasoningEffort"]>;
 
 const SHELL = process.platform === "win32" ? "powershell" : "bash";
 // File tools differ by model family (e.g. GPT models edit with apply_patch and search with rg); all are equivalent file operations.
@@ -23,7 +25,7 @@ const QUIET_TOOLS = new Set([`read_${SHELL}`, `list_${SHELL}`, `write_${SHELL}`]
 interface Card { id: string; messageId: string; seq: number; kind: CodeEvent["kind"]; data: Record<string, unknown>; createdAt: number; flush?: ReturnType<typeof setTimeout> }
 interface Turn { messageId: string; emit?: (event: CodeEvent) => void; audit: Audit; signal: AbortSignal; activity?: () => void; progress?: (stage: string) => void }
 interface CodeSession {
-  chatId: string; ownerId: string; project: string; model: string; store: Store;
+  chatId: string; ownerId: string; project: string; model: string; effort?: ReasoningEffort; store: Store;
   client: CopilotClient; session: CopilotSession; sessionId: string;
   allowances: Allowances; cards: Map<string, Card>; toolKeys: Map<string, Set<string>>; turn: Turn | null; lastActive: number; fresh: boolean;
 }
@@ -70,7 +72,7 @@ export function codingInstruction(project: string) {
 function codingSessionConfig(model: string, project: string, sessionId: string, effort: ReasoningEffort | undefined, onPermissionRequest: SessionConfig["onPermissionRequest"]): SessionConfig {
   return {
     sessionId, model, clientName: "Model Chat code",
-    ...(effort ? { reasoningEffort: effort, reasoningSummary: "detailed" as const } : {}),
+    ...(effort ? { reasoningEffort: effort as SdkEffort, ...(effort === "none" ? {} : { reasoningSummary: "detailed" as const }) } : {}),
     availableTools: CODE_TOOLS.map(name => `builtin:${name}`),
     excludedTools: ["mcp:*", "custom:*"],
     tools: [], mcpServers: {}, customAgents: [], includedBuiltinSkills: [], skillDirectories: [], hooks: {},
@@ -259,7 +261,7 @@ async function startSession(chat: Chat, ownerId: string, model: string, effort: 
   const client = new CopilotClient({ mode: "empty", baseDirectory: home, workingDirectory: cwd, env: codingEnvironment(), useLoggedInUser: false, logLevel: "error" });
   const expected = await copilotSessionToken();
   const sessionId = `modelchat-code-${randomUUID()}`;
-  const partial = { chatId: chat.id, ownerId, project: chat.projectPath!, model, store, client, sessionId, allowances: emptyAllowances(), cards: new Map(), toolKeys: new Map(), turn: null, lastActive: Date.now(), fresh: true } as unknown as CodeSession;
+  const partial = { chatId: chat.id, ownerId, project: chat.projectPath!, model, effort, store, client, sessionId, allowances: emptyAllowances(), cards: new Map(), toolKeys: new Map(), turn: null, lastActive: Date.now(), fresh: true } as unknown as CodeSession;
   try {
     await deadline(client.start(), 30_000);
     const config = codingSessionConfig(model, partial.project, sessionId, effort, request => permission(partial, request));
@@ -296,7 +298,7 @@ async function startSession(chat: Chat, ownerId: string, model: string, effort: 
 async function ensureSession(chat: Chat, ownerId: string, model: string, effort: ReasoningEffort | undefined, store: Store) {
   const existing = sessions.get(chat.id);
   if (existing && existing.ownerId === ownerId && existing.project === chat.projectPath) {
-    if (existing.model !== model) { await deadline(existing.session.setModel(model, effort ? { reasoningEffort: effort } : undefined), 30_000); existing.model = model; }
+    if (existing.model !== model || existing.effort !== effort) { await deadline(existing.session.setModel(model, effort ? { reasoningEffort: effort as SdkEffort } : undefined), 30_000); existing.model = model; existing.effort = effort; }
     return existing;
   }
   if (existing) await disposeCodeSession(chat.id);

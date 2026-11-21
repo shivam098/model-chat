@@ -6,11 +6,13 @@ import { AppError, errorResponse } from "@/lib/errors";
 import { assertLocalRequest, readBytes, readJson, requireAccess } from "@/lib/http";
 import { LIMITS } from "@/lib/contracts";
 import { validateFileName } from "@/lib/files";
-import { listModels, runCopilotReply, type ReplyRunner } from "@/lib/copilot";
+import { listModels, modelLevels, replyReasoningEffort, runCopilotReply, type ReplyRunner } from "@/lib/copilot";
 import { prepareImageTurn } from "@/lib/image-turn";
 import { codeToolInstruction, createCodeTool, previewMatches } from "@/lib/code-tool";
 import { sandboxConfig, sandboxStatus } from "@/lib/sandbox";
 import { webSearchStatus } from "@/lib/web-search";
+import { beginResearch, cancelResearch, researchAllowed, startResearch } from "@/lib/research";
+import { THINKING_LEVELS } from "@/lib/thinking";
 import { createChatStream, stopReply, stopSessionReplies, hasSessionReply, type StreamSecurity } from "@/lib/stream";
 import { disposeCodeChat, handleCodeApi, handleCodeMessage } from "@/lib/coding/routes";
 import { hasCodeSession } from "@/lib/coding/agent";
@@ -37,7 +39,7 @@ function transferSlot(userId: string) {
 type RouteContext = { params: Promise<{ segments: string[] }> };
 const accountId = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
 const draftSchema = z.object({
-  chatId: z.uuid().optional(), draft: z.string().max(LIMITS.inputCharacters), model: z.string().max(128).optional(),
+  chatId: z.uuid().optional(), draft: z.string().max(LIMITS.inputCharacters), model: z.string().max(128).optional(), thinking: z.enum(THINKING_LEVELS).optional(),
 }).strict();
 const pagination = z.coerce.number().int().min(0).max(100_000);
 
@@ -68,7 +70,7 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
       if (!((method === "POST" && ["sign-up/email", "sign-in/email", "sign-out", "two-factor/verify-totp", "two-factor/verify-backup-code"].includes(endpoint)) ||
           (method === "POST" && twoFactorManage) ||
           (method === "GET" && endpoint === "get-session"))) throw new AppError(404, "Endpoint not found.");
-      // Only the superuser manages two-step verification (it guards remote coding); verifying a code is part of anyone's sign-in.
+      // Only the superuser manages the optional two-step verification; verifying a code is part of anyone's sign-in once it's on.
       if (twoFactorManage && (!access || security.check(access).appRole !== "superuser")) {
         if (access) security.record(access, "account.two_factor", null, "denied", "not_superuser", true);
         throw new AppError(access ? 403 : 401, access ? "Only the superuser account uses two-step verification." : "Sign in first.");
@@ -100,7 +102,7 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
     const saveDraft = (input: z.infer<typeof draftSchema>) => run("draft.save", input.chatId ?? null, () => {
       if (!input.chatId && !input.draft) return null;
       const chat = input.chatId ? store.chat(user.id, input.chatId) : store.createChat(user.id);
-      store.saveDraft(user.id, chat.id, input.draft, input.model);
+      store.saveDraft(user.id, chat.id, input.draft, input.model, input.thinking);
       return store.chat(user.id, chat.id);
     }, chat => chat?.id ?? null);
     if (s.length === 1 && s[0] === "account" && method === "GET") {
@@ -160,7 +162,7 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
     }
     if (s.length === 1 && s[0] === "models" && method === "GET") {
       const models = await listModels(new URL(request.url).searchParams.get("refresh") === "1");
-      return Response.json(run("models.list", null, () => ({ models: models.map(m => ({ id: m.id, name: m.name, multiplier: m.billing?.multiplier, vision: Boolean(m.capabilities.supports.vision && m.capabilities.limits.vision), maxImages: m.capabilities.limits.vision?.max_prompt_images })), authenticated: true })));
+      return Response.json(run("models.list", null, () => ({ models: models.map(m => ({ id: m.id, name: m.name, multiplier: m.billing?.multiplier, vision: Boolean(m.capabilities.supports.vision && m.capabilities.limits.vision), maxImages: m.capabilities.limits.vision?.max_prompt_images, levels: modelLevels(m) })), authenticated: true })));
     }
     if (s[0] === "code") return await handleCodeApi(request, s, ctx, guard, store);
     if (s[0] !== "chats") throw new AppError(404, "Endpoint not found.");
@@ -185,7 +187,7 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
       }
     }
     if (s.length === 3 && s[2] === "stop" && method === "POST") {
-      run("message.stop", chatId, () => stopReply(store, user.id, chatId));
+      run("message.stop", chatId, () => { stopReply(store, user.id, chatId); cancelResearch({ store, guard }, user.id, chatId); });
       return Response.json({ ok: true });
     }
     const streamSecurity: StreamSecurity = {
@@ -197,10 +199,39 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
       finished: (messageId, status, lost) => guard.record(ctx, "message.finish", messageId, lost ? "denied" : status === "error" ? "error" : "allowed", lost ? "access_ended" : status),
     };
     if (s.length === 3 && s[2] === "messages" && method === "POST" && chat.mode === "code") return await handleCodeMessage(request, ctx, guard, store, chatId, streamSecurity);
+    // Deep research: drafting a plan, then starting it. Both need web search for this account and are refused while acting.
+    if (s.length === 3 && s[2] === "research" && method === "POST") {
+      const body = await readJson(request, z.object({
+        content: z.string().trim().min(1, "Write what you want researched first.").max(LIMITS.inputCharacters),
+        model: z.string().min(1).max(128),
+        thinking: z.enum(THINKING_LEVELS).optional(),
+        fileIds: z.array(z.uuid()).default([]),
+      }).strict());
+      if (chat.mode === "code") throw new AppError(400, "Deep research works in ordinary chats, not coding chats.");
+      const refused = researchAllowed(guard, user.id, ctx.delegationId);
+      if (refused) { guard.record(ctx, "research.plan", chatId, "denied", ctx.delegationId ? "acting" : "no_web_access", true); throw new AppError(403, refused); }
+      if (new Set(body.fileIds).size !== body.fileIds.length) throw new AppError(400, "Repeated file IDs are not allowed.");
+      store.assertIdle(user.id, chatId);
+      const model = (await listModels()).find(m => m.id === body.model);
+      guard.check(ctx);
+      if (!model) throw new AppError(400, "That model is no longer available. Refresh the model list and select another.");
+      const turn = prepareImageTurn(store, user.id, chatId, body.content, body.fileIds, model, runCopilotReply,
+        (id, outcome, reason) => guard.record(ctx, "image.analysis", id, outcome, reason, true), body.thinking);
+      const result = beginResearch({ store, guard }, { ctx, chatId, content: body.content, model, thinking: body.thinking, fileIds: body.fileIds, prompt: turn.prompt, runner: turn.runner });
+      return Response.json(result, { status: 201 });
+    }
+    if (s.length === 5 && s[2] === "research" && s[4] === "start" && method === "POST") {
+      const { plan } = await readJson(request, z.object({ plan: z.array(z.string().trim().min(1).max(300)).min(1).max(7).optional() }).strict());
+      const researchId = z.uuid().parse(s[3]);
+      if (ctx.delegationId) { guard.record(ctx, "research.start", researchId, "denied", "acting", true); throw new AppError(403, "Deep research isn't available while acting as another user."); }
+      startResearch({ store, guard }, ctx, chatId, researchId, plan);
+      return Response.json({ ok: true });
+    }
     if (s.length === 3 && s[2] === "messages" && method === "POST") {
       const body = await readJson(request, z.object({
         content: z.string().trim().min(1, "Write a message first.").max(LIMITS.inputCharacters),
         model: z.string().min(1).max(128),
+        thinking: z.enum(THINKING_LEVELS).optional(),
         fileIds: z.array(z.uuid()).default([]),
       }).strict());
       if (new Set(body.fileIds).size !== body.fileIds.length) throw new AppError(400, "Repeated file IDs are not allowed.");
@@ -211,7 +242,7 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
       const model = models.find(m => m.id === body.model);
       if (!model) throw new AppError(400, "That model is no longer available. Refresh the model list and select another.");
       const turn = prepareImageTurn(store, user.id, chatId, body.content, body.fileIds, model, runCopilotReply,
-        (id, outcome, reason) => guard.record(ctx, "image.analysis", id, outcome, reason, true));
+        (id, outcome, reason) => guard.record(ctx, "image.analysis", id, outcome, reason, true), body.thinking);
       const sandbox = sandboxConfig();
       // Decided on the server for this turn: the owner's own chats by default, never while acting as another user.
       const web = webSearchStatus(ctx, guard).enabled;
@@ -233,7 +264,7 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
           if (searches) guard.record(ctx, "web.search", chatId, "allowed", `${searches} search${searches === 1 ? "" : "es"}`, true);
         }
       };
-      return createChatStream(store, user.id, chatId, body.content, body.model, body.fileIds, turn.prompt, runner, request.signal, streamSecurity);
+      return createChatStream(store, user.id, chatId, body.content, body.model, body.fileIds, turn.prompt, runner, request.signal, streamSecurity, undefined, { thinking: replyReasoningEffort(model, body.thinking) ?? null });
     }
     if (s.length === 3 && s[2] === "files" && method === "POST") {
       const release = transferSlot(user.id);

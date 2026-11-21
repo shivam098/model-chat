@@ -8,6 +8,7 @@ import { AccessService } from "../../lib/access";
 import { UploadStore } from "../../lib/upload-store";
 import { detectOutput } from "../../lib/code-tool";
 import { runSandbox } from "../../lib/sandbox";
+import { openAccount } from "./helpers";
 
 const origin = "http://127.0.0.1:3211";
 test.skip(!existsSync(path.resolve(".local", "sandbox-config.json")), "The WSL code runner is not configured on this machine.");
@@ -93,7 +94,7 @@ open('/work/output/drawing.svg', 'w').write('<svg xmlns="http://www.w3.org/2000/
     expect(download.headers()["content-disposition"]).toMatch(/^attachment;/);
     expect(download.headers()["x-content-type-options"]).toBe("nosniff");
   }
-  await page.getByRole("button", { name: "Files & privacy" }).click();
+  await openAccount(page);
   await expect(page.getByRole("dialog")).toContainText("no internet or network access");
   await expect(page.getByRole("dialog")).toContainText("python-pptx");
   await page.getByRole("button", { name: "Close dialog" }).click();
