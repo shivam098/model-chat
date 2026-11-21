@@ -138,9 +138,9 @@ test("coding access: superuser only, never while acting, and local-only without 
 test("coding shells never inherit tokens or the app's own settings, and the tool set is verified", () => {
   const saved = { ...process.env };
   try {
-    Object.assign(process.env, { GH_TOKEN: "gho_example", COPILOT_SDK_AUTH_TOKEN: "x", BETTER_AUTH_SECRET: "s", MODEL_CHAT_COPILOT_LOGIN: "owner", OPENAI_API_KEY: "k", MY_SECRET: "v" });
+    Object.assign(process.env, { GH_TOKEN: "gho_example", COPILOT_SDK_AUTH_TOKEN: "x", BETTER_AUTH_SECRET: "s", MODEL_CHAT_COPILOT_LOGIN: "owner", MODEL_CHAT_COPILOT_TOKEN: "github_pat_example", OPENAI_API_KEY: "k", MY_SECRET: "v" });
     const environment = codingEnvironment();
-    for (const name of ["GH_TOKEN", "COPILOT_SDK_AUTH_TOKEN", "BETTER_AUTH_SECRET", "MODEL_CHAT_COPILOT_LOGIN", "OPENAI_API_KEY", "MY_SECRET"]) assert.equal(environment[name], undefined, name);
+    for (const name of ["GH_TOKEN", "COPILOT_SDK_AUTH_TOKEN", "BETTER_AUTH_SECRET", "MODEL_CHAT_COPILOT_LOGIN", "MODEL_CHAT_COPILOT_TOKEN", "OPENAI_API_KEY", "MY_SECRET"]) assert.equal(environment[name], undefined, name);
     assert.ok(environment.PATH || environment.Path, "Normal tools stay on PATH");
     assert.ok(environment.GH_CONFIG_DIR && !environment.GH_CONFIG_DIR.includes(path.join("AppData", "Roaming", "GitHub CLI")), "gh can't reach the owner's stored login");
     assert.equal(environment.GIT_TERMINAL_PROMPT, "0");

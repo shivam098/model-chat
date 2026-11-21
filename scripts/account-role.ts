@@ -3,8 +3,10 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import env from "@next/env";
 import { z } from "zod";
+import { dropCopilotToken } from "../lib/secret-env.mjs";
 
 env.loadEnvConfig(process.cwd());
+dropCopilotToken();
 const args = process.argv.slice(2);
 if (args.length !== 4 || args[0] !== "--email" || args[2] !== "--role") {
   throw new Error("Usage: npm run admin:role -- --email existing@example.com --role superuser|user");

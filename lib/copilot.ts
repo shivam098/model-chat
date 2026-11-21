@@ -9,10 +9,11 @@ import { systemInstruction } from "./context";
 import type { CodeEvent, NativeImage, WebSource } from "./contracts";
 import { WEB_SERVER, WEB_TOOL, extractSources, mergeSources } from "./web-search";
 import { nearestLevel, orderedLevels, type ThinkingLevel } from "./thinking";
-import { expectedCopilotLogin, isAccountError, isolatedRuntimeEnvironment, selectStoredSignIn, verifyRuntimeIdentity } from "./copilot-account";
+import { checkTokenWithGitHub, credentialPlan, isAccountError, isolatedRuntimeEnvironment, selectStoredSignIn, tokenLogin, tokenProblem, verifyRuntimeIdentity, type CredentialPlan } from "./copilot-account";
+import { redactSecrets, takeCopilotToken } from "./secret-env.mjs";
 
 const copilotHome = process.env.MODEL_CHAT_COPILOT_HOME ? path.resolve(process.env.MODEL_CHAT_COPILOT_HOME) : path.join(dataDirectory, "copilot");
-interface CopilotCredential { login: string; source: string; token: string; at: number }
+interface CopilotCredential { login: string; source: string; token: string; at: number; viaToken: boolean }
 const credentialState = globalThis as typeof globalThis & {
   modelChatCopilotCredential?: CopilotCredential;
   modelChatCopilotCredentialPending?: Promise<CopilotCredential>;
@@ -21,35 +22,62 @@ const CREDENTIAL_TTL_MS = 10 * 60_000;
 export function forgetCopilotCredential() {
   credentialState.modelChatCopilotCredential = undefined;
 }
+/** True when this copy signs in with MODEL_CHAT_COPILOT_TOKEN instead of npm run copilot:login. */
+export function usesCopilotToken() {
+  return Boolean(takeCopilotToken());
+}
 // The token stays in this process's memory; it is never logged or written by the app.
 async function copilotCredential(refresh = false): Promise<CopilotCredential> {
-  const expected = expectedCopilotLogin(copilotHome);
+  const plan = credentialPlan(copilotHome, takeCopilotToken());
   const cached = credentialState.modelChatCopilotCredential;
-  if (!refresh && cached && cached.login.toLowerCase() === expected.login.toLowerCase() && Date.now() - cached.at < CREDENTIAL_TTL_MS) return cached;
+  const sameAccount = cached && cached.source === plan.source && (!plan.login || cached.login.toLowerCase() === plan.login.toLowerCase());
+  if (!refresh && cached && sameAccount && Date.now() - cached.at < CREDENTIAL_TTL_MS) return cached;
   if (credentialState.modelChatCopilotCredentialPending) return credentialState.modelChatCopilotCredentialPending;
   credentialState.modelChatCopilotCredentialPending = (async () => {
     forgetCopilotCredential();
     const cwd = path.join(copilotHome, "empty-workspace");
     await mkdir(cwd, { recursive: true, mode: 0o700 });
-    // Only "copilot-cli" mode may read the OS credential store where `copilot login` keeps the app's sign-in
-    // ("empty" mode disables it). This client only reads the account roster and never creates a session.
-    const broker = new CopilotClient({
-      mode: "copilot-cli",
-      baseDirectory: copilotHome,
-      workingDirectory: cwd,
-      env: isolatedRuntimeEnvironment(copilotHome),
-      useLoggedInUser: true,
-      logLevel: "error",
-    });
-    try {
-      await deadline(broker.start(), 30_000);
-      const signIn = selectStoredSignIn(await deadline(broker.rpc.account.getAllUsers(), 15_000), expected.login);
-      const credential = { ...signIn, source: expected.source, at: Date.now() };
-      credentialState.modelChatCopilotCredential = credential;
-      return credential;
-    } finally { await closeClient(broker); }
+    const credential = plan.kind === "token" ? await tokenCredential(plan, cwd) : await storedCredential(plan, cwd);
+    credentialState.modelChatCopilotCredential = credential;
+    return credential;
   })().finally(() => { credentialState.modelChatCopilotCredentialPending = undefined; });
   return credentialState.modelChatCopilotCredentialPending;
+}
+async function storedCredential(plan: Extract<CredentialPlan, { kind: "stored" }>, cwd: string): Promise<CopilotCredential> {
+  // Only "copilot-cli" mode may read the OS credential store where `copilot login` keeps the app's sign-in
+  // ("empty" mode disables it). This client only reads the account roster and never creates a session.
+  const broker = new CopilotClient({
+    mode: "copilot-cli",
+    baseDirectory: copilotHome,
+    workingDirectory: cwd,
+    env: isolatedRuntimeEnvironment(copilotHome),
+    useLoggedInUser: true,
+    logLevel: "error",
+  });
+  try {
+    await deadline(broker.start(), 30_000);
+    const signIn = selectStoredSignIn(await deadline(broker.rpc.account.getAllUsers(), 15_000), plan.login);
+    return { ...signIn, source: plan.source, at: Date.now(), viaToken: false };
+  } finally { await closeClient(broker); }
+}
+async function tokenCredential(plan: Extract<CredentialPlan, { kind: "token" }>, cwd: string): Promise<CopilotCredential> {
+  // The token reaches only the Copilot runtime (as gitHubToken), which resolves the account it belongs to. This client never creates a session.
+  const probe = new CopilotClient({
+    mode: "empty",
+    baseDirectory: copilotHome,
+    workingDirectory: cwd,
+    env: isolatedRuntimeEnvironment(copilotHome),
+    gitHubToken: plan.token,
+    useLoggedInUser: false,
+    logLevel: "error",
+  });
+  try {
+    await deadline(probe.start(), 30_000);
+    const current = await deadline(probe.rpc.account.getCurrentAuth(), 15_000);
+    const login = tokenLogin(current, plan.login);
+    if (!login) throw tokenProblem(await checkTokenWithGitHub(plan.token), (current.authErrors ?? []).map(redactSecrets));
+    return { login, token: plan.token, source: plan.source, at: Date.now(), viaToken: true };
+  } finally { await closeClient(probe); }
 }
 /** The account the app is using, for owner diagnostics. */
 export async function copilotAccount(): Promise<{ login: string; source: string }> {
@@ -71,7 +99,7 @@ export async function createClient(refreshCredential = false, environment?: Reco
     baseDirectory: copilotHome,
     workingDirectory: cwd,
     env: environment ?? isolatedRuntimeEnvironment(copilotHome),
-    // Only the app's own stored sign-in; useLoggedInUser:false stops any fallback to gh or environment tokens.
+    // Only this app's credential (stored sign-in or MODEL_CHAT_COPILOT_TOKEN); useLoggedInUser:false stops any fallback to gh or environment tokens.
     gitHubToken: credential.token,
     useLoggedInUser: false,
     sessionIdleTimeoutSeconds: 300,
@@ -79,7 +107,7 @@ export async function createClient(refreshCredential = false, environment?: Reco
   });
   try {
     await deadline(client.start(), 30_000);
-    verifyRuntimeIdentity(await deadline(client.rpc.account.getCurrentAuth(), 15_000), credential.login);
+    verifyRuntimeIdentity(await deadline(client.rpc.account.getCurrentAuth(), 15_000), credential.login, credential.viaToken);
   } catch (error) {
     await closeClient(client);
     if (isAccountError(error)) forgetCopilotCredential();
@@ -108,7 +136,9 @@ export function copilotError(error: unknown): AppError {
   const message = error instanceof Error ? error.message : "";
   if (/auth|sign.?in|token|401|403|entitle|subscription/i.test(message)) {
     forgetCopilotCredential();
-    return new AppError(503, "Copilot authentication or entitlement is unavailable. Run npm run copilot:login on this machine, then refresh the connection.", { cause: error });
+    return new AppError(503, usesCopilotToken()
+      ? "Copilot authentication or entitlement is unavailable. The host owner can run npm run check:copilot on this machine for details."
+      : "Copilot authentication or entitlement is unavailable. Run npm run copilot:login on this machine, then refresh the connection.", { cause: error });
   }
   if (/model.*(not|invalid|unavailable)|quota|rate.limit|429|402|budget/i.test(message)) {
     return new AppError(503, "Copilot refused the selected model or its usage limit was reached. Refresh the model list or check your Copilot plan.", { cause: error });

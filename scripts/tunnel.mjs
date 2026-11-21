@@ -12,8 +12,11 @@ import Database from "better-sqlite3";
 import { CLOUDFLARED, NODE, isCloudflared, isNode, launchDetached, processImage, quotePath, readTunnelState, sameProcess } from "../lib/process-tools.mjs";
 import { publishStableLink, readStableLink, stableLinkConfig } from "../lib/stable-link.mjs";
 import { repairPlan } from "../lib/watchdog.mjs";
+import { dropCopilotToken } from "../lib/secret-env.mjs";
 
 env.loadEnvConfig(process.cwd());
+// This script never uses the Copilot token, so none of the programs it starts (tunnel, build, app) inherit it; the app reads .env.local itself.
+dropCopilotToken();
 const command = process.argv[2] || "start";
 const force = process.argv.includes("--force");
 const option = name => { const index = process.argv.indexOf(name); return index < 0 ? undefined : process.argv[index + 1]; };

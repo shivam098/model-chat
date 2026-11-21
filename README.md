@@ -95,7 +95,7 @@ Limitations:
 
 ### Copilot sign-in
 
-The backend uses **only this app's own Copilot sign-in**, created with `npm run copilot:login`. It never uses the GitHub CLI's active account, `gh` tokens, or `GH_TOKEN`/`GITHUB_TOKEN`/`COPILOT_GITHUB_TOKEN` variables, so switching or signing out accounts in `gh` does not affect the app. SDK/runtime configuration and sessions are isolated under this app's data directory.
+The backend uses **only this app's own Copilot sign-in**, created with `npm run copilot:login` (or the optional token described below). It never uses the GitHub CLI's active account, `gh` tokens, or `GH_TOKEN`/`GITHUB_TOKEN`/`COPILOT_GITHUB_TOKEN` variables, so switching or signing out accounts in `gh` does not affect the app. SDK/runtime configuration and sessions are isolated under this app's data directory.
 
 How it works, with the official SDK:
 
@@ -125,6 +125,11 @@ This launches the installed `copilot login` command with an app-specific `COPILO
 
 App users see only a generic "missing or does not match its configured account" message; account names appear only in the owner's `check:copilot` output.
 
+**Token instead of `copilot:login` (optional).** A copy can sign in with a fine-grained personal access token (`github_pat_…`) owned by your account with the **Copilot Requests** account permission, set as `MODEL_CHAT_COPILOT_TOKEN` in `.env.local` (see [Run Model Chat on another computer](#run-model-chat-on-another-computer)). When it's set, it replaces the stored sign-in for chat, web search, deep research and coding mode; when it isn't, nothing changes.
+- The token must resolve to `MODEL_CHAT_COPILOT_LOGIN` if that's set; a different account is blocked. Without it, `check:copilot` reports which account the token belongs to.
+- It's read into memory when the app starts and removed from the process environment, so shells, tools, the tunnel and other programs never inherit it. It goes only to the Copilot runtime (as `gitHubToken`; coding sessions get it over RPC). `check:copilot` also sends it to GitHub's own `GET /user` to show its expiry date (warning in the last 3 days), and when Copilot refuses it the app asks the same endpoint whether it expired or was revoked, or lacks Copilot Requests. It's never logged or printed; GitHub tokens are redacted from diagnostics.
+- Classic tokens (`ghp_…`) don't work with Copilot. After changing the token, restart the app.
+
 Limitations:
 - The credential store entry is per Windows user and per account. Signing that account out with `copilot logout`, in any Copilot CLI on this PC, removes it for the app too. Run `npm run copilot:login` again afterwards.
 - The account roster API is marked experimental in SDK 1.0.28 and may change with SDK updates.
@@ -133,6 +138,29 @@ Limitations:
 `npm run test:copilot-account` proves the isolation without changing your real `gh` state. It points the GitHub CLI config at a fake one with a different active account and fake tokens, then checks that the app still lists models as the configured account and that a mismatched account fails. It lists models only and makes no model request.
 
 `npm run check:copilot -- --chat` additionally makes **one small, real, billable model request**. The UI and scripts never produce pretend model answers. Model choices come from `client.listModels()`, filtered by policy and a usable advertised context limit; entries reporting only zero/unknown capacity (including the current Auto routing entry) are omitted rather than inventing a context size. Choices can differ from those in the desktop app. A failed connection, model restriction, empty answer, or exhausted allowance is shown explicitly.
+
+## Run Model Chat on another computer
+
+A second copy, for example on another laptop, has its own accounts, chats and files, and its coding mode works on that computer's files. It can sign in to Copilot with a fine-grained token instead of `npm run copilot:login`. This is a work account's token, so your company's rules for tokens may apply.
+
+1. Install the prerequisites. **Windows:** Node.js 24 LTS (24.13 or later, from nodejs.org) and Git. **macOS:** [Homebrew](https://brew.sh), then `brew install node@24 git` (for iOS apps, also follow [Running on a Mac](#running-on-a-mac)).
+2. Get the app:
+   ```bash
+   git clone https://github.com/shivam098/model-chat.git
+   cd model-chat
+   npm ci
+   ```
+3. Create the token on GitHub: *Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token*. Owner: your account. Pick an expiry, and under **Account permissions** set **Copilot Requests** (read-only). It needs no repository access.
+4. Create `.env.local` in the `model-chat` folder (git ignores it; don't share or commit it):
+   ```dotenv
+   MODEL_CHAT_COPILOT_LOGIN=your-github-login
+   MODEL_CHAT_COPILOT_TOKEN=github_pat_...
+   ```
+5. `npm run check:copilot`: it must show your account, the token's expiry date and the model list.
+6. `npm run build`, then `npm start`, and open **http://127.0.0.1:3210** on that computer. It's local only; no tunnel is needed, and coding mode works there because the browser is on the host itself.
+7. Sign up, then make that account the superuser: `npm run admin:role -- --email you@example.com --role superuser`.
+
+**Replacing the token.** `npm run check:copilot` warns in the token's last 3 days. After it expires, chats say the Copilot sign-in is missing and `check:copilot` says GitHub rejected the token. Create a new token the same way, replace the `MODEL_CHAT_COPILOT_TOKEN` line in `.env.local`, restart the app (Ctrl+C, then `npm start`; or `npm run app:restart` when it runs with the tunnel), and run `npm run check:copilot` again.
 
 ## Running on a Mac
 
@@ -143,7 +171,7 @@ Model Chat runs on macOS too (Apple silicon or Intel), with the same app, data l
 1. Install **Xcode** from the App Store (free, but a large download). Open it once to accept the licence, then add an iOS Simulator in *Xcode → Settings → Components*.
 2. Install [Homebrew](https://brew.sh), then: `brew install node@24 cloudflared xcodegen gh`.
 3. `git clone https://github.com/shivam098/model-chat.git && cd model-chat && npm ci`
-4. Copilot: `npm run copilot:login` (the sign-in is stored in the Mac's Keychain; allow access if macOS asks), add `MODEL_CHAT_COPILOT_LOGIN=<your login>` to `.env.local`, then `npm run check:copilot`, which must list models.
+4. Copilot: `npm run copilot:login` (the sign-in is stored in the Mac's Keychain; allow access if macOS asks), or instead put a fine-grained token in `.env.local` as `MODEL_CHAT_COPILOT_TOKEN` (see [Run Model Chat on another computer](#run-model-chat-on-another-computer)). Add `MODEL_CHAT_COPILOT_LOGIN=<your login>` to `.env.local`, then `npm run check:copilot`, which must list models.
 5. `npm run build`, then `npm start` (this Mac only) or `npm run tunnel` (with the shared link) and `npm run autorestart:on`. `npm run autorestart:off` removes the launchd agent `com.modelchat.autorestart`.
 6. Make your account the superuser: sign up at http://127.0.0.1:3210, then `npm run admin:role -- --email you@example.com --role superuser`.
 7. Optional media: `python3 -m venv .local/media-venv && .local/media-venv/bin/pip install -r requirements-media.txt`, download a Whisper model once (`.local/media-venv/bin/python -c "from faster_whisper import WhisperModel; WhisperModel('small')"`), then `npm run setup:media -- --python .local/media-venv/bin/python --model small`.
@@ -151,6 +179,7 @@ Model Chat runs on macOS too (Apple silicon or Intel), with the same app, data l
 **Check it works:**
 
 - [ ] `npm run check:copilot` lists models, and `npm test` passes.
+- [ ] If you use a token: `npm run check:copilot` says it signed in with `MODEL_CHAT_COPILOT_TOKEN` and shows the token's expiry date.
 - [ ] http://127.0.0.1:3210 opens, and you can sign in.
 - [ ] Choose **Code → New project → iOS app (SwiftUI)**, then ask "Run it in the Simulator". Approve `./ios.sh run`: the Simulator opens on the Mac and a screenshot appears on the command's card in the chat.
 - [ ] Ask "Run the tests". `./ios.sh test` shows `** TEST SUCCEEDED **`.
@@ -476,6 +505,8 @@ For an explicit end-to-end check of the **currently running public tunnel**, `np
 `npm run test:composer:public` is opt-in and makes **two real Copilot replies** through the running HTTPS link with the lowest-cost listed models. It starts a long reply; while it streams (on a mobile-sized window) it types, presses Enter, attaches a file, changes the model and tries dictation, checks Send is unavailable, then presses **Stop reply**. It then sends the queued draft and checks the reply uses the mid-reply file, which belongs only to the new turn, and that another account cannot read it. It deletes only its synthetic accounts.
 
 ## Source map
+
+`lib/copilot-account.ts` decides which Copilot credential a copy uses (the optional `MODEL_CHAT_COPILOT_TOKEN` or the stored sign-in), checks the account and explains token problems; `lib/secret-env.mjs` keeps the token out of child processes and redacts GitHub tokens. `tests/copilot-account.test.ts` covers precedence, account mismatch, error messages, expiry warnings and redaction without real tokens or model calls.
 
 `components/code-mode.tsx`, `lib/coding/` and `lib/preview-proxy.mjs` implement coding mode (UI cards and panel; access guard, approval policy, blocked paths, the coding session manager, routes and previews). `tests/coding-mode.test.ts` covers the policy, path rules, access guard and shell environment without model calls. `tests/browser/coding.spec.ts` is an opt-in real run from this computer's browser (one Copilot turn; it creates files, starts a server and stops it in a temporary projects folder):
 

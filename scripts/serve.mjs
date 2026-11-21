@@ -7,8 +7,11 @@ import { networkPolicy } from "../lib/network-policy.mjs";
 import { readTunnelState } from "../lib/process-tools.mjs";
 import { stableLinkOrigin } from "../lib/stable-link.mjs";
 import { previewFor, proxyPreview, proxyPreviewUpgrade } from "../lib/preview-proxy.mjs";
+import { takeCopilotToken } from "../lib/secret-env.mjs";
 
 env.loadEnvConfig(process.cwd());
+// The optional Copilot token moves into memory now, before anything can start a child process that would inherit it.
+takeCopilotToken();
 const portIndex = process.argv.indexOf("--port");
 const port = Number(portIndex < 0 ? process.env.PORT || 3210 : process.argv[portIndex + 1]);
 if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("Port must be between 1024 and 65535.");
@@ -49,6 +52,7 @@ process.once("exit", () => {
 });
 const app = next({ dev: process.argv.includes("--dev"), hostname: "127.0.0.1", port });
 await app.prepare();
+takeCopilotToken();
 const handler = app.getRequestHandler();
 const publicHost = new URL(policy.origin).host;
 const localHost = new URL(policy.localOrigin).host;
