@@ -114,5 +114,5 @@ export async function handleCodeMessage(request: Request, ctx: AccessContext, gu
     security.check();
     if (!codingStatus(request, ctx, guard).available) throw new AppError(403, "Coding access ended.");
   } };
-  return createChatStream(store, user.id, chatId, body.content, body.model, [], body.content, wrapped, request.signal, codingSecurity, undefined, { idleMs: 30 * 60_000, thinking: effort ?? null });
+  return createChatStream(store, user.id, chatId, body.content, body.model, [], body.content, wrapped, request.signal, codingSecurity, undefined, { thinking: effort ?? null });
 }

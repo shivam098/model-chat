@@ -210,3 +210,52 @@ test("deep research: Stop cancels it, it keeps no access while acting or without
     assert.match(researchAllowed(guard, "admin", null, "off")!, /turned off/);
   } finally { db.close(); }
 });
+
+test("deep research: model requests have no fixed deadline; a silent plan or report request is ended, and Stop reaches the report writer", async () => {
+  const { db, store, guard } = setup();
+  try {
+    const ctx = guard.resolve("admin", "admin-session");
+    const base = { ctx, content: "Q", model: model(["low", "medium"]), fileIds: [], prompt: JSON.stringify({ conversation: [{ role: "user", content: "Q" }] }) };
+    const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+    const untilAborted = (input: ReplyInput) => new Promise<never>((_, reject) => {
+      const fail = () => reject(new DOMException("aborted", "AbortError"));
+      if (input.signal.aborted) fail(); else input.signal.addEventListener("abort", fail, { once: true });
+    });
+    // A slow plan that keeps producing events outlasts several silence windows.
+    const slow = store.createChat("admin");
+    const slowPlan = async (input: ReplyInput) => { for (let i = 0; i < 8; i++) { await sleep(40); input.onActivity?.(); } input.onDelta('{"title":"T","steps":["One"]}'); };
+    beginResearch({ store, guard, runner: slowPlan, scope: () => "owner" as const, silenceMs: 100 }, { ...base, chatId: slow.id, runner: slowPlan });
+    await until(() => store.messages("admin", slow.id).at(-1)?.research?.state === "awaiting_start");
+    cancelResearch({ store, guard }, "admin", slow.id);
+    // A plan request that goes completely silent is ended with a plain message.
+    const silent = store.createChat("admin");
+    const silentPlan = async (input: ReplyInput) => { await untilAborted(input); };
+    beginResearch({ store, guard, runner: silentPlan, scope: () => "owner" as const, silenceMs: 100 }, { ...base, chatId: silent.id, runner: silentPlan });
+    await until(() => store.messages("admin", silent.id).at(-1)?.research?.state === "error");
+    assert.match(store.messages("admin", silent.id).at(-1)!.error!, /stopped responding while drafting the plan/);
+    // The run hits its request cap after reading a page; the report writer then runs with no fixed deadline, and Stop cancels it.
+    const capped = store.createChat("admin");
+    let writing = false;
+    const runner = async (input: ReplyInput) => {
+      if (!input.tools?.length) {
+        if (input.prompt.includes("Write the final deep research report")) { writing = true; await untilAborted(input); }
+        input.onDelta('{"title":"T","steps":["One"]}'); return;
+      }
+      const tool = input.tools[0] as Tool & { handler: (args: unknown) => Promise<unknown> };
+      await tool.handler({ url: "https://example.org/a" });
+      for (let i = 0; i <= RESEARCH_CAPS.modelRequests; i++) input.onSessionEvent?.(usage("agent"));
+      await untilAborted(input);
+    };
+    const read = async (url: string) => ({ url, title: "A", text: "Page text.", contentType: "text/html", truncated: false });
+    const deps = { store, guard, runner, read: read as never, scope: () => "owner" as const };
+    beginResearch(deps, { ...base, chatId: capped.id, runner });
+    await until(() => store.messages("admin", capped.id).at(-1)?.research?.state === "awaiting_start");
+    startResearch(deps, ctx, capped.id, store.messages("admin", capped.id).at(-1)!.research!.id);
+    await until(() => writing);
+    await sleep(150);
+    assert.equal(store.messages("admin", capped.id).at(-1)!.research!.state, "writing", "Still writing: no fixed per-request deadline");
+    cancelResearch(deps, "admin", capped.id);
+    await until(() => store.messages("admin", capped.id).at(-1)?.research?.state === "cancelled");
+    assert.equal(store.messages("admin", capped.id).at(-1)!.status, "cancelled");
+  } finally { db.close(); }
+});

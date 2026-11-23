@@ -49,7 +49,7 @@ test("one mixed-file turn includes all six files; overflow adds exactly one deta
       store.addFile("alice", chat.id, `notes.${ext}`, Buffer.from("Fixture value 42"), "Fixture value 42", ""))];
     const calls: { prompt: string; pixels: Buffer[] }[] = [];
     const runner: ReplyRunner = async input => {
-      input.onRequestStart?.();
+      input.onActivity?.();
       const body = JSON.parse(input.prompt);
       calls.push({ prompt: input.prompt, pixels: (input.images || []).map(image => Buffer.from(image.data, "base64")) });
       if (body.conversation.at(-1).content.startsWith("Inspect EACH")) {

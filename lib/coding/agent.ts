@@ -23,7 +23,7 @@ export const CODE_TOOLS = [SHELL, `read_${SHELL}`, `write_${SHELL}`, `stop_${SHE
 const QUIET_TOOLS = new Set([`read_${SHELL}`, `list_${SHELL}`, `write_${SHELL}`]);
 
 interface Card { id: string; messageId: string; seq: number; kind: CodeEvent["kind"]; data: Record<string, unknown>; createdAt: number; flush?: ReturnType<typeof setTimeout> }
-interface Turn { messageId: string; emit?: (event: CodeEvent) => void; audit: Audit; signal: AbortSignal; activity?: () => void; progress?: (stage: string) => void }
+interface Turn { messageId: string; emit?: (event: CodeEvent) => void; audit: Audit; signal: AbortSignal; activity?: () => void; hold?: () => () => void; progress?: (stage: string) => void }
 interface CodeSession {
   chatId: string; ownerId: string; project: string; model: string; effort?: ReasoningEffort; store: Store;
   client: CopilotClient; session: CopilotSession; sessionId: string;
@@ -240,12 +240,14 @@ async function permission(session: CodeSession, request: PermissionRequest) {
     ...(card.kind === "command" ? { command: card.subject } : card.kind === "write" ? fileFields : { summary: card.kind === "url" ? `Fetch ${card.subject}` : `Read ${card.subject}` }),
     approval: { id, kind: card.kind, subject: card.subject, intention: card.intention, outside: card.outside, warning: card.warning, sessionScope: card.sessionScope, state: "pending" },
   });
+  // Waiting for the owner isn't the model going quiet, so the silence watchdog pauses until the answer.
+  const resume = turn.hold?.();
   const answer = await new Promise<Decision>(resolve => {
     const cancel = () => resolve("deny");
     pending.set(id, { chatId: session.chatId, ownerId: session.ownerId, resolve: value => { turn.signal.removeEventListener("abort", cancel); resolve(value); } });
     turn.signal.addEventListener("abort", cancel, { once: true });
     if (turn.signal.aborted) cancel();
-  }).finally(() => pending.delete(id));
+  }).finally(() => { pending.delete(id); resume?.(); });
   const current = session.cards.get(key);
   turn.progress?.(answer === "deny" ? "Continuing without that step" : "Working in the project");
   upsert(session, key, kind, { status: answer === "deny" ? "denied" : "running", approval: { ...(current?.data.approval as object), state: answer } });
@@ -318,14 +320,16 @@ export function codingRunner(args: { store: Store; chat: Chat; ownerId: string; 
     if (!args.chat.projectPath) throw new AppError(400, "This coding chat has no project folder.");
     const session = await ensureSession(args.chat, args.ownerId, input.model, input.reasoningEffort, args.store);
     if (session.turn) throw new AppError(409, "A coding turn is already running in this chat.");
-    session.turn = { messageId: input.assistantMessageId!, emit: input.onCodeEvent, audit: args.audit, signal: input.signal, activity: input.onRequestStart, progress: input.onProgress };
+    session.turn = { messageId: input.assistantMessageId!, emit: input.onCodeEvent, audit: args.audit, signal: input.signal, activity: input.onActivity, hold: input.holdActivity, progress: input.onProgress };
     input.onProgress?.("Working in the project");
     session.lastActive = Date.now();
     const accumulate = createMessageAccumulator(input.onDelta, input.onReplace);
     const reason = input.onReasoning ? createMessageAccumulator(text => input.onReasoning!(text, false), text => input.onReasoning!(text, true)) : null;
     let sessionError: string | undefined;
     const off = [
-      session.session.on("assistant.message_delta", event => { session.turn?.activity?.(); accumulate(event.data.messageId, event.data.deltaContent, false); }),
+      // Every runtime event in this long-lived session shows the turn is still working.
+      session.session.on(() => session.turn?.activity?.()),
+      session.session.on("assistant.message_delta", event => accumulate(event.data.messageId, event.data.deltaContent, false)),
       session.session.on("assistant.message", event => accumulate(event.data.messageId, event.data.content || "", true)),
       session.session.on("session.error", event => { sessionError = event.data.message; }),
       ...(reason ? [
@@ -353,11 +357,8 @@ export function codingRunner(args: { store: Store; chat: Chat; ownerId: string; 
         session.session.on("session.idle", () => finish()),
         session.session.on("session.error", event => fail(new Error(event.data.message))),
       );
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const limit = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new AppError(504, "The coding turn ran for 6 hours and was stopped.")), 6 * 60 * 60_000); });
-      try {
-        await Promise.race([session.session.send({ prompt }).then(() => finished), aborted, limit]);
-      } finally { clearTimeout(timer); }
+      // No fixed deadline: Stop or the reply's silence watchdog ends a turn.
+      await Promise.race([session.session.send({ prompt }).then(() => finished), aborted]);
       if (sessionError) throw new Error(sessionError);
     } catch (error) {
       if (input.signal.aborted) throw new DOMException("Reply cancelled", "AbortError");

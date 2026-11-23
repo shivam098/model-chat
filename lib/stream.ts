@@ -3,6 +3,7 @@ import { AppError } from "./errors";
 import { copilotError, type ReplyRunner } from "./copilot";
 import { LIMITS, type StreamEvent, type MessageStatus, type NativeImage, type WebSource } from "./contracts";
 import { finalizeSources } from "./web-search";
+import { REPLY_SILENCE_MS, silenceMinutes, silenceWatchdog } from "./reply-watchdog";
 
 type ActiveReply = { userId: string; actorId: string; sessionId?: string; controller: AbortController };
 export interface StreamSecurity {
@@ -29,8 +30,8 @@ export function hasSessionReply(sessionId: string) {
 export function stopSessionReplies(sessionId: string) {
   for (const job of active.values()) if (job.sessionId === sessionId) job.controller.abort();
 }
-export function createChatStream(store: Store, userId: string, chatId: string, content: string, model: string, fileIds: string[], prompt: string, runner: ReplyRunner, requestSignal: AbortSignal, security?: StreamSecurity, images?: NativeImage[], options: { idleMs?: number; thinking?: string | null } = {}) {
-  const idleMs = options.idleMs ?? 240_000;
+export function createChatStream(store: Store, userId: string, chatId: string, content: string, model: string, fileIds: string[], prompt: string, runner: ReplyRunner, requestSignal: AbortSignal, security?: StreamSecurity, images?: NativeImage[], options: { silenceMs?: number; thinking?: string | null } = {}) {
+  const silenceMs = options.silenceMs ?? REPLY_SILENCE_MS;
   if (active.has(chatId)) throw new AppError(409, "A reply is already running in this chat.");
   if (active.size >= 2 || [...active.values()].some(j => j.userId === userId || j.actorId === (security?.actorId ?? userId))) throw new AppError(429, "One reply per account or actor and two per app can run at once. Wait or stop the current reply.");
   const controller = new AbortController();
@@ -108,13 +109,10 @@ export function createChatStream(store: Store, userId: string, chatId: string, c
           }
           persist();
         };
-        let timeout: ReturnType<typeof setTimeout> | undefined;
-        const requestStarted = () => {
-          clearTimeout(timeout);
-          timeout = setTimeout(() => controller.abort(new Error("timeout")), idleMs);
-        };
-        requestStarted();
+        // No fixed deadline: only a request the runtime has gone completely silent on is ended. Heartbeats below don't count.
+        const watchdog = silenceWatchdog(silenceMs, () => controller.abort(new Error("silent")));
         let stage = "Generating reply";
+        // Keeps the browser, the local server's socket timeout and the Cloudflare link alive however long the reply runs.
         const heartbeat = setInterval(() => { if (checkAccess()) send({ type: "progress", stage }); }, 15_000);
         const authorizationTimer = security ? setInterval(checkAccess, 500) : undefined;
         try {
@@ -127,18 +125,21 @@ export function createChatStream(store: Store, userId: string, chatId: string, c
               send({ type: "web", searching: update.searching, searches: update.searches, sources: sources() ?? [] });
               persist();
             },
-            onRequestStart: requestStarted, onProgress: value => { stage = value; if (checkAccess()) send({ type: "progress", stage }); },
+            onActivity: watchdog.touch, holdActivity: watchdog.hold, onProgress: value => { stage = value; if (checkAccess()) send({ type: "progress", stage }); },
             onDelta: text => accept(text, false), onReplace: text => accept(text, true), onReasoning: acceptReasoning });
           if (controller.signal.aborted) throw new DOMException("Reply cancelled", "AbortError");
           if (!text.trim()) throw new AppError(503, "Copilot returned no text. The request was saved, but no answer was generated.");
         } catch (cause) {
           status = controller.signal.aborted ? "cancelled" : "error";
           if (outputExceeded) error = "Reply stopped at the 32,000-character output limit.";
-          else if (controller.signal.reason instanceof Error && controller.signal.reason.message === "timeout") error = idleMs > 240_000 ? `Nothing happened for ${Math.round(idleMs / 60_000)} minutes, so the reply was stopped.` : "A model request exceeded four minutes and was stopped.";
+          else if (controller.signal.reason instanceof Error && controller.signal.reason.message === "silent") {
+            status = "error";
+            error = `The model stopped responding: nothing arrived for ${silenceMinutes(silenceMs)}, so the reply was ended. ${text.trim() ? "The partial text above is saved." : "No text had arrived yet."}`;
+          }
           else if (controller.signal.aborted) error = "Reply stopped. Any partial text is saved.";
           else error = copilotError(cause).message;
         } finally {
-          clearTimeout(timeout);
+          watchdog.stop();
           clearInterval(heartbeat);
           clearInterval(authorizationTimer);
           requestSignal.removeEventListener("abort", requestAbort);

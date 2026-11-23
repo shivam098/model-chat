@@ -251,7 +251,7 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
         toolInstruction: codeToolInstruction(sandbox, Boolean(input.webSearch)),
         tools: [createCodeTool({
           store, access: ctx, chatId, assistantMessageId: input.assistantMessageId!, signal: input.signal,
-          authorize: () => { guard.check(ctx); }, onProgress: input.onProgress, onActivity: input.onRequestStart, onAttachments: input.onAttachments,
+          authorize: () => { guard.check(ctx); }, onProgress: input.onProgress, onActivity: input.onActivity, onAttachments: input.onAttachments,
           audit: (action, objectId, outcome, reason) => guard.record(ctx, action, objectId, outcome, reason, true),
         })],
       }) : turn.runner;

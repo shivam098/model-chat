@@ -9,6 +9,7 @@ import { systemInstruction } from "./context";
 import type { CodeEvent, NativeImage, WebSource } from "./contracts";
 import { WEB_SERVER, WEB_TOOL, extractSources, mergeSources } from "./web-search";
 import { nearestLevel, orderedLevels, type ThinkingLevel } from "./thinking";
+import { SDK_WAIT_MS } from "./reply-watchdog";
 import { checkTokenWithGitHub, credentialPlan, isAccountError, isolatedRuntimeEnvironment, selectStoredSignIn, tokenLogin, tokenProblem, verifyRuntimeIdentity, type CredentialPlan } from "./copilot-account";
 import { redactSecrets, takeCopilotToken } from "./secret-env.mjs";
 
@@ -226,7 +227,10 @@ export interface ReplyInput {
   images?: NativeImage[];
   authorize?: () => void;
   onProgress?: (stage: string) => void;
-  onRequestStart?: () => void;
+  /** Real runtime activity (any SDK event, a tool's progress): restarts the reply's silence watchdog. */
+  onActivity?: () => void;
+  /** Pauses the silence watchdog while waiting on the owner, such as a coding approval; returns the resume function. */
+  holdActivity?: () => () => void;
   assistantMessageId?: string;
   onAttachments?: () => void;
   tools?: Tool[];
@@ -267,6 +271,25 @@ export function verifyToolMetadata(tools: { name: string; mcpServerName?: string
   }
 }
 const toolViolationError = () => new AppError(503, "The runtime offered a tool Model Chat doesn't allow in this chat, so the reply was stopped for safety.");
+/**
+ * A model that spent its whole output allowance on thinking and wrote no answer. Measured with Claude Opus 5.5 at Max on a hard proof:
+ * 283 s of streamed reasoning used all 32,000 output tokens, and the runtime's continuation then failed (its fallback model isn't offered to apps).
+ */
+export function thinkingExhausted(usage: { finishReason?: string; maxOutputTokens?: number; model?: string; modelDisplayName?: string }, answered: boolean) {
+  if (answered || usage.finishReason !== "length") return null;
+  const budget = usage.maxOutputTokens ? `${usage.maxOutputTokens.toLocaleString("en-US")}-token ` : "";
+  return new AppError(503, `${usage.modelDisplayName || usage.model || "The model"} used its whole ${budget}output allowance thinking before writing an answer, and Copilot couldn't continue the reply. Its thinking is saved under Show thinking. Try a lower thinking level (for example High) or another model.`);
+}
+/**
+ * GPT models send nothing while they think. Measured with GPT-6 Sol at Max: the connection to the model closed after about 631 s
+ * without data ("unexpected EOF", failureKind "transport"), and the runtime retried from scratch. Returns the silent minutes, or null.
+ */
+export function silentCallDropped(failure: { failureKind?: string; durationMs?: number }) {
+  return failure.failureKind === "transport" && (failure.durationMs ?? 0) >= 5 * 60_000 ? Math.round(failure.durationMs! / 60_000) : null;
+}
+export function droppedThinkingError(minutes: number) {
+  return new AppError(503, `The connection to the model closed after about ${minutes} minutes of silent thinking, and Copilot's retries didn't finish either. GPT models send nothing while they think, and that connection doesn't stay open longer. Try a lower thinking level or another model.`);
+}
 export function createMessageAccumulator(onDelta: (text: string) => void, onReplace: (text: string) => void) {
   const parts = new Map<string, string>();
   let sent = "";
@@ -284,8 +307,8 @@ export function unexpectedTool(tools: { name: string; mcpServerName?: string }[]
     ? !(webSearch && tool.mcpServerName === WEB_SERVER && tool.name === WEB_TOOL)
     : !customNames.includes(tool.name))?.name ?? null;
 }
-export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDelta, onReplace, images, authorize, onRequestStart, onProgress, tools = [], toolInstruction, reasoningEffort, onReasoning, webSearch = false, onWeb, pageReader = false, preToolUse, onSessionEvent }) => {
-  onRequestStart?.();
+export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDelta, onReplace, images, authorize, onActivity, onProgress, tools = [], toolInstruction, reasoningEffort, onReasoning, webSearch = false, onWeb, pageReader = false, preToolUse, onSessionEvent }) => {
+  onActivity?.();
   const sessionId = `modelchat-${randomUUID()}`;
   const directory = path.join(copilotHome, "requests", sessionId);
   await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -293,6 +316,9 @@ export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDe
   let session: CopilotSession | undefined;
   let abortListener: (() => void) | undefined;
   let toolViolation: string | undefined;
+  let exhausted: AppError | null = null;
+  let dropped: number | null = null;
+  let answered = false;
   const unsubscribe: (() => void)[] = [];
   try {
     signal.throwIfAborted();
@@ -312,6 +338,8 @@ export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDe
     verifyToolMetadata(metadata.tools, tools.map(tool => tool.name));
     signal.throwIfAborted();
     authorize?.();
+    // Every runtime event (reasoning, text, tool calls, usage, progress) shows the request is still alive.
+    unsubscribe.push(session.on(() => onActivity?.()));
     if (onSessionEvent) unsubscribe.push(session.on(event => onSessionEvent(event)));
     // A tool-using turn can contain several assistant messages; keep all of them in one saved reply.
     const accumulate = createMessageAccumulator(onDelta, onReplace);
@@ -324,6 +352,16 @@ export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDe
     }
     let sessionError: string | undefined;
     unsubscribe.push(session.on("session.error", event => { sessionError = event.data.message; }));
+    unsubscribe.push(session.on("assistant.message_delta", event => { if (event.data.deltaContent.trim()) answered = true; }));
+    unsubscribe.push(session.on("assistant.usage", event => { exhausted = thinkingExhausted(event.data as Parameters<typeof thinkingExhausted>[0], answered) ?? exhausted; }));
+    let attempts = 1;
+    unsubscribe.push(session.on("model.call_failure", event => { dropped = silentCallDropped(event.data) ?? dropped; }));
+    // A retry restarts the model's work; it isn't stopped, but the owner sees it and can Stop. (Not in the SDK's typed event list.)
+    unsubscribe.push(session.on(event => {
+      if ((event.type as string) !== "assistant.turn_retry") return;
+      attempts++;
+      onProgress?.(dropped ? `Connection closed after ${dropped} min of silent thinking; retrying (attempt ${attempts})` : `Retrying the model request (attempt ${attempts})`);
+    }));
     if (webSearch) {
       // GitHub's MCP tools load when the turn starts, so the tool set is checked again then, and every tool call is checked as it starts.
       const customNames = tools.map(tool => tool.name);
@@ -344,12 +382,11 @@ export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDe
         const { toolCallId, toolName, mcpServerName } = event.data;
         if (mcpServerName === WEB_SERVER && toolName === WEB_TOOL) {
           pending.add(toolCallId); searches++;
-          onRequestStart?.(); onProgress?.("Searching the web"); report();
+          onProgress?.("Searching the web"); report();
         } else if (unexpectedTool([{ name: toolName, mcpServerName }], customNames, true)) violate(toolName);
       }));
       unsubscribe.push(session.on("tool.execution_complete", event => {
         if (!pending.delete(event.data.toolCallId)) return;
-        onRequestStart?.();
         if (event.data.success !== false) sources = mergeSources(sources, extractSources(event.data.result?.content));
         onProgress?.(pending.size ? "Searching the web" : "Reading web results");
         report();
@@ -359,7 +396,7 @@ export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDe
         if (event.data.kind !== "web_search") return;
         if (!hosted.has(event.data.outputIndex)) searches++;
         hosted.set(event.data.outputIndex, event.data.status !== "completed");
-        onRequestStart?.(); onProgress?.(event.data.status === "completed" ? "Reading web results" : "Searching the web"); report();
+        onProgress?.(event.data.status === "completed" ? "Reading web results" : "Searching the web"); report();
       }));
     }
     const aborted = new Promise<never>((_, reject) => {
@@ -372,12 +409,16 @@ export const runCopilotReply: ReplyRunner = async ({ model, prompt, signal, onDe
     });
     signal.throwIfAborted();
     authorize?.();
-    await Promise.race([session.sendAndWait({ prompt, attachments: images }, tools.length ? 45 * 60_000 : webSearch ? 10 * 60_000 : 180_000), aborted]);
+    // No per-request deadline: the caller's silence watchdog or Stop ends the request (SDK_WAIT_MS only satisfies the API).
+    await Promise.race([session.sendAndWait({ prompt, attachments: images }, SDK_WAIT_MS), aborted]);
     if (toolViolation) throw toolViolationError();
     if (sessionError) throw new Error(sessionError);
+    if (exhausted && !answered) throw exhausted;
   } catch (error) {
     if (signal.aborted) throw new DOMException("Reply cancelled", "AbortError");
     if (toolViolation) throw toolViolationError();
+    if (exhausted && !answered) throw exhausted;
+    if (dropped && !answered) throw droppedThinkingError(dropped);
     throw copilotError(error);
   } finally {
     for (const off of unsubscribe) off();
