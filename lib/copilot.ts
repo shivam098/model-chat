@@ -141,7 +141,10 @@ export function copilotError(error: unknown): AppError {
       ? "Copilot authentication or entitlement is unavailable. The host owner can run npm run check:copilot on this machine for details."
       : "Copilot authentication or entitlement is unavailable. Run npm run copilot:login on this machine, then refresh the connection.", { cause: error });
   }
-  if (/model.*(not|invalid|unavailable)|quota|rate.limit|429|402|budget/i.test(message)) {
+  if (/rate.?limit|too many requests|\b429\b/i.test(message)) {
+    return new AppError(503, "Copilot is limiting how many requests run at once right now, so this reply stopped. Send it again in a moment; other replies keep running.", { cause: error });
+  }
+  if (/model.*(not|invalid|unavailable)|quota|402|budget/i.test(message)) {
     return new AppError(503, "Copilot refused the selected model or its usage limit was reached. Refresh the model list or check your Copilot plan.", { cause: error });
   }
   if (/timeout|timed out|ETIMEDOUT/i.test(message)) return new AppError(504, "Copilot timed out. Check your connection and try again.");
@@ -231,6 +234,8 @@ export interface ReplyInput {
   onActivity?: () => void;
   /** Pauses the silence watchdog while waiting on the owner, such as a coding approval; returns the resume function. */
   holdActivity?: () => () => void;
+  /** Older turns were summarised to fit this request (the note is also saved on the reply). */
+  onContext?: (note: string) => void;
   assistantMessageId?: string;
   onAttachments?: () => void;
   tools?: Tool[];

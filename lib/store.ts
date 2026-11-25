@@ -6,8 +6,11 @@ import { AppError } from "./errors";
 import { LIMITS, PREVIEW_TYPES, type Chat, type CodeEvent, type Message, type MessageStatus, type Attachment, type ImageSource, type ImageAnalysis, type WebSource, type ResearchEntry, type ResearchState, type ResearchView } from "./contracts";
 import type { MediaFrame } from "./media";
 import { installUploadSchema, fileTextPage, fileContextExcerpt } from "./upload-store";
+import type { SavedSummary } from "./condense";
 
 export type FileRecord = Attachment & { text: string; bytes: Buffer };
+/** Which sent files a request may use: those of messages on `path`, plus `extra` (for example attachments carried into an edit). */
+export interface FileScope { path: string[]; extra?: string[] }
 export interface ResearchRow {
   id: string; chatId: string; messageId: string; userId: string; actorId: string; model: string; thinking: string | null; question: string;
   state: ResearchState; title: string; plan: string; log: string; counts: string; sources: string; error: string | null;
@@ -122,6 +125,38 @@ export class Store {
       CREATE INDEX IF NOT EXISTS app_code_event_chat ON app_code_event(chatId, seq);`);
     // Sessions created by a verified second factor (authenticator or backup code), shown in settings.
     db.exec("CREATE TABLE IF NOT EXISTS app_second_factor (sessionId TEXT PRIMARY KEY, userId TEXT NOT NULL, verifiedAt INTEGER NOT NULL)");
+    // Edited messages branch the conversation: each message points to the one before it, and the chat remembers the branch shown.
+    // Existing chats become a single branch in their saved order.
+    if (!messageColumns.some(column => column.name === "parentId")) {
+      db.transaction(() => {
+        db.exec("ALTER TABLE app_message ADD COLUMN parentId TEXT");
+        db.exec(`UPDATE app_message SET parentId=(SELECT p.id FROM app_message p WHERE p.chatId=app_message.chatId
+          AND (p.createdAt<app_message.createdAt OR (p.createdAt=app_message.createdAt AND p.rowid<app_message.rowid)) ORDER BY p.createdAt DESC,p.rowid DESC LIMIT 1)`);
+      })();
+    }
+    db.exec("CREATE INDEX IF NOT EXISTS app_message_parent ON app_message(chatId,parentId)");
+    if (!(db.pragma("table_info(app_chat)") as { name: string }[]).some(column => column.name === "leafId")) {
+      db.transaction(() => {
+        db.exec("ALTER TABLE app_chat ADD COLUMN leafId TEXT");
+        db.exec("UPDATE app_chat SET leafId=(SELECT m.id FROM app_message m WHERE m.chatId=app_chat.id ORDER BY m.createdAt DESC,m.rowid DESC LIMIT 1)");
+      })();
+    }
+    // Shown on a reply whose request carried a summary of older turns instead of all of them.
+    if (!messageColumns.some(column => column.name === "contextNote")) db.exec("ALTER TABLE app_message ADD COLUMN contextNote TEXT");
+    // Attachments carried from an edited message to its new version (the file itself stays bound to the message that first sent it).
+    db.exec(`CREATE TABLE IF NOT EXISTS app_file_link (
+        fileId TEXT NOT NULL REFERENCES app_file(id) ON DELETE CASCADE,
+        messageId TEXT NOT NULL REFERENCES app_message(id) ON DELETE CASCADE,
+        PRIMARY KEY(fileId,messageId)
+      );
+      CREATE INDEX IF NOT EXISTS app_file_link_message ON app_file_link(messageId);`);
+    // Saved summaries of older turns, each covering the conversation from its start through one message; reused while they still fit.
+    db.exec(`CREATE TABLE IF NOT EXISTS app_context_summary (
+        id TEXT PRIMARY KEY, chatId TEXT NOT NULL REFERENCES app_chat(id) ON DELETE CASCADE,
+        throughMessageId TEXT NOT NULL REFERENCES app_message(id) ON DELETE CASCADE,
+        covers INTEGER NOT NULL, content TEXT NOT NULL, model TEXT NOT NULL, createdAt INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS app_context_summary_chat ON app_context_summary(chatId,throughMessageId);`);
     installUploadSchema(db);
   }
   markSecondFactor(sessionId: string, userId: string) {
@@ -207,16 +242,86 @@ export class Store {
     this.assertIdle(userId, chatId);
     this.db.prepare("DELETE FROM app_chat WHERE id=? AND userId=?").run(chatId, userId);
   }
-  messages(userId: string, chatId: string): Message[] {
+  messages(userId: string, chatId: string, through?: string | null): Message[] {
     this.chat(userId, chatId);
-    const rows = this.db.prepare("SELECT * FROM app_message WHERE chatId=? ORDER BY createdAt,rowid").all(chatId) as (Omit<Message, "sources"> & { sources?: string | null })[];
+    const rows = this.db.prepare("SELECT * FROM app_message WHERE chatId=? ORDER BY createdAt,rowid").all(chatId) as (Omit<Message, "sources" | "siblings"> & { sources?: string | null; parentId: string | null })[];
+    const path = this.walk(chatId, rows, through);
+    // Versions of a user message: the user messages that share its parent (an edit adds one), oldest first.
+    const versions = new Map<string, string[]>();
+    for (const row of rows) if (row.role === "user") versions.set(row.parentId ?? "", [...(versions.get(row.parentId ?? "") ?? []), row.id]);
     const research = this.researchViews(chatId);
-    return rows.map(({ sources, ...row }) => {
+    return path.map(({ sources, ...row }) => {
       const item: Message = { ...row, ...(research.has(row.id) ? { research: research.get(row.id) } : {}) };
       if (item.thinking == null) delete item.thinking;
+      if (item.contextNote == null) delete item.contextNote;
+      const siblings = row.role === "user" ? versions.get(row.parentId ?? "") : undefined;
+      if (siblings && siblings.length > 1) item.siblings = siblings;
       if (!sources) return item;
       try { return { ...item, sources: JSON.parse(sources) as WebSource[] }; } catch { return item; }
     });
+  }
+  /** The branch ending at `through` (null: none; undefined: the branch the chat shows), from the first message on. */
+  private walk<T extends { id: string; parentId: string | null }>(chatId: string, rows: T[], through?: string | null): T[] {
+    if (through === null || !rows.length) return [];
+    const byId = new Map(rows.map(row => [row.id, row]));
+    const leafId = through ?? (this.db.prepare("SELECT leafId FROM app_chat WHERE id=?").get(chatId) as { leafId: string | null } | undefined)?.leafId;
+    let current = (leafId ? byId.get(leafId) : undefined) ?? (through ? undefined : rows.at(-1));
+    if (!current) throw new AppError(404, "Message not found.");
+    const path: T[] = [];
+    const seen = new Set<string>();
+    while (current && !seen.has(current.id)) {
+      seen.add(current.id);
+      path.push(current);
+      current = current.parentId ? byId.get(current.parentId) : undefined;
+    }
+    return path.reverse();
+  }
+  /** IDs of the messages on a branch (see walk), without loading their contents. */
+  pathIds(userId: string, chatId: string, through?: string | null): string[] {
+    this.chat(userId, chatId);
+    const rows = this.db.prepare("SELECT id,parentId FROM app_message WHERE chatId=? ORDER BY createdAt,rowid").all(chatId) as { id: string; parentId: string | null }[];
+    return this.walk(chatId, rows, through).map(row => row.id);
+  }
+  /** Shows another version of a user message: the branch continues with its most recent reply (and that reply's latest follow-ups). */
+  switchBranch(userId: string, chatId: string, messageId: string) {
+    return this.db.transaction(() => {
+      this.assertIdle(userId, chatId);
+      const rows = this.db.prepare("SELECT id,parentId,role FROM app_message WHERE chatId=? ORDER BY createdAt,rowid").all(chatId) as { id: string; parentId: string | null; role: string }[];
+      if (!rows.some(row => row.id === messageId && row.role === "user")) throw new AppError(404, "Message not found.");
+      let leaf = messageId;
+      for (;;) {
+        const child = rows.filter(row => row.parentId === leaf).at(-1);
+        if (!child) break;
+        leaf = child.id;
+      }
+      this.db.prepare("UPDATE app_chat SET leafId=? WHERE id=? AND userId=?").run(leaf, chatId, userId);
+      return this.messages(userId, chatId);
+    })();
+  }
+  /** Validates an edit of a user message on the shown branch and returns where its new version attaches. */
+  editBase(userId: string, chatId: string, messageId: string): { parentId: string | null; files: string[] } {
+    const path = this.messages(userId, chatId);
+    const original = path.find(message => message.id === messageId);
+    if (!original || original.role !== "user") throw new AppError(404, "That message isn't in the conversation shown. Reload the chat and try again.");
+    return { parentId: original.parentId ?? null, files: this.messageFileIds(chatId, messageId) };
+  }
+  /** Files sent with a message, including ones carried over from the version it edits. */
+  messageFileIds(chatId: string, messageId: string): string[] {
+    return (this.db.prepare("SELECT id FROM app_file WHERE chatId=? AND (messageId=? OR id IN (SELECT fileId FROM app_file_link WHERE messageId=?)) ORDER BY createdAt,rowid").all(chatId, messageId, messageId) as { id: string }[]).map(row => row.id);
+  }
+  summaries(userId: string, chatId: string) {
+    this.chat(userId, chatId);
+    const rows = this.db.prepare("SELECT throughMessageId,covers,content,model,createdAt FROM app_context_summary WHERE chatId=? ORDER BY createdAt").all(chatId) as SavedSummary[];
+    return new Map(rows.map(row => [row.throughMessageId, row]));
+  }
+  saveSummary(userId: string, chatId: string, summary: SavedSummary) {
+    this.chat(userId, chatId);
+    this.db.prepare("INSERT INTO app_context_summary(id,chatId,throughMessageId,covers,content,model,createdAt) SELECT ?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM app_message WHERE id=? AND chatId=?)")
+      .run(randomUUID(), chatId, summary.throughMessageId, summary.covers, summary.content, summary.model, summary.createdAt, summary.throughMessageId, chatId);
+  }
+  setContextNote(userId: string, chatId: string, messageId: string, note: string) {
+    this.chat(userId, chatId);
+    this.db.prepare("UPDATE app_message SET contextNote=? WHERE id=? AND chatId=? AND role='assistant' AND status='streaming'").run(note.slice(0, 300), messageId, chatId);
   }
   /** Deep research runs of a chat, keyed by the reply they produce. */
   researchViews(chatId: string): Map<string, ResearchView> {
@@ -245,9 +350,15 @@ export class Store {
   }
   attachments(userId: string, chatId: string): Attachment[] {
     this.chat(userId, chatId);
-    const rows = this.db.prepare("SELECT f.id,f.chatId,f.messageId,f.name,f.size,f.characters,f.notes,f.createdAt,f.mimeType,(SELECT count(*) FROM app_media_frame m WHERE m.fileId=f.id) AS frameCount,COALESCE(j.status,'ready') AS processingStatus,j.stage AS processingStage,j.progress AS processingProgress,j.error AS processingError,COALESCE(j.completeUpload,1) AS uploadComplete,(SELECT m.role FROM app_message m WHERE m.id=f.messageId) AS messageRole FROM app_file f LEFT JOIN app_file_job j ON j.fileId=f.id WHERE f.chatId=? ORDER BY f.createdAt,f.rowid").all(chatId) as Attachment[];
+    const rows = this.db.prepare("SELECT f.id,f.chatId,f.messageId,f.name,f.size,f.characters,f.notes,f.createdAt,f.mimeType,(SELECT count(*) FROM app_media_frame m WHERE m.fileId=f.id) AS frameCount,COALESCE(j.status,'ready') AS processingStatus,j.stage AS processingStage,j.progress AS processingProgress,j.error AS processingError,COALESCE(j.completeUpload,1) AS uploadComplete,(SELECT m.role FROM app_message m WHERE m.id=f.messageId) AS messageRole,(SELECT group_concat(l.messageId) FROM app_file_link l WHERE l.fileId=f.id) AS linked FROM app_file f LEFT JOIN app_file_job j ON j.fileId=f.id WHERE f.chatId=? ORDER BY f.createdAt,f.rowid").all(chatId) as (Attachment & { linked: string | null })[];
     // Inline previews are limited to verified code-runner outputs; everything else stays download-only.
-    return rows.map(row => ({ ...row, preview: row.messageRole === "assistant" && row.processingStatus === "ready" ? PREVIEW_TYPES[row.mimeType || ""] ?? null : null }));
+    return rows.map(({ linked, ...row }) => ({ ...row, ...(linked ? { linkedMessageIds: linked.split(",") } : {}), preview: row.messageRole === "assistant" && row.processingStatus === "ready" ? PREVIEW_TYPES[row.mimeType || ""] ?? null : null }));
+  }
+  /** Files in a request's context: ones sent on its branch (`path`, default: the branch shown), plus `extra` and pending uploads. */
+  private inScope(userId: string, chatId: string, scope?: FileScope) {
+    const path = new Set(scope?.path ?? this.pathIds(userId, chatId));
+    const extra = new Set(scope?.extra ?? []);
+    return (file: Attachment) => extra.has(file.id) || [file.messageId, ...(file.linkedMessageIds ?? [])].some(id => id && path.has(id));
   }
   file(userId: string, chatId: string, fileId: string): FileRecord {
     this.chat(userId, chatId);
@@ -278,7 +389,7 @@ export class Store {
     if (file.messageId) throw new AppError(409, "Files already sent are part of saved context. Delete the chat to remove them.");
     this.db.prepare("DELETE FROM app_file WHERE chatId=? AND id=? AND messageId IS NULL").run(chatId, fileId);
   }
-  contextFiles(userId: string, chatId: string, pendingIds: string[], query = "", totalBudget: number = LIMITS.chatFileCharacters) {
+  contextFiles(userId: string, chatId: string, pendingIds: string[], query = "", totalBudget: number = LIMITS.chatFileCharacters, scope?: FileScope) {
     const attachments = this.attachments(userId, chatId);
     for (const id of pendingIds) {
       const file = attachments.find(item => item.id === id);
@@ -286,8 +397,9 @@ export class Store {
       if (file.messageId) throw new AppError(400, "This file has already been sent.");
       if (file.processingStatus && file.processingStatus !== "ready") throw new AppError(409, "A selected file is still processing or needs retry. You can send text without it.");
     }
+    const sent = this.inScope(userId, chatId, scope);
     const selected = attachments
-      .filter(f => f.messageId || pendingIds.includes(f.id))
+      .filter(f => sent(f) || pendingIds.includes(f.id))
       .filter(f => !f.processingStatus || f.processingStatus === "ready");
     // Code-runner outputs are listed compactly so they never consume the shared budget for the user's documents.
     const userFiles = selected.filter(file => file.messageRole !== "assistant");
@@ -301,8 +413,9 @@ export class Store {
       ...generated.map(file => ({ id: file.id, name: file.name, text: generatedFileSummary(file) })),
     ];
   }
-  imageSources(userId: string, chatId: string, pendingIds: string[]): ImageSource[] {
-    return this.attachments(userId, chatId).filter(file => (file.messageId || pendingIds.includes(file.id)) && file.messageRole !== "assistant").flatMap(file => {
+  imageSources(userId: string, chatId: string, pendingIds: string[], scope?: FileScope): ImageSource[] {
+    const sent = this.inScope(userId, chatId, scope);
+    return this.attachments(userId, chatId).filter(file => (sent(file) || pendingIds.includes(file.id)) && file.messageRole !== "assistant").flatMap(file => {
       if (file.processingStatus && file.processingStatus !== "ready") return [];
       if (file.mimeType?.startsWith("image/")) {
         const normalized = this.db.prepare("SELECT mimeType,length(bytes) size FROM app_analysis_image WHERE fileId=?").get(file.id) as { mimeType: string; size: number } | undefined;
@@ -334,7 +447,8 @@ export class Store {
   }
   contextImages(userId: string, chatId: string, pendingIds: string[]) {
     this.contextFiles(userId, chatId, pendingIds);
-    return this.attachments(userId, chatId).filter(file => file.messageId || pendingIds.includes(file.id)).flatMap(file => {
+    const sent = this.inScope(userId, chatId);
+    return this.attachments(userId, chatId).filter(file => sent(file) || pendingIds.includes(file.id)).flatMap(file => {
       if (file.processingStatus && file.processingStatus !== "ready") return [];
       if (file.mimeType?.startsWith("image/")) {
         const processed = this.db.prepare("SELECT bytes,mimeType FROM app_analysis_image WHERE fileId=?").get(file.id) as { bytes: Buffer; mimeType: string } | undefined;
@@ -348,22 +462,34 @@ export class Store {
       }));
     });
   }
-  beginTurn(userId: string, chatId: string, content: string, model: string, fileIds: string[], thinking?: string | null) {
+  /**
+   * Starts a turn on the branch shown. With `edit`, the new message is another version of `edit.editOf` (same place in the conversation);
+   * the old version and everything after it stay saved on their own branch. Kept attachments of the old version come along.
+   */
+  beginTurn(userId: string, chatId: string, content: string, model: string, fileIds: string[], thinking?: string | null, edit?: { editOf: string; keepFileIds?: string[] }) {
     return this.db.transaction(() => {
       this.assertIdle(userId, chatId);
       this.contextFiles(userId, chatId, fileIds);
-      if (this.messages(userId, chatId).length >= LIMITS.messagesPerChat) throw new AppError(400, "This chat has reached 100 turns. Start a new chat.");
+      if ((this.db.prepare("SELECT count(*) AS n FROM app_message WHERE chatId=?").get(chatId) as { n: number }).n >= LIMITS.messagesPerChat) throw new AppError(400, "This chat has reached 100 turns. Start a new chat.");
+      let parentId: string | null;
+      const keep = [...new Set(edit?.keepFileIds ?? [])];
+      if (edit) {
+        const base = this.editBase(userId, chatId, edit.editOf);
+        if (keep.some(id => !base.files.includes(id))) throw new AppError(400, "Only the edited message's own attachments can be kept.");
+        parentId = base.parentId;
+      } else parentId = this.pathIds(userId, chatId).at(-1) ?? null;
       const now = Date.now();
-      const user: Message = { id: randomUUID(), chatId, role: "user", content, model, status: "complete", error: null, createdAt: now, reasoning: "" };
-      const assistant: Message = { ...user, id: randomUUID(), role: "assistant", content: "", status: "streaming", createdAt: now + 1, ...(thinking ? { thinking } : {}) };
-      const insert = this.db.prepare("INSERT INTO app_message(id,chatId,role,content,model,status,error,createdAt,reasoning,thinking) VALUES (@id,@chatId,@role,@content,@model,@status,@error,@createdAt,@reasoning,@thinking)");
+      const user: Message = { id: randomUUID(), chatId, role: "user", content, model, status: "complete", error: null, createdAt: now, reasoning: "", parentId };
+      const assistant: Message = { ...user, id: randomUUID(), role: "assistant", content: "", status: "streaming", createdAt: now + 1, parentId: user.id, ...(thinking ? { thinking } : {}) };
+      const insert = this.db.prepare("INSERT INTO app_message(id,chatId,role,content,model,status,error,createdAt,reasoning,thinking,parentId) VALUES (@id,@chatId,@role,@content,@model,@status,@error,@createdAt,@reasoning,@thinking,@parentId)");
       insert.run({ ...user, thinking: null });
       insert.run({ ...assistant, thinking: thinking ?? null });
       for (const id of fileIds) this.db.prepare("UPDATE app_file SET messageId=? WHERE chatId=? AND id=?").run(user.id, chatId, id);
+      for (const id of keep) this.db.prepare("INSERT OR IGNORE INTO app_file_link(fileId,messageId) VALUES (?,?)").run(id, user.id);
       // Keep a draft typed after this message was sent; clear it only when it is the text being sent.
       const draft = this.chat(userId, chatId).draft || "";
-      this.db.prepare("UPDATE app_chat SET model=?,thinking=COALESCE(?,thinking),updatedAt=?,draft=?,title=CASE WHEN title='New chat' THEN ? ELSE title END WHERE id=? AND userId=?")
-        .run(model, thinking ?? null, now, draft.trim() === content.trim() ? "" : draft, content.slice(0, 64) || "File analysis", chatId, userId);
+      this.db.prepare("UPDATE app_chat SET model=?,thinking=COALESCE(?,thinking),updatedAt=?,leafId=?,draft=?,title=CASE WHEN title='New chat' THEN ? ELSE title END WHERE id=? AND userId=?")
+        .run(model, thinking ?? null, now, assistant.id, edit || draft.trim() !== content.trim() ? draft : "", content.slice(0, 64) || "File analysis", chatId, userId);
       return { user, assistant };
     })();
   }
@@ -373,7 +499,7 @@ export class Store {
       .run(content, status, error, reasoning ?? null, sources?.length ? JSON.stringify(sources) : null, messageId, chatId);
     if (result.changes !== 1) throw new AppError(409, "This reply is no longer active.");
     this.db.prepare("UPDATE app_chat SET updatedAt=? WHERE id=? AND userId=?").run(Date.now(), chatId, userId);
-    return this.messages(userId, chatId).find(m => m.id === messageId)!;
+    return this.messages(userId, chatId, messageId).at(-1)!;
   }
 }
 

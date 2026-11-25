@@ -9,6 +9,8 @@ import { nearestLevel, THINKING_LEVELS, type ThinkingLevel } from "./thinking";
 import { PageReadError, readPage } from "./page-reader";
 import { webSearchScope, type WebSearchScope } from "./web-search";
 import { REPLY_SILENCE_MS, silenceMinutes, silenceWatchdog } from "./reply-watchdog";
+import type { FinalPromptInput } from "./image-turn";
+import { WAITING_STAGE, reserveMemory, waitForMemory, type MemoryProbe } from "./capacity";
 
 class ResearchStopped extends Error {}
 
@@ -25,12 +27,12 @@ interface Job {
   id: string; chatId: string; userId: string; messageId: string; ctx: AccessContext;
   model: ModelInfo; effort: ThinkingLevel | undefined; question: string;
   runner: ReplyRunner; prompt: string; controller: AbortController | null; phase: "planning" | "awaiting" | "running";
+  /** Builds the request prompt, summarising older turns first if the chat no longer fits (see prepareImageTurn). */
+  finalPrompt?: (input: FinalPromptInput) => Promise<{ prompt: string; note: string | null }>;
 }
 const state = globalThis as typeof globalThis & { modelChatResearch?: Map<string, Job> };
 const jobs = state.modelChatResearch ||= new Map<string, Job>();
-type Deps = { store: Store; guard: AccessService; runner?: ReplyRunner; read?: typeof readPage; scope?: () => WebSearchScope; silenceMs?: number };
-
-const busyJobs = () => [...jobs.values()].filter(job => job.phase !== "awaiting");
+type Deps = { store: Store; guard: AccessService; runner?: ReplyRunner; read?: typeof readPage; scope?: () => WebSearchScope; silenceMs?: number; memory?: MemoryProbe };
 /** Research needs web search for this account, never runs while acting as another user, and stops if the account loses web access. */
 export function researchAllowed(guard: AccessService, userId: string, delegationId?: string | null, scope: WebSearchScope = webSearchScope()) {
   if (delegationId) return "Deep research isn't available while acting as another user.";
@@ -99,26 +101,25 @@ export function finalizeReport(report: string, sources: Source[]) {
 }
 
 /** Creates the research turn (question + reply) and drafts its plan in the background. */
-export function beginResearch(deps: Deps, input: { ctx: AccessContext; chatId: string; content: string; model: ModelInfo; thinking?: string | null; fileIds: string[]; prompt: string; runner: ReplyRunner }) {
+export function beginResearch(deps: Deps, input: { ctx: AccessContext; chatId: string; content: string; model: ModelInfo; thinking?: string | null; fileIds: string[]; prompt: string; runner: ReplyRunner; finalPrompt?: Job["finalPrompt"]; edit?: { editOf: string; keepFileIds?: string[] } }) {
   const { store, guard } = deps;
   const { ctx, chatId } = input;
   const userId = ctx.subject.id;
   const refused = researchAllowed(guard, userId, ctx.delegationId, deps.scope?.());
   if (refused) throw new AppError(403, refused);
   if ([...jobs.values()].some(job => job.chatId === chatId)) throw new AppError(409, "Research is already running in this chat.");
-  if (busyJobs().some(job => job.userId === userId)) throw new AppError(429, "One deep research run per account can work at a time. Wait for it to finish or stop it.");
-  if (busyJobs().length >= 2) throw new AppError(429, "Two deep research runs are already working on this app. Try again in a few minutes.");
   const effort = replyReasoningEffort(input.model, input.thinking);
   const id = randomUUID();
   const turn = store.db.transaction(() => {
     guard.check(ctx);
-    const turn = store.beginTurn(userId, chatId, input.content, input.model.id, input.fileIds, effort ?? null);
+    const turn = store.beginTurn(userId, chatId, input.content, input.model.id, input.fileIds, effort ?? null, input.edit);
     store.createResearch({ id, chatId, messageId: turn.assistant.id, userId, actorId: ctx.actor.id, model: input.model.id, thinking: effort ?? null, question: input.content, state: "planning", createdAt: Date.now() });
     store.updateResearch(id, { log: [entry("plan", "Drafting a research plan")] });
     guard.record(ctx, "research.plan", id, "allowed", `chat ${chatId}`, true);
+    if (input.edit) guard.record(ctx, "message.edit", turn.user.id, "allowed", `new version of ${input.edit.editOf}`, true);
     return turn;
   })();
-  const job: Job = { id, chatId, userId, messageId: turn.assistant.id, ctx, model: input.model, effort, question: input.content, runner: input.runner, prompt: input.prompt, controller: new AbortController(), phase: "planning" };
+  const job: Job = { id, chatId, userId, messageId: turn.assistant.id, ctx, model: input.model, effort, question: input.content, runner: input.runner, prompt: input.prompt, controller: new AbortController(), phase: "planning", finalPrompt: input.finalPrompt };
   jobs.set(id, job);
   void plan(deps, job).catch(error => console.error("[model-chat] Research planning failed:", error instanceof Error ? error.name : "Unknown"));
   return turn;
@@ -129,27 +130,43 @@ async function plan(deps: Deps, job: Job) {
   const run = deps.runner ?? runCopilotReply;
   const controller = job.controller!;
   const watchdog = silenceWatchdog(deps.silenceMs ?? RESEARCH_CAPS.silenceMs, () => controller.abort(new Error("silent")));
-  let text = "", requests = 0, userRequests = 0;
+  let text = "", requests = 0, userRequests = 0, note: string | null = null;
+  let release: (() => void) | undefined;
   try {
+    const authorize = () => { const refused = researchAllowed(deps.guard, job.userId, null, deps.scope?.()); if (refused) throw new AppError(403, refused); };
+    release = reserveMemory(deps.memory) ?? undefined;
+    if (!release) {
+      const resume = watchdog.hold();
+      try { release = (await waitForMemory(controller.signal, () => store.updateResearch(job.id, { log: [entry("plan", WAITING_STAGE)] }), deps.memory)).release; }
+      finally { resume(); }
+      controller.signal.throwIfAborted();
+    }
+    // Long chats: summarise older turns once (saved and reused by the research session) before planning.
+    if (job.finalPrompt) {
+      const built = await job.finalPrompt({ signal: controller.signal, authorize, onActivity: watchdog.touch, assistantMessageId: job.messageId,
+        onProgress: stage => { if (/^Summarising/.test(stage)) store.updateResearch(job.id, { log: [entry("plan", stage)] }); } });
+      job.prompt = built.prompt;
+      note = built.note;
+      if (note) store.updateResearch(job.id, { log: [entry("note", note), entry("plan", "Drafting a research plan")] });
+    }
     // The plan request sees the same conversation and files; it only drafts steps. Planning uses at most medium reasoning to stay quick.
     const payload = JSON.parse(job.prompt) as { conversation: { role: string; content: string }[] };
     payload.conversation[payload.conversation.length - 1].content = `${PLAN_TASK}\n\nResearch request:\n${job.question}`;
     const levels = job.model.supportedReasoningEfforts as string[] | undefined;
     const effort = job.effort && THINKING_LEVELS.indexOf(job.effort) > THINKING_LEVELS.indexOf("medium") ? nearestLevel(levels, "medium") : job.effort;
-    await run({ model: job.model.id, prompt: JSON.stringify(payload), signal: controller.signal, reasoningEffort: effort, onActivity: watchdog.touch,
-      authorize: () => { const refused = researchAllowed(deps.guard, job.userId, null, deps.scope?.()); if (refused) throw new AppError(403, refused); },
+    await run({ model: job.model.id, prompt: JSON.stringify(payload), signal: controller.signal, reasoningEffort: effort, onActivity: watchdog.touch, authorize,
       onDelta: value => { text += value; }, onReplace: value => { text = value; },
       onSessionEvent: event => { if (event.type === "assistant.usage") { requests++; if ((event.data as { initiator?: string }).initiator === "user") userRequests++; } } });
     if (controller.signal.aborted) throw new DOMException("cancelled", "AbortError");
     const { title, steps } = parsePlan(text, job.question);
     job.phase = "awaiting"; job.controller = null;
-    store.updateResearch(job.id, { state: "awaiting_start", title, plan: steps, counts: { searches: 0, pages: 0, failedPages: 0, requests, userRequests }, log: [entry("plan", `Plan ready: ${steps.length} step${steps.length === 1 ? "" : "s"}`)] });
+    store.updateResearch(job.id, { state: "awaiting_start", title, plan: steps, counts: { searches: 0, pages: 0, failedPages: 0, requests, userRequests }, log: [...(note ? [entry("note", note)] : []), entry("plan", `Plan ready: ${steps.length} step${steps.length === 1 ? "" : "s"}`)] });
   } catch (error) {
     const silent = controller.signal.reason instanceof Error && controller.signal.reason.message === "silent";
     const stopped = controller.signal.aborted && !silent;
     finish(deps, job, stopped ? "cancelled" : "error", "", stopped ? "Research was cancelled while the plan was being drafted." : silent ? `The model stopped responding while drafting the plan (nothing arrived for ${silenceMinutes(deps.silenceMs ?? RESEARCH_CAPS.silenceMs)}). Try again.` : copilotError(error).message,
       { searches: 0, pages: 0, failedPages: 0, requests, userRequests }, []);
-  } finally { watchdog.stop(); }
+  } finally { watchdog.stop(); release?.(); }
 }
 
 /** Starts an awaiting plan, optionally edited by the user. */
@@ -160,8 +177,6 @@ export function startResearch(deps: Deps, ctx: AccessContext, chatId: string, re
   if (refused) throw new AppError(403, refused);
   const job = jobs.get(researchId);
   if (row.state !== "awaiting_start" || !job || job.phase !== "awaiting") throw new AppError(409, "This plan can no longer be started. Send the request again.");
-  if (busyJobs().some(other => other.userId === job.userId)) throw new AppError(429, "One deep research run per account can work at a time. Wait for it to finish or stop it.");
-  if (busyJobs().length >= 2) throw new AppError(429, "Two deep research runs are already working on this app. Try again in a few minutes.");
   const steps = (edited ?? researchView(row).plan).map(step => step.trim().slice(0, PLAN_STEPS.characters)).filter(Boolean).slice(0, PLAN_STEPS.max);
   if (!steps.length) throw new AppError(400, "The plan needs at least one step.");
   guard.check(ctx);
@@ -224,6 +239,13 @@ async function execute(deps: Deps, job: Job, steps: string[], prior: ResearchVie
   };
   const note = (item: ResearchEntry) => { log.push(item); persist(true); };
   const stopReason = (reason: string) => { if (!controller.signal.aborted) controller.abort(new Error(reason)); };
+  // Like replies, a run waits to start only while this computer is short of memory; its 15 minutes start when it does.
+  let releaseMemory = reserveMemory(deps.memory);
+  if (!releaseMemory) {
+    try { releaseMemory = (await waitForMemory(controller.signal, () => note(entry("note", WAITING_STAGE)), deps.memory)).release; controller.signal.throwIfAborted(); }
+    catch { releaseMemory?.(); return finish(deps, job, "cancelled", "", "Research stopped before it began.", counts, [], log); }
+  }
+  lastEvent = Date.now();
   const wall = setTimeout(() => stopReason("time"), RESEARCH_CAPS.minutes * 60_000);
   const idle = setInterval(() => {
     if (Date.now() - lastEvent > (deps.silenceMs ?? RESEARCH_CAPS.silenceMs)) stopReason("idle");
@@ -316,6 +338,7 @@ async function execute(deps: Deps, job: Job, steps: string[], prior: ResearchVie
     if (!controller.signal.aborted) log.push(entry("note", copilotError(error).message));
   } finally {
     clearTimeout(wall);
+    releaseMemory();
     clearInterval(idle);
   }
   const reason = controller.signal.aborted ? (controller.signal.reason instanceof Error ? controller.signal.reason.message : "stopped") : null;

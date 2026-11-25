@@ -6,8 +6,8 @@ export const LIMITS = {
   transfersPerApp: 6,
   fileCharacters: 30_000,
   chatFileCharacters: 60_000,
-  promptBytes: 100_000,
-  inputCharacters: 8_000,
+  /** A message can be a long paste (about 33k tokens); the request is still checked against the chosen model's window. */
+  inputCharacters: 100_000,
   outputCharacters: 32_000,
   reasoningCharacters: 32_000,
   codeEventText: 64_000,
@@ -15,6 +15,8 @@ export const LIMITS = {
   messagesPerChat: 200,
   chatsPerUser: 100,
 };
+/** Request-body ceiling for anything carrying a message or draft: the longest message, even if every character is escaped, plus room. */
+export const MESSAGE_BODY_BYTES = LIMITS.inputCharacters * 6 + 64 * 1024;
 export const MEDIA_EXTENSIONS = ["mp3", "wav", "m4a", "aac", "flac", "ogg", "opus", "mp4", "mov", "webm", "mkv", "avi"];
 export function isMediaExtension(extension: string) { return MEDIA_EXTENSIONS.includes(extension.toLowerCase()); }
 export const FILE_ACCEPT = ".txt,.md,.csv,.json,.log,.yaml,.yml,.xml,.pdf,.docx,.xlsx,.png,.jpg,.jpeg,.webp,.gif,.mp3,.wav,.m4a,.aac,.flac,.ogg,.opus,.mp4,.mov,.webm,.mkv,.avi";
@@ -62,6 +64,12 @@ export interface Message {
   thinking?: string | null;
   /** Deep research run that produces this reply. */
   research?: ResearchView;
+  /** The message before this one on its branch (null for the first). */
+  parentId?: string | null;
+  /** For an edited user message: every version of it, oldest first (present only when there are several). */
+  siblings?: string[];
+  /** On a reply whose request summarised older turns to fit the model's context. */
+  contextNote?: string;
 }
 export interface WebSource { url: string; title: string; cited?: boolean }
 export type ResearchState = "planning" | "awaiting_start" | "running" | "writing" | "complete" | "cancelled" | "error";
@@ -97,6 +105,8 @@ export interface Attachment {
   processingError?: string | null;
   uploadComplete?: number;
   messageRole?: "user" | "assistant" | null;
+  /** Later versions of the message that carried this attachment over when it was edited. */
+  linkedMessageIds?: string[];
   preview?: "image" | "video" | "pdf" | null;
 }
 export const PREVIEW_TYPES: Record<string, "image" | "video" | "pdf"> = {
@@ -127,6 +137,7 @@ export type StreamEvent =
   | { type: "code"; event: CodeEvent }
   | { type: "web"; searching: boolean; searches: number; sources: WebSource[] }
   | { type: "progress"; stage: string }
+  | { type: "context"; note: string }
   | { type: "attachments" }
   | { type: "done"; message: Message }
   | { type: "error"; error: string };

@@ -1,10 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { ArrowDown, ArrowRight, ArrowUp, BookOpen, Brain, ChevronDown, Code2, Eye, FileText, FolderOpen, Globe, Leaf, LoaderCircle, LogOut, Menu, MessageSquare, Mic, Moon, PanelLeft, PanelRight, Pencil, Plus, RefreshCw, Settings2, ShieldCheck, Square, SquarePen, Sun, Telescope, Trash2, Volume2, X } from "lucide-react";
+import { ArrowDown, ArrowRight, ArrowUp, BookOpen, Brain, ChevronDown, ChevronLeft, ChevronRight, Code2, Eye, FileText, FolderOpen, Globe, Layers, Leaf, LoaderCircle, LogOut, Menu, MessageSquare, Mic, Moon, PanelLeft, PanelRight, Pencil, Plus, RefreshCw, Settings2, ShieldCheck, Square, SquarePen, Sun, Telescope, Trash2, Volume2, X } from "lucide-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { FILE_ACCEPT, LIMITS, type Attachment, type Chat, type ChatDetail, type Model, type StreamEvent, type WebSource } from "@/lib/contracts";
+import { FILE_ACCEPT, LIMITS, type Attachment, type Chat, type ChatDetail, type Message, type Model, type StreamEvent, type WebSource } from "@/lib/contracts";
 import { dictationConstructor, voiceError, type Dictation, type VoiceWindow } from "@/lib/voice";
 import { DEMOS, type DemoId } from "@/lib/demos";
 import type { AccountView, AppUser } from "@/lib/access";
@@ -13,6 +13,7 @@ import { CodeCard, CodePanel, ProjectPicker, TwoFactorSettings, folderName, merg
 import { LampLight } from "./lamp-light";
 import { ModelPicker } from "./model-picker";
 import { ACTIVE_RESEARCH, ResearchCard } from "./research-card";
+import { ThreadNav } from "./thread-nav";
 import { isThinkingLevel, nearestLevel, THINKING_LABELS, type ThinkingLevel } from "@/lib/thinking";
 import { THEME_STORAGE_KEY, type Theme } from "@/lib/theme";
 import { softwareRendering } from "@/lib/render-tier";
@@ -169,6 +170,13 @@ export function ChatApp() {
   const [projectPicker, setProjectPicker] = useState(false);
   const [codePanel, setCodePanel] = useState<PanelTab | null>(null);
   const [deciding, setDeciding] = useState<Set<string>>(() => new Set());
+  // Editing a sent message in place: its new text and which of its attachments the new version keeps.
+  const [editing, setEditing] = useState<{ id: string; text: string; keep: string[] } | null>(null);
+  const [branching, setBranching] = useState(false);
+  const [flashId, setFlashId] = useState<string | null>(null);
+  const [atBottom, setAtBottom] = useState(true);
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  const flashTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const bottom = useRef<HTMLDivElement>(null);
   const scroller = useRef<HTMLDivElement>(null);
   const follow = useRef(true);
@@ -333,6 +341,8 @@ export function ChatApp() {
     if (!detail?.messages.length) { if (scroller.current) scroller.current.scrollTop = 0; return; }
     if (follow.current) bottom.current?.scrollIntoView({ behavior: busy ? "instant" : "smooth" });
   }, [detail?.messages, detail?.codeEvents, busy, interim]);
+  // An open edit, expanded long messages and the scroll state belong to the chat they were made in.
+  useEffect(() => { setEditing(null); setExpanded(new Set()); setAtBottom(true); }, [detail?.chat.id, user?.id]);
 
   useEffect(() => {
     if ((!remoteBusy && !researchActive) || busy || !detail) return;
@@ -572,36 +582,38 @@ export function ChatApp() {
     const [updated, listed] = await Promise.all([api<ChatDetail>(`/api/chats/${id}`), api<{ chats: Chat[] }>("/api/chats")]);
     if (userRef.current && detailRef.current?.chat.id === id) { setDetail(updated); setChats(listed.chats); }
   }
-  async function send(event?: FormEvent, textOnly = false) {
+  /** Sends the composer's message, or with `edit` a new version of one of your earlier messages. */
+  async function send(event?: FormEvent, textOnly = false, edit?: { id: string; content: string; keep: string[]; research: boolean }) {
     event?.preventDefault();
-    if (locked || researchActive || !modelAvailable || !draft.trim()) return;
+    if (locked || researchActive || !modelAvailable || !(edit ? edit.content.trim() : draft.trim())) return;
     if (codeBlocked) { setNotice(codeStatus?.reason || "Coding mode isn't available here."); return; }
-    if (!textOnly && (pending.length !== readyPending.length || transfers.some(transfer => transfer.error))) {
+    if (!edit && !textOnly && (pending.length !== readyPending.length || transfers.some(transfer => transfer.error))) {
       setNotice("Some attached files are still processing or could not be uploaded. Nothing was sent. Wait or retry/remove those files, or explicitly choose Send text only.");
       return;
     }
-    if (researchMode) return planResearch(textOnly);
+    if (edit ? edit.research : researchMode) return planResearch(textOnly, edit);
     stopDictation();
-    const content = draft.trim();
+    const content = edit ? edit.content.trim() : draft.trim();
     const ownerId = userRef.current?.id;
     const epoch = workspaceEpoch.current;
-    // Clear the composer now so anything typed while this reply streams becomes the next draft, not this turn.
-    draftRef.current = ""; setDraft(""); setDraftState("saving");
+    // Clear the composer now so anything typed while this reply streams becomes the next draft, not this turn. An edit leaves the draft alone.
+    if (edit) setEditing(null);
+    else { draftRef.current = ""; setDraft(""); setDraftState("saving"); }
     setBusy(true); setNotice(""); setStreamStage(detailRef.current?.chat.mode === "code" ? "Working in the project" : "Preparing attachments"); follow.current = true;
     const controller = new AbortController();
     generation.current = controller;
     let chatId: string | undefined;
     let accepted = false;
     let done = false;
-    const selectedFiles = textOnly ? [] : pending;
+    const selectedFiles = edit || textOnly ? [] : pending;
     try {
-      await flushDraft(true);
+      if (!edit) await flushDraft(true);
       const chat = await ensureChat();
       chatId = chat.id;
       const response = await fetch(`/api/chats/${chat.id}/messages`, {
         method: "POST", signal: controller.signal,
         headers: { "Content-Type": "application/json", "x-model-chat-subject": ownerId! },
-        body: JSON.stringify({ content, model: selectedModel, ...(thinkingLevel ? { thinking: thinkingLevel } : {}), fileIds: selectedFiles.map(f => f.id) }),
+        body: JSON.stringify({ content, model: selectedModel, ...(thinkingLevel ? { thinking: thinkingLevel } : {}), fileIds: selectedFiles.map(f => f.id), ...(edit ? { editOf: edit.id, keepFileIds: edit.keep } : {}) }),
       });
       if (!response.ok) {
         const data = await response.json();
@@ -617,12 +629,22 @@ export function ChatApp() {
         if (item.type === "error") throw new Error(item.error);
         if (item.type === "start") {
           accepted = true;
-          setDetail(previous => previous && previous.chat.id === chatId ? ({ ...previous,
-            messages: [...previous.messages, item.user, item.assistant],
-            attachments: previous.attachments.map(f => selectedFiles.some(p => p.id === f.id) ? { ...f, messageId: item.user.id } : f),
-          }) : previous);
+          setDetail(previous => {
+            if (!previous || previous.chat.id !== chatId) return previous;
+            // An edit replaces the edited message and everything after it on screen; the old branch stays saved.
+            const cut = edit ? previous.messages.findIndex(m => m.id === edit.id) : -1;
+            const kept = cut >= 0 ? previous.messages.slice(0, cut) : previous.messages;
+            const versions = edit && cut >= 0 ? [...(previous.messages[cut].siblings ?? [edit.id]), item.user.id] : undefined;
+            return { ...previous,
+              messages: [...kept, versions ? { ...item.user, siblings: versions } : item.user, item.assistant],
+              attachments: previous.attachments.map(f => selectedFiles.some(p => p.id === f.id) ? { ...f, messageId: item.user.id }
+                : edit?.keep.includes(f.id) ? { ...f, linkedMessageIds: [...(f.linkedMessageIds ?? []), item.user.id] } : f),
+            };
+          });
         } else if (item.type === "progress") {
           setStreamStage(item.stage);
+        } else if (item.type === "context") {
+          setDetail(previous => previous && previous.chat.id === chatId ? ({ ...previous, messages: previous.messages.map((m, index) => index === previous.messages.length - 1 ? { ...m, contextNote: item.note } : m) }) : previous);
         } else if (item.type === "attachments") {
           const chatForFiles = chatId;
           void api<{ attachments: Attachment[] }>(`/api/chats/${chatForFiles}/files`).then(result => {
@@ -660,7 +682,8 @@ export function ChatApp() {
     } catch (error) {
       if (userRef.current?.id === ownerId && workspaceEpoch.current === epoch) {
         report(error);
-        if (!accepted) {
+        if (!accepted && edit) setEditing({ id: edit.id, text: edit.content, keep: edit.keep });
+        else if (!accepted) {
           // Restore the unsent message without discarding anything typed since Send.
           const restored = draftRef.current.trim() ? `${content}\n\n${draftRef.current}` : content;
           draftRef.current = restored; setDraft(restored); setDraftState("saving");
@@ -671,7 +694,7 @@ export function ChatApp() {
         try { await refreshChat(chatId); } catch (error) { report(error); }
       }
       if (generation.current === controller) { setBusy(false); generation.current = null; }
-      composer.current?.focus();
+      if (!edit) composer.current?.focus();
     }
   }
   async function stop() {
@@ -680,27 +703,29 @@ export function ChatApp() {
     catch (error) { report(error); }
   }
   // Deep research: the server drafts a plan in the background; the chat's polling shows it, and Start runs the research there.
-  async function planResearch(textOnly: boolean) {
+  async function planResearch(textOnly: boolean, edit?: { id: string; content: string; keep: string[] }) {
     stopDictation();
-    const content = draft.trim();
+    const content = edit ? edit.content.trim() : draft.trim();
     const ownerId = userRef.current?.id;
     const epoch = workspaceEpoch.current;
-    const selectedFiles = textOnly ? [] : pending;
-    draftRef.current = ""; setDraft(""); setDraftState("saving");
+    const selectedFiles = edit || textOnly ? [] : pending;
+    if (edit) setEditing(null);
+    else { draftRef.current = ""; setDraft(""); setDraftState("saving"); }
     setBusy(true); setNotice(""); follow.current = true;
     let chatId: string | undefined;
     let accepted = false;
     try {
-      await flushDraft(true);
+      if (!edit) await flushDraft(true);
       const chat = await ensureChat();
       chatId = chat.id;
-      await api(`/api/chats/${chat.id}/research`, { method: "POST", body: JSON.stringify({ content, model: selectedModel, ...(thinkingLevel ? { thinking: thinkingLevel } : {}), fileIds: selectedFiles.map(file => file.id) }) });
+      await api(`/api/chats/${chat.id}/research`, { method: "POST", body: JSON.stringify({ content, model: selectedModel, ...(thinkingLevel ? { thinking: thinkingLevel } : {}), fileIds: selectedFiles.map(file => file.id), ...(edit ? { editOf: edit.id, keepFileIds: edit.keep } : {}) }) });
       accepted = true;
       setResearch(false);
     } catch (error) {
       if (userRef.current?.id === ownerId && workspaceEpoch.current === epoch) {
         report(error);
-        if (!accepted) {
+        if (!accepted && edit) setEditing({ id: edit.id, text: edit.content, keep: edit.keep });
+        else if (!accepted) {
           const restored = draftRef.current.trim() ? `${content}\n\n${draftRef.current}` : content;
           draftRef.current = restored; setDraft(restored); setDraftState("saving");
         }
@@ -722,6 +747,42 @@ export function ChatApp() {
       await refreshChat(chatId);
     } catch (error) { report(error); }
     finally { setResearchDeciding(null); }
+  }
+  /** Shows another version of an edited message; the conversation below it (and the model's context) follows that version. */
+  async function showVersion(messageId: string) {
+    if (!detail || locked || researchActive || branching) return;
+    const chatId = detail.chat.id;
+    const epoch = workspaceEpoch.current;
+    setBranching(true); setEditing(null);
+    try {
+      const result = await api<ChatDetail>(`/api/chats/${chatId}/branch`, { method: "POST", body: JSON.stringify({ messageId }) });
+      if (detailRef.current?.chat.id === chatId && workspaceEpoch.current === epoch) {
+        follow.current = false;
+        setDetail(result);
+        requestAnimationFrame(() => scroller.current?.querySelector<HTMLElement>(`[data-message-id="${messageId}"]`)?.scrollIntoView({ block: "nearest" }));
+      }
+    } catch (error) { report(error); }
+    finally { setBranching(false); }
+  }
+  function startEdit(item: Message) {
+    if (!detail) return;
+    setEditing({ id: item.id, text: item.content, keep: messageFiles(item.id).map(file => file.id) });
+  }
+  function messageFiles(id: string) {
+    return (detailRef.current?.attachments || []).filter(file => file.messageId === id || file.linkedMessageIds?.includes(id));
+  }
+  function jumpTo(id: string) {
+    const node = scroller.current?.querySelector<HTMLElement>(`[data-message-id="${id}"]`);
+    if (!node) return;
+    follow.current = false;
+    node.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
+    setFlashId(id);
+    clearTimeout(flashTimer.current);
+    flashTimer.current = setTimeout(() => setFlashId(null), 1600);
+  }
+  function jumpToLatest() {
+    follow.current = true;
+    bottom.current?.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
   }
   async function chooseCode() {
     if (composeLocked || !codeReady) return;
@@ -927,7 +988,7 @@ export function ChatApp() {
         const next = draftRef.current + (draftRef.current && !draftRef.current.endsWith(" ") ? " " : "") + final;
         if (next.length > LIMITS.inputCharacters) {
           instance.stop();
-          setNotice("Dictation reached the 8,000-character message limit. The transcript was shortened; review it before sending.");
+          setNotice(`Dictation reached the ${LIMITS.inputCharacters.toLocaleString()}-character message limit. The transcript was shortened; review it before sending.`);
         }
         draftRef.current = next.slice(0, LIMITS.inputCharacters);
         setDraft(draftRef.current);
@@ -1049,9 +1110,13 @@ export function ChatApp() {
       {acting && <div className="acting-banner" role="status"><div><strong>Acting as {user.name}</strong><span>{user.email} · Signed in as {actor?.email}. Actions are audited.</span></div><button onClick={() => void returnToSelf()} disabled={locked}>Return to my workspace</button>{(busy || remoteBusy) && <small>Stop the current reply before returning.</small>}</div>}
       {connectionError && <div className="connection-banner" role="status"><ShieldCheck size={16} /><span>{connectionError}</span><button onClick={() => setSettings(true)}>Setup</button></div>}
       {notice && <div className="notice" role="alert"><span>{notice}</span><IconButton label="Dismiss message" onClick={() => setNotice("")}><X size={16} /></IconButton></div>}
+      <div className="conversation-wrap">
       <div className="conversation" ref={scroller} onScroll={() => {
         const node = scroller.current;
-        if (node) follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 120;
+        if (!node) return;
+        const distance = node.scrollHeight - node.scrollTop - node.clientHeight;
+        follow.current = distance < 120;
+        setAtBottom(distance < Math.max(320, node.clientHeight * 0.6));
       }}>
         {loadingChat ? <div className="loading-chat"><LoaderCircle className="spin" /> Opening conversation...</div> :
           welcome ? codeChat ? <div className="welcome">
@@ -1061,20 +1126,43 @@ export function ChatApp() {
             <h1>Start with a question or a file</h1>
             <p>{pending.length ? processing ? "Your files are processing. You can keep writing meanwhile." : readyPending.length ? "Your files are ready. Ask about them below." : "Some uploads need attention before you send." : "Choose any of your Copilot models in the box below. Switch models mid-conversation and the context carries over."}</p>
           </div> : <div className="message-list">
-            {detail!.messages.map(item => {
+            {detail!.messages.map((item, index) => {
               const time = new Date(item.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-              const files = detail!.attachments.filter(f => f.messageId === item.id);
-              if (item.role === "user") return <article key={item.id} className="message user" aria-label="Your message">
-                {files.length > 0 && <div className="sent-files">{files.map(sentFile)}</div>}
-                <div className="bubble">{item.content}</div>
-                <time className="hover-time" dateTime={new Date(item.createdAt).toISOString()}>{time}</time>
-                {item.error && <div className={`message-status ${item.status}`} role="status">{item.error}</div>}
-              </article>;
+              const files = detail!.attachments.filter(f => f.messageId === item.id || f.linkedMessageIds?.includes(item.id));
+              if (item.role === "user") {
+                const reply = detail!.messages[index + 1];
+                const versions = item.siblings;
+                const version = versions ? versions.indexOf(item.id) : -1;
+                const editBlocked = locked || researchActive || branching || !modelAvailable || codeBlocked;
+                const long = item.content.length > 1600 || item.content.split("\n").length > 24;
+                const open = expanded.has(item.id);
+                if (editing?.id === item.id) return <article key={item.id} data-message-id={item.id} className="message user editing" aria-label="Your message, being edited">
+                  <EditBox text={editing.text} files={files} keep={editing.keep} disabled={editBlocked} code={Boolean(codeChat)} research={Boolean(reply?.research) && researchAvailable}
+                    modelLabel={`${currentModel?.name || selectedModel}${thinkingLevel ? ` · ${THINKING_LABELS[thinkingLevel as ThinkingLevel] || thinkingLevel}` : ""}`}
+                    onChange={(text, keep) => setEditing({ id: item.id, text, keep })} onCancel={() => setEditing(null)}
+                    onSend={() => void send(undefined, false, { id: item.id, content: editing.text, keep: editing.keep, research: Boolean(reply?.research) && researchAvailable })} />
+                </article>;
+                return <article key={item.id} data-message-id={item.id} className={`message user ${flashId === item.id ? "flash" : ""}`} aria-label="Your message">
+                  {files.length > 0 && <div className="sent-files">{files.map(sentFile)}</div>}
+                  <div className={`bubble ${long && !open ? "clamped" : ""}`}>{item.content}</div>
+                  {long && <button type="button" className="text-button bubble-more" aria-expanded={open} onClick={() => setExpanded(previous => { const next = new Set(previous); if (next.has(item.id)) next.delete(item.id); else next.add(item.id); return next; })}>{open ? "Show less" : "Show all"}</button>}
+                  <div className="user-actions">
+                    {versions && <span className="versions" role="group" aria-label="Versions of this message">
+                      <IconButton label="Previous version" disabled={version <= 0 || editBlocked} onClick={() => void showVersion(versions[version - 1])}><ChevronLeft size={16} /></IconButton>
+                      <span className="version-count" aria-live="polite">{version + 1} / {versions.length}</span>
+                      <IconButton label="Next version" disabled={version >= versions.length - 1 || editBlocked} onClick={() => void showVersion(versions[version + 1])}><ChevronRight size={16} /></IconButton>
+                    </span>}
+                    <IconButton label="Edit message" title={editBlocked ? "Wait for the current reply to finish, or stop it, to edit" : "Edit and send a new version from here"} disabled={editBlocked} onClick={() => startEdit(item)}><Pencil size={15} /></IconButton>
+                    <time className="hover-time" dateTime={new Date(item.createdAt).toISOString()}>{time}</time>
+                  </div>
+                  {item.error && <div className={`message-status ${item.status}`} role="status">{item.error}</div>}
+                </article>;
+              }
               const streaming = item.status === "streaming";
-              return <article key={item.id} className={`message assistant ${streaming ? "streaming" : ""}`} aria-label="Assistant message">
+              return <article key={item.id} data-message-id={item.id} className={`message assistant ${streaming ? "streaming" : ""}`} aria-label="Assistant message">
                 <span className="reply-mark" aria-hidden="true"><Leaf size={14} /></span>
                 <div className="reply-body">
-                  <div className="reply-meta"><span className="model-tag">{models.find(m => m.id === item.model)?.name || item.model}</span>{item.thinking && <span className="thinking-tag" title="Thinking level for this reply">{THINKING_LABELS[item.thinking as ThinkingLevel] || item.thinking}</span>}<time className="hover-time" dateTime={new Date(item.createdAt).toISOString()}>{time}</time></div>
+                  <div className="reply-meta"><span className="model-tag">{models.find(m => m.id === item.model)?.name || item.model}</span>{item.thinking && <span className="thinking-tag" title="Thinking level for this reply">{THINKING_LABELS[item.thinking as ThinkingLevel] || item.thinking}</span>}{item.contextNote && <span className="context-note" title={`${item.contextNote}. The full history stays saved and shown here; the model saw a summary of the older messages, passages from them that match your message, and the latest messages in full.`}><Layers size={12} aria-hidden="true" />Earlier messages summarised</span>}<time className="hover-time" dateTime={new Date(item.createdAt).toISOString()}>{time}</time></div>
                   {item.research && <ResearchCard research={item.research} deciding={researchDeciding === item.research.id} onStart={plan => void startResearchRun(item.research!.id, plan)} onCancel={() => void stop()} />}
                   {item.reasoning && <Thinking text={item.reasoning} live={streaming && !item.content} open={openThinking.has(item.id)} onToggle={() => toggleThinking(item.id)} />}
                   {codeChat && <div className="code-cards">{(detail!.codeEvents || []).filter(event => event.messageId === item.id).map(event =>
@@ -1106,6 +1194,9 @@ export function ChatApp() {
             })}
           </div>}
         <div ref={bottom} />
+      </div>
+      {!welcome && !loadingChat && detail && <ThreadNav scroller={scroller} atBottom={atBottom} onJump={jumpTo} onLatest={jumpToLatest}
+        items={detail.messages.filter(item => item.role === "user").map(item => ({ id: item.id, text: item.content, time: new Date(item.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) }))} />}
       </div>
       <div className="composer-wrap">
         <div className={`composer-frame ${replyRunning ? "working" : ""}`}>
@@ -1164,7 +1255,7 @@ export function ChatApp() {
               {uploading && <button type="button" className="text-button" onClick={() => uploadController.current?.abort()}>Cancel upload</button>}
               {(pending.length > readyPending.length || transfers.some(transfer => transfer.error)) && <button type="button" className="text-button" disabled={!draft.trim() || locked || !modelAvailable} onClick={() => void send(undefined, true)}>Send text only</button>}
             </div>
-            <div className="send-group">{draft.length > 7000 && <small>{draft.length}/{LIMITS.inputCharacters}</small>}
+            <div className="send-group">{draft.length > LIMITS.inputCharacters * 0.9 && <small>{draft.length.toLocaleString()}/{LIMITS.inputCharacters.toLocaleString()}</small>}
               <ModelPicker models={models} value={selectedModel} thinking={thinking} loading={modelLoading} disabled={composeLocked || modelLoading || !models.length}
                 onModel={id => { setSelectedModel(id); setDraftState("saving"); }} onThinking={level => { setThinking(level); setDraftState("saving"); }} />
               {busy || remoteBusy || researchActive ? <button type="button" className="send-button stop" aria-label={researchActive ? "Stop research" : "Stop reply"} title={researchActive ? "Stop the research run. Pages read so far stay in its details." : "Stop the reply; partial text is kept. You can keep writing meanwhile."} onClick={() => void stop()}><Square size={14} fill="currentColor" /></button> :
@@ -1213,7 +1304,12 @@ export function ChatApp() {
         <p>TXT, Markdown, CSV, JSON, LOG, YAML/XML, selectable-text PDF, DOCX, XLSX, PNG/JPEG/WebP/static GIF, and the listed audio/video formats remain supported. There is no preset total file-size or storage quota; disk reserves and decoder safeguards still apply. Photos up to 268 megapixels and 65,535 pixels per side are accepted, including 200 MP phone photos and wide panoramas; the model gets an upright copy at most 2048 pixels on its longest side, and the original is kept. Files that claim far more pixels than their size could hold are rejected as unsafe. Video frames are sampled from videos up to 8K. No scanned-PDF OCR, macros or executable uploads. Context and model output remain finite; original files and saved prompts are not truncated.</p>
         <p>Download originals from message chips. X removes unsent files; deleting a chat removes its files and saved image analyses. Histories and drafts survive user/chat switches. Up to 100 chats and 100 turns per chat remain.</p>
       </div>
-      <div className="settings-section"><h3><Code2 size={16} /> Code runner</h3><p>{sandboxInfo?.message || "Checking the code runner..."}</p>{sandboxInfo?.ready && <><p>Ask for a PDF report, chart, GIF/MP4 animation, or Word/Excel/PowerPoint file. The model writes Python that runs in a disposable Linux sandbox on this computer (WSL). Each run has <strong>no internet or network access</strong>, cannot install packages, cannot see Windows, other chats or other users, and is deleted afterwards. Only files from this chat that the model selects are copied in.{sandboxInfo.limits && <> Limits per run: about {sandboxInfo.limits.wallSeconds} seconds, {sandboxInfo.limits.cpus} CPUs, {Math.round(sandboxInfo.limits.memoryBytes / 1024 ** 3)} GB memory, {Math.round(sandboxInfo.limits.workBytes / 1024 ** 2)} MB scratch space and {sandboxInfo.limits.outputFiles} output files; up to 8 runs per reply.</>}</p><p>Available libraries: {sandboxInfo.libraries.join(", ")}. Only the host owner can add libraries, using a command on this computer; they cannot be installed from chat.</p><p>Results are attached to the reply as downloads. PNG/JPEG/GIF/WebP images, MP4/WebM videos and PDFs also get previews; other types such as HTML or SVG are download-only. Generated code can be wrong; check important results. Runs use the host owner&apos;s Copilot quota like any message.</p></>}</div>
+      <div className="settings-section"><h3><Layers size={16} /> Long chats, edits and navigation</h3>
+          <p><strong>Edit</strong> a message you sent with its pencil (shown on hover, always on touch screens), then Send: you get a new reply from that point with the current model and thinking level. Earlier versions and the replies after them stay saved; switch with ‹ 2 / 3 ›. The model only sees the version shown. In coding chats, files changed by later turns aren&apos;t rolled back.</p>
+          <p><strong>Long chats keep working.</strong> Each request can use the chosen model&apos;s whole context window. When a chat outgrows it, older messages are summarised by the cheapest available model (one extra request), saved and reused, while the latest messages and passages that match your question go in full; those replies say &ldquo;Earlier messages summarised&rdquo;. The full history stays here. A message can be up to {LIMITS.inputCharacters.toLocaleString()} characters.</p>
+          <p><strong>Find your way:</strong> the marks along the right edge are your messages. Hover for a preview, click to jump; Alt+↑ and Alt+↓ step between them and &ldquo;Latest&rdquo; returns to the end. On a phone, the list button shows them all.</p>
+          <p>Replies in different chats run at the same time, so you can start a new chat while another answers. Each chat answers one message at a time. Only if this computer is short of memory does a reply wait to start; it starts by itself, and Stop cancels it.</p>
+        </div>        <div className="settings-section"><h3><Code2 size={16} /> Code runner</h3><p>{sandboxInfo?.message || "Checking the code runner..."}</p>{sandboxInfo?.ready && <><p>Ask for a PDF report, chart, GIF/MP4 animation, or Word/Excel/PowerPoint file. The model writes Python that runs in a disposable Linux sandbox on this computer (WSL). Each run has <strong>no internet or network access</strong>, cannot install packages, cannot see Windows, other chats or other users, and is deleted afterwards. Only files from this chat that the model selects are copied in.{sandboxInfo.limits && <> Limits per run: about {sandboxInfo.limits.wallSeconds} seconds, {sandboxInfo.limits.cpus} CPUs, {Math.round(sandboxInfo.limits.memoryBytes / 1024 ** 3)} GB memory, {Math.round(sandboxInfo.limits.workBytes / 1024 ** 2)} MB scratch space and {sandboxInfo.limits.outputFiles} output files; up to 8 runs per reply.</>}</p><p>Available libraries: {sandboxInfo.libraries.join(", ")}. Only the host owner can add libraries, using a command on this computer; they cannot be installed from chat.</p><p>Results are attached to the reply as downloads. PNG/JPEG/GIF/WebP images, MP4/WebM videos and PDFs also get previews; other types such as HTML or SVG are download-only. Generated code can be wrong; check important results. Runs use the host owner&apos;s Copilot quota like any message.</p></>}</div>
       {webInfo && <div className="settings-section"><h3><Globe size={16} /> Web search</h3><p>{webInfo.enabled
         ? "On for your chats. When a question needs current information, the model can search the web and cite its sources under the reply. Searches run on GitHub's servers through the host owner's Copilot account, not from this computer. Web results can be wrong or out of date; check important facts. The model sees search results, not whole pages, so it can't fully read a link you paste."
         : `Off for this account. ${webInfo.reason ?? ""} Replies use only the model's training and what you share.`}</p>
@@ -1239,6 +1335,46 @@ export function ChatApp() {
   </div>;
 }
 
+/**
+ * Editing a sent message in place, like ChatGPT: Send adds a new version from this point (with the chat's current model and thinking level);
+ * the old version and the replies after it stay saved and reachable with the ‹ › switcher.
+ */
+function EditBox({ text, files, keep, disabled, code, research, modelLabel, onChange, onCancel, onSend }: {
+  text: string; files: Attachment[]; keep: string[]; disabled: boolean; code: boolean; research: boolean; modelLabel: string;
+  onChange: (text: string, keep: string[]) => void; onCancel: () => void; onSend: () => void;
+}) {
+  const box = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    const node = box.current;
+    if (!node) return;
+    node.style.height = "auto";
+    node.style.height = `${Math.min(node.scrollHeight + 2, Math.round(window.innerHeight * 0.5))}px`;
+  }, [text]);
+  useEffect(() => { const node = box.current; if (node) { node.focus(); node.setSelectionRange(node.value.length, node.value.length); } }, []);
+  const kept = files.filter(file => keep.includes(file.id));
+  const removed = files.length - kept.length;
+  return <form className="edit-box" onSubmit={event => { event.preventDefault(); if (!disabled && text.trim()) onSend(); }}>
+    <label className="sr-only" htmlFor="edit-message">Edit your message</label>
+    <textarea id="edit-message" ref={box} value={text} maxLength={LIMITS.inputCharacters} onChange={event => onChange(event.target.value, keep)}
+      onKeyDown={event => {
+        if (event.key === "Escape") { event.preventDefault(); onCancel(); }
+        else if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); if (!disabled && text.trim()) onSend(); }
+      }} />
+    {files.length > 0 && <div className="edit-files" aria-label="Attachments of this message">
+      {kept.map(file => <span className="file-chip edit-file" key={file.id}><FileText size={14} /><span>{file.name}</span>
+        <button type="button" className="icon-button" aria-label={`Remove ${file.name} from the new version`} onClick={() => onChange(text, keep.filter(id => id !== file.id))}><X size={14} /></button></span>)}
+      {removed > 0 && <button type="button" className="text-button" onClick={() => onChange(text, files.map(file => file.id))}>Restore {removed} removed</button>}
+    </div>}
+    <p className="edit-note">{code
+      ? <>Sends a new version from here and starts a fresh coding session with this branch&apos;s history. <strong>File changes made by later turns stay on disk; nothing is rolled back</strong>, and background processes from the old session stop.</>
+      : research ? <>Sends a new deep research request from here: you&apos;ll review a new plan first. The earlier version and its report stay saved.</>
+      : <>Sends a new version from here with {modelLabel}. The earlier version and the replies after it stay saved; switch between them with ‹ ›.</>}</p>
+    <div className="edit-actions">
+      <button type="button" className="secondary-button" onClick={onCancel}>Cancel</button>
+      <button type="submit" className="primary-button" disabled={disabled || !text.trim()} title={disabled ? "Wait for the current reply to finish, or stop it" : "Send (Enter)"}>Send</button>
+    </div>
+  </form>;
+}
 function Dialog({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
   const dialog = useRef<HTMLDialogElement>(null);
   useEffect(() => { dialog.current?.showModal(); }, []);

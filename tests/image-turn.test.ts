@@ -9,7 +9,7 @@ import { Store } from "../lib/store";
 import { AccessService } from "../lib/access";
 import { prepareImageTurn } from "../lib/image-turn";
 import { createChatStream } from "../lib/stream";
-import { SYSTEM_INSTRUCTION } from "../lib/context";
+import { estimateTokens, modelPromptLimit, promptTokenBudget } from "../lib/context";
 import type { ReplyRunner } from "../lib/copilot";
 
 const model: ModelInfo = { id: "single-image-fixture", name: "Fixture", capabilities: {
@@ -215,7 +215,8 @@ test("many file excerpts fit remaining context without dropping any selected fil
       const body = JSON.parse(input.prompt);
       assert.equal(body.files.length, 10);
       assert.ok(body.files.every((file: { text: string }) => file.text.includes("Selected excerpts")));
-      assert.ok(Buffer.byteLength(input.prompt) + Buffer.byteLength(SYSTEM_INSTRUCTION) < 100000);
+      assert.ok(estimateTokens(input.prompt) <= promptTokenBudget(modelPromptLimit(model)), "Within the model's prompt budget");
+      assert.ok(Buffer.byteLength(input.prompt) > 100_000, "No longer squeezed into the old fixed 100 KB cap");
       input.onDelta("All ten file excerpts considered.");
     });
     assert.equal(result.last.status, "complete");

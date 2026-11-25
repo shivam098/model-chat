@@ -62,8 +62,8 @@ test("reopen and model switch retain exact owned context and sent files", () => 
   } finally { reopened.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 test("model context stays bounded while stored file contents are not capped or discarded", () => {
-  assert.throws(() => buildPrompt([], [{ id: "x", name: "huge", text: "x".repeat(LIMITS.promptBytes) }], "question"), /budget/);
-  assert.throws(() => buildPrompt([], [], "hi", 100), /budget/);
+  assert.throws(() => buildPrompt([], [{ id: "x", name: "huge", text: "x".repeat(400_000) }], "question"), /doesn't fit the model's context window/);
+  assert.throws(() => buildPrompt([], [], "hi", 100), /doesn't fit the model's context window/);
   const { db, store, chat } = fixture();
   try {
     store.addFile("alice", chat.id, "one.txt", Buffer.from("1"), "x".repeat(30_000), "");

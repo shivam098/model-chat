@@ -42,7 +42,7 @@ test("native image bytes persist and remain available only to their owner after 
     assert.deepEqual(nativeImages(store.contextImages("alice", chat.id, []), model), blobs);
     assert.throws(() => store.contextImages("bob", chat.id, []), /not found/);
     assert.throws(() => nativeImages(store.contextImages("alice", chat.id, []), { ...model, capabilities: { ...model.capabilities, supports: { vision: false, reasoningEffort: false } } }), /vision/);
-    assert.throws(() => buildPrompt([], [], "test", 0), /budget/);
+    assert.throws(() => buildPrompt([], [], "test", 0), /doesn't fit the model's context window/);
   } finally { db.close(); }
 });
 test("unsupported or misleading inputs fail explicitly instead of pretending to analyze media", async () => {

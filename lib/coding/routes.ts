@@ -3,7 +3,7 @@ import type { Store } from "../store";
 import type { AccessContext, AccessService } from "../access";
 import { AppError } from "../errors";
 import { readJson } from "../http";
-import { LIMITS } from "../contracts";
+import { LIMITS, MESSAGE_BODY_BYTES } from "../contracts";
 import { listModels, replyReasoningEffort, type ReplyRunner } from "../copilot";
 import { THINKING_LEVELS } from "../thinking";
 import { createChatStream, type StreamSecurity } from "../stream";
@@ -92,7 +92,7 @@ export function screenshot(project: string, name: string) {
 }
 
 /** A message in a coding chat: the same streamed reply and saved history as chat, run by the owner's coding session. */
-export async function handleCodeMessage(request: Request, ctx: AccessContext, guard: AccessService, store: Store, chatId: string, security: StreamSecurity) {
+export async function handleCodeMessage(request: Request, ctx: AccessContext, guard: AccessService, store: Store, chatId: string, securityFor: (editOf?: string) => StreamSecurity, plain: StreamSecurity) {
   const user = ctx.subject;
   requireCoding(request, ctx, guard, "code.message");
   const body = await readJson(request, z.object({
@@ -100,19 +100,25 @@ export async function handleCodeMessage(request: Request, ctx: AccessContext, gu
     model: z.string().min(1).max(128),
     thinking: z.enum(THINKING_LEVELS).optional(),
     fileIds: z.array(z.uuid()).max(0, "Coding chats work on the project folder. Put files in the project instead of attaching them.").default([]),
-  }).strict());
+    editOf: z.uuid().optional(),
+    keepFileIds: z.array(z.uuid()).max(0).default([]),
+  }).strict(), MESSAGE_BODY_BYTES);
   store.assertIdle(user.id, chatId);
   const chat = store.chat(user.id, chatId);
   const model = (await listModels()).find(item => item.id === body.model);
   if (!model) throw new AppError(400, "That model is no longer available. Refresh the model list and select another.");
-  const history = store.messages(user.id, chatId).filter(message => message.content).map(message => ({ role: message.role, content: message.content }));
+  const base = body.editOf ? store.editBase(user.id, chatId, body.editOf) : undefined;
+  const history = store.messages(user.id, chatId, base ? base.parentId : undefined).filter(message => message.content).map(message => ({ role: message.role, content: message.content }));
+  // The coding session remembers the turns it ran; an edit starts a fresh one that gets this branch's recap instead. Files stay as they are.
+  if (base) await disposeCodeChat(chatId);
   const runner = codingRunner({ store, chat, ownerId: user.id, history, audit: (action, objectId, outcome, reason) => guard.record(ctx, action, objectId, outcome, reason, true) });
   const effort = replyReasoningEffort(model, body.thinking);
   const wrapped: ReplyRunner = input => runner({ ...input, reasoningEffort: effort });
+  const security = base ? securityFor(body.editOf) : plain;
   // Coding access is re-checked throughout the turn: losing the superuser role or the local browser stops it.
   const codingSecurity: StreamSecurity = { ...security, check: () => {
     security.check();
     if (!codingStatus(request, ctx, guard).available) throw new AppError(403, "Coding access ended.");
   } };
-  return createChatStream(store, user.id, chatId, body.content, body.model, [], body.content, wrapped, request.signal, codingSecurity, undefined, { thinking: effort ?? null });
+  return createChatStream(store, user.id, chatId, body.content, body.model, [], body.content, wrapped, request.signal, codingSecurity, undefined, { thinking: effort ?? null, ...(base ? { edit: { editOf: body.editOf! } } : {}) });
 }

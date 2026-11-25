@@ -156,7 +156,7 @@ kbd{display:inline-block;padding:0 4px;border:1px solid var(--line-strong);borde
 .message.assistant{display:grid;grid-template-columns:28px minmax(0,1fr);column-gap:16px}
 .reply-mark{display:grid;place-items:center;width:28px;height:28px;border:1px solid var(--line);border-radius:50%;background:var(--surface);color:var(--accent)}
 .reply-body{min-width:0}
-.reply-meta{display:flex;align-items:center;gap:8px;height:28px;margin-bottom:4px}
+.reply-meta{display:flex;flex-wrap:wrap;align-items:center;column-gap:8px;row-gap:2px;min-height:28px;margin-bottom:4px}
 .reply-meta .model-tag{height:auto;padding:0;border:0;background:none;color:var(--text-3)}
 .reply-actions{display:flex;gap:4px;margin:8px 0 0 -8px}
 .reply-actions .icon-button{width:32px;height:32px;border-radius:50%}
@@ -601,7 +601,7 @@ kbd{display:inline-block;padding:0 4px;border:1px solid var(--line-strong);borde
 .thinking-levels label.selected span{border-color:var(--accent-line);background:rgba(var(--lamp),.16);color:var(--text);font-weight:500}
 .thinking-levels input:focus-visible+span{outline:2px solid var(--accent);outline-offset:2px}
 .thinking-hint{display:block;padding:8px 10px 2px;font-size:12px;line-height:16px;color:var(--text-3)}
-.thinking-tag{font-family:var(--mono);font-size:12px;line-height:16px;color:var(--text-3)}
+.thinking-tag{font-family:var(--mono);font-size:12px;line-height:16px;color:var(--text-3);white-space:nowrap}
 .thinking-tag::before{content:"·";margin-right:8px}
 @media (max-width:760px){.model-menu{left:8px!important;right:8px!important;bottom:calc(8px + env(safe-area-inset-bottom))!important;width:auto;max-width:none;max-height:78dvh;border-radius:20px}.model-option{min-height:44px}.thinking-levels span{height:36px;padding:0 14px}}
 
@@ -641,3 +641,70 @@ kbd{display:inline-block;padding:0 4px;border:1px solid var(--line-strong);borde
 .research-card.done h4{margin:14px 0 4px;font-size:12px;font-weight:500;color:var(--text-3)}
 .research-card.error,.research-card.cancelled{border-style:dashed}
 @media (max-width:760px){.research-chip>span{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}.research-chip{position:relative;padding:0 8px}.research-card{padding:12px}}
+
+/* Editing a sent message, its versions, long messages and the jump highlight */
+.conversation-wrap{position:relative;flex:1;min-height:0;display:flex;flex-direction:column}
+.main-panel.empty .conversation-wrap{flex:1 1 0}
+.message{scroll-margin-top:16px}
+.user-actions{display:flex;align-items:center;gap:2px;min-height:28px;margin-top:-4px}
+.user-actions>*{opacity:0;transition:opacity .15s var(--ease)}
+.user-actions>.versions,.message.user:hover .user-actions>*,.message.user:focus-within .user-actions>*{opacity:1}
+.message.user .user-actions .hover-time{margin:0 0 0 4px;opacity:inherit}
+.user-actions .icon-button{width:28px;height:28px;border-radius:50%;color:var(--text-3)}
+.user-actions .icon-button:hover:not(:disabled){background:var(--sunken);color:var(--text)}
+.user-actions .icon-button:disabled{opacity:.4}
+.versions{display:inline-flex;align-items:center;margin-right:2px;font-family:var(--mono);font-size:12px;color:var(--text-3)}
+.version-count{min-width:40px;text-align:center;font-variant-numeric:tabular-nums}
+.bubble.clamped{max-height:356px;overflow:hidden;-webkit-mask-image:linear-gradient(to bottom,#000 72%,transparent);mask-image:linear-gradient(to bottom,#000 72%,transparent)}
+.bubble-more{margin-top:-6px}
+.message.user.flash .bubble{animation:message-flash 1.6s var(--ease)}
+@keyframes message-flash{0%,35%{box-shadow:0 0 0 2px var(--accent)}100%{box-shadow:0 0 0 2px transparent}}
+.message.user.editing{align-items:stretch}
+.edit-box{display:flex;flex-direction:column;gap:10px;width:min(100%,640px);margin-left:auto;padding:12px 14px;border:1px solid var(--line-strong);border-radius:20px;background:var(--raised)}
+.edit-box:focus-within{border-color:var(--accent-line)}
+.edit-box textarea{width:100%;min-height:72px;max-height:50vh;padding:0;resize:none;border:0;outline:0;background:transparent;color:var(--text);font:inherit;font-size:15px;line-height:24px;overflow:auto}
+.edit-files{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.edit-file{padding:2px 2px 2px 10px;gap:6px}
+.edit-file>span{max-width:200px}
+.edit-note{margin:0;font-size:13px;line-height:18px;color:var(--text-3)}
+.edit-note strong{font-weight:600;color:var(--text-2)}
+.edit-actions{display:flex;justify-content:flex-end;gap:8px}
+.edit-actions>button{height:34px;border-radius:17px}
+.context-note{display:inline-flex;align-items:center;gap:5px;font-family:var(--mono);font-size:12px;line-height:16px;color:var(--text-3);cursor:help;white-space:nowrap}
+.context-note::before{content:"·";margin-right:3px}
+
+/* Thread navigator: a marker per message you sent, previous/next, jump to latest; a sheet on phones */
+.thread-nav{position:absolute;top:12px;bottom:12px;right:12px;z-index:3;display:flex;flex-direction:column;align-items:center;gap:4px;width:24px}
+.thread-step{display:grid;place-items:center;width:24px;height:24px;padding:0;border:0;border-radius:50%;background:transparent;color:var(--text-3);opacity:.55;transition:opacity .15s var(--ease)}
+.thread-nav:hover .thread-step,.thread-step:focus-visible{opacity:1}
+.thread-step:hover{background:var(--sunken);color:var(--text)}
+.thread-track{position:relative;flex:1;width:24px}
+.thread-mark{position:absolute;left:50%;width:18px;height:12px;margin:-6px 0 0 -9px;padding:0;border:0;background:transparent;cursor:pointer}
+.thread-mark::before{content:"";position:absolute;top:5px;left:5px;right:5px;height:2px;border-radius:1px;background:var(--line-strong);transition:background .15s var(--ease),left .15s var(--ease),right .15s var(--ease)}
+.thread-mark:hover::before,.thread-mark:focus-visible::before{left:1px;right:1px;background:var(--text-2)}
+.thread-mark.active::before{left:1px;right:1px;background:var(--accent)}
+.thread-tip{position:absolute;top:50%;right:24px;width:max-content;max-width:300px;padding:6px 10px;border:1px solid var(--line-strong);border-radius:10px;background:var(--surface);box-shadow:var(--shadow-lg);color:var(--text);font-size:13px;line-height:18px;text-align:left;white-space:normal;pointer-events:none;opacity:0;transform:translateY(-50%);transition:opacity .12s var(--ease)}
+.thread-tip small{display:block;font-family:var(--mono);font-size:11px;line-height:16px;color:var(--text-3)}
+.thread-mark:hover .thread-tip,.thread-mark:focus-visible .thread-tip{opacity:1}
+.thread-list-button{display:none}
+.jump-latest{position:absolute;bottom:12px;left:50%;z-index:3;display:inline-flex;align-items:center;gap:6px;height:34px;padding:0 14px;border:1px solid var(--line-strong);border-radius:17px;background:var(--surface);box-shadow:var(--shadow-lg);color:var(--text-2);font-size:13px;transform:translateX(-50%)}
+.jump-latest:hover{background:var(--sunken);color:var(--text)}
+.thread-sheet-backdrop{position:fixed;inset:0;z-index:30;display:flex;align-items:flex-end;justify-content:center;background:var(--backdrop)}
+.thread-sheet{display:flex;flex-direction:column;width:100%;max-width:560px;max-height:70dvh;padding:8px 8px calc(12px + env(safe-area-inset-bottom));border-radius:20px 20px 0 0;background:var(--sheet);box-shadow:var(--shadow-lg)}
+.thread-sheet header{display:flex;align-items:center;justify-content:space-between;padding:4px 4px 4px 12px}
+.thread-sheet h2{margin:0;font-size:15px;font-weight:600}
+.thread-sheet ol{margin:0;padding:0;list-style:none;overflow:auto}
+.thread-sheet li button{display:grid;grid-template-columns:28px minmax(0,1fr) auto;align-items:center;gap:8px;width:100%;min-height:44px;padding:8px 12px;border:0;border-radius:12px;background:transparent;color:var(--text);font-size:14px;text-align:left}
+.thread-sheet li button:hover,.thread-sheet li button[aria-current]{background:var(--sunken)}
+.thread-sheet-number,.thread-sheet time{font-family:var(--mono);font-size:12px;color:var(--text-3)}
+.thread-sheet-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+@media (hover:none){.user-actions>*{opacity:1}}
+@media (max-width:1100px){.thread-nav{right:6px}}
+@media (max-width:760px){
+  .thread-nav{display:none}
+  .thread-list-button{position:absolute;right:12px;bottom:12px;z-index:3;display:grid;place-items:center;width:38px;height:38px;padding:0;border:1px solid var(--line-strong);border-radius:50%;background:var(--surface);box-shadow:var(--shadow-lg);color:var(--text-2)}
+  .edit-box{width:100%}
+  .edit-box textarea{font-size:16px}
+}
+@media (prefers-reduced-motion:reduce){.message.user.flash .bubble{animation:none;box-shadow:0 0 0 2px var(--accent)}}
+@media (min-width:761px){.conversation-wrap:has(.thread-nav) .conversation{padding-right:48px}}

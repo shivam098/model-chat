@@ -4,6 +4,7 @@ import { copilotError, type ReplyRunner } from "./copilot";
 import { LIMITS, type StreamEvent, type MessageStatus, type NativeImage, type WebSource } from "./contracts";
 import { finalizeSources } from "./web-search";
 import { REPLY_SILENCE_MS, silenceMinutes, silenceWatchdog } from "./reply-watchdog";
+import { WAITING_STAGE, reserveMemory, waitForMemory, type MemoryProbe } from "./capacity";
 
 type ActiveReply = { userId: string; actorId: string; sessionId?: string; controller: AbortController };
 export interface StreamSecurity {
@@ -30,14 +31,14 @@ export function hasSessionReply(sessionId: string) {
 export function stopSessionReplies(sessionId: string) {
   for (const job of active.values()) if (job.sessionId === sessionId) job.controller.abort();
 }
-export function createChatStream(store: Store, userId: string, chatId: string, content: string, model: string, fileIds: string[], prompt: string, runner: ReplyRunner, requestSignal: AbortSignal, security?: StreamSecurity, images?: NativeImage[], options: { silenceMs?: number; thinking?: string | null } = {}) {
+export function createChatStream(store: Store, userId: string, chatId: string, content: string, model: string, fileIds: string[], prompt: string, runner: ReplyRunner, requestSignal: AbortSignal, security?: StreamSecurity, images?: NativeImage[], options: { silenceMs?: number; thinking?: string | null; edit?: { editOf: string; keepFileIds?: string[] }; memory?: MemoryProbe } = {}) {
   const silenceMs = options.silenceMs ?? REPLY_SILENCE_MS;
+  // Any number of chats can generate at once; each chat runs one reply at a time (the composer keeps the next message as a draft).
   if (active.has(chatId)) throw new AppError(409, "A reply is already running in this chat.");
-  if (active.size >= 2 || [...active.values()].some(j => j.userId === userId || j.actorId === (security?.actorId ?? userId))) throw new AppError(429, "One reply per account or actor and two per app can run at once. Wait or stop the current reply.");
   const controller = new AbortController();
   const turn = store.db.transaction(() => {
     security?.check();
-    const turn = store.beginTurn(userId, chatId, content, model, fileIds, options.thinking);
+    const turn = store.beginTurn(userId, chatId, content, model, fileIds, options.thinking, options.edit);
     security?.accepted(turn.user.id, turn.assistant.id);
     return turn;
   })();
@@ -115,7 +116,18 @@ export function createChatStream(store: Store, userId: string, chatId: string, c
         // Keeps the browser, the local server's socket timeout and the Cloudflare link alive however long the reply runs.
         const heartbeat = setInterval(() => { if (checkAccess()) send({ type: "progress", stage }); }, 15_000);
         const authorizationTimer = security ? setInterval(checkAccess, 500) : undefined;
+        let releaseMemory: (() => void) | undefined;
         try {
+          // Only when this computer is genuinely short of memory does a reply wait to start; Stop works while it waits.
+          releaseMemory = reserveMemory(options.memory) ?? undefined;
+          if (!releaseMemory) {
+            const resume = watchdog.hold();
+            try {
+              releaseMemory = (await waitForMemory(controller.signal, () => { stage = WAITING_STAGE; if (checkAccess()) send({ type: "progress", stage }); }, options.memory)).release;
+              stage = "Generating reply"; if (checkAccess()) send({ type: "progress", stage });
+            } finally { resume(); }
+            controller.signal.throwIfAborted();
+          }
           await runner({ model, prompt, images, authorize: security?.check, signal: controller.signal, assistantMessageId: turn.assistant.id,
             onAttachments: () => { if (checkAccess()) send({ type: "attachments" }); },
             onCodeEvent: event => { if (checkAccess()) send({ type: "code", event }); },
@@ -126,6 +138,7 @@ export function createChatStream(store: Store, userId: string, chatId: string, c
               persist();
             },
             onActivity: watchdog.touch, holdActivity: watchdog.hold, onProgress: value => { stage = value; if (checkAccess()) send({ type: "progress", stage }); },
+            onContext: note => { if (checkAccess()) send({ type: "context", note }); },
             onDelta: text => accept(text, false), onReplace: text => accept(text, true), onReasoning: acceptReasoning });
           if (controller.signal.aborted) throw new DOMException("Reply cancelled", "AbortError");
           if (!text.trim()) throw new AppError(503, "Copilot returned no text. The request was saved, but no answer was generated.");
@@ -140,6 +153,7 @@ export function createChatStream(store: Store, userId: string, chatId: string, c
           else error = copilotError(cause).message;
         } finally {
           watchdog.stop();
+          releaseMemory?.();
           clearInterval(heartbeat);
           clearInterval(authorizationTimer);
           requestSignal.removeEventListener("abort", requestAbort);

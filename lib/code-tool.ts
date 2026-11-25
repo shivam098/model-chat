@@ -7,7 +7,7 @@ import { PREVIEW_TYPES } from "./contracts";
 import type { Store } from "./store";
 import { UploadStore } from "./upload-store";
 import { requireDiskCapacity } from "./upload-io";
-import { reserveSandbox, runSandbox, sandboxConfig, SANDBOX_RUNS_PER_REPLY, SANDBOX_TOOL, type SandboxConfig, type SandboxInput } from "./sandbox";
+import { acquireSandbox, runSandbox, sandboxConfig, SANDBOX_RUNS_PER_REPLY, SANDBOX_TOOL, type SandboxConfig, type SandboxInput } from "./sandbox";
 import { safeFileName } from "./safe-name";
 
 export type CodeAudit = (action: "code.run" | "code.output", objectId: string, outcome: "allowed" | "denied" | "error", reason: string) => void;
@@ -120,9 +120,11 @@ export function createCodeTool(context: CodeToolContext): Tool {
         return { name, size: file.size, chunks: () => uploads.rawChunks(file.id) };
       });
       const runId = randomUUID();
+      // Two sandbox slots exist (and one run per account at a time); with replies running in parallel, a run waits for its turn.
+      const waiting = setInterval(() => context.onActivity?.(), 30_000);
       let release: () => void;
-      try { release = reserveSandbox(runId, subjectId, context.access.actor.id); }
-      catch (error) { return failure(error instanceof Error ? error.message : "The code runner is busy."); }
+      try { release = await acquireSandbox(runId, subjectId, context.access.actor.id, context.signal, () => context.onProgress?.("Waiting for a free code-runner slot (another run is using it)")); }
+      finally { clearInterval(waiting); }
       context.audit?.("code.run", runId, "allowed", "started");
       context.onActivity?.();
       context.onProgress?.(`Running Python in the offline sandbox (run ${runs} of up to ${SANDBOX_RUNS_PER_REPLY})`);

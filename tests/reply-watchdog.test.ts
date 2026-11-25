@@ -64,14 +64,13 @@ test("a completely silent request is ended by the watchdog with a plain message,
     const silentAlice = reply(store, "alice", first.id, async input => { input.onActivity?.(); input.onDelta("Partial text"); await untilAborted(input); });
     const silentBob = reply(store, "bob", second.id, async input => { await untilAborted(input); });
     await sleep(20);
-    assert.throws(() => createChatStream(store, "carol", store.createChat("carol").id, "Q", "m", [], "{}", async () => undefined, new AbortController().signal), /two per app/, "Both app slots are busy");
     await Promise.all([silentAlice, silentBob]);
     const ended = store.messages("alice", first.id).at(-1)!;
     assert.equal(ended.status, "error");
     assert.equal(ended.content, "Partial text", "Partial text is saved");
     assert.match(ended.error!, /^The model stopped responding: nothing arrived for \d+ seconds, so the reply was ended\. The partial text above is saved\.$/);
     assert.match(store.messages("bob", second.id).at(-1)!.error!, /stopped responding.*No text had arrived yet\./);
-    // Both the per-account and the per-app slots are free again.
+    // The chat is free for its next reply.
     await reply(store, "alice", first.id, async input => { input.onDelta("Next reply."); });
     await reply(store, "carol", store.createChat("carol").id, async input => { input.onDelta("Also fine."); });
     assert.equal(store.messages("alice", first.id).at(-1)!.status, "complete");

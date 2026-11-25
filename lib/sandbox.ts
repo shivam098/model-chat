@@ -118,6 +118,22 @@ export function reserveSandbox(runId: string, subjectId: string, actorId: string
   active.set(runId, { subjectId, actorId });
   return () => { active.delete(runId); };
 }
+/** Takes a sandbox slot, waiting (not failing) while both are in use; `onWaiting` runs once if it has to wait. Stop cancels the wait. */
+export async function acquireSandbox(runId: string, subjectId: string, actorId: string, signal: AbortSignal, onWaiting: () => void, pollMs = 500) {
+  let waited = false;
+  for (;;) {
+    signal.throwIfAborted();
+    try { return reserveSandbox(runId, subjectId, actorId); }
+    catch (error) { if (!(error instanceof AppError && error.status === 429)) throw error; }
+    if (!waited) { waited = true; onWaiting(); }
+    await new Promise<void>((resolve, reject) => {
+      const done = () => { clearTimeout(timer); signal.removeEventListener("abort", stop); };
+      const stop = () => { done(); reject(new DOMException("Run cancelled", "AbortError")); };
+      const timer = setTimeout(() => { done(); resolve(); }, pollMs);
+      signal.addEventListener("abort", stop, { once: true });
+    });
+  }
+}
 
 export async function runSandbox(code: string, inputs: SandboxInput[], options: { signal: AbortSignal; limits?: Partial<SandboxLimits> }): Promise<SandboxResult> {
   const config = sandboxConfig();

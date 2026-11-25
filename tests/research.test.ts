@@ -175,7 +175,7 @@ test("deep research runs as a background job: plan, start, capped searches, full
   } finally { db.close(); }
 });
 
-test("deep research: Stop cancels it, it keeps no access while acting or without web search, and one run per account works at a time", async () => {
+test("deep research: Stop cancels it, it keeps no access while acting or without web search, and runs in different chats work in parallel", async () => {
   const { db, store, guard } = setup();
   try {
     const ctx = guard.resolve("admin", "admin-session");
@@ -191,7 +191,16 @@ test("deep research: Stop cancels it, it keeps no access while acting or without
     const other = store.createChat("admin");
     startResearch(deps, ctx, chat.id, store.messages("admin", chat.id).at(-1)!.research!.id);
     await until(() => store.messages("admin", chat.id).at(-1)?.research?.state === "running");
-    assert.throws(() => beginResearch(deps, { ...input, chatId: other.id }), /One deep research run per account/, "A second run waits for the first");
+    assert.throws(() => beginResearch(deps, input), /already running in this chat/, "One run per chat");
+    // Another chat of the same account runs at the same time.
+    const parallel = store.createChat("admin");
+    beginResearch(deps, { ...input, chatId: parallel.id });
+    await until(() => store.messages("admin", parallel.id).at(-1)?.research?.state === "awaiting_start");
+    startResearch(deps, ctx, parallel.id, store.messages("admin", parallel.id).at(-1)!.research!.id);
+    await until(() => store.messages("admin", parallel.id).at(-1)?.research?.state === "running");
+    assert.equal(store.messages("admin", chat.id).at(-1)?.research?.state, "running", "Both runs work at once");
+    cancelResearch(deps, "admin", parallel.id);
+    await until(() => store.messages("admin", parallel.id).at(-1)?.research?.state === "cancelled");
     cancelResearch(deps, "admin", chat.id);
     await until(() => store.messages("admin", chat.id).at(-1)?.research?.state === "cancelled");
     assert.equal(store.messages("admin", chat.id).at(-1)!.status, "cancelled");

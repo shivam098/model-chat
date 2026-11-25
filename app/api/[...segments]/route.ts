@@ -4,10 +4,11 @@ import { getStore } from "@/lib/store";
 import { AccessService, type AccessContext } from "@/lib/access";
 import { AppError, errorResponse } from "@/lib/errors";
 import { assertLocalRequest, readBytes, readJson, requireAccess } from "@/lib/http";
-import { LIMITS } from "@/lib/contracts";
+import { LIMITS, MESSAGE_BODY_BYTES } from "@/lib/contracts";
 import { validateFileName } from "@/lib/files";
 import { listModels, modelLevels, replyReasoningEffort, runCopilotReply, type ReplyRunner } from "@/lib/copilot";
 import { prepareImageTurn } from "@/lib/image-turn";
+import { chooseSummaryModel } from "@/lib/condense";
 import { codeToolInstruction, createCodeTool, previewMatches } from "@/lib/code-tool";
 import { sandboxConfig, sandboxStatus } from "@/lib/sandbox";
 import { webSearchStatus } from "@/lib/web-search";
@@ -121,7 +122,7 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
       if (s.length === 2 && s[1] === "acting" && method === "POST") {
         guard.requireAdmin(ctx);
         if (hasSessionReply(ctx.sessionId)) throw new AppError(409, "Stop the current reply before switching users.");
-        const input = await readJson(request, z.object({ userId: accountId, chatId: z.uuid().optional(), previous: draftSchema.optional() }).strict());
+        const input = await readJson(request, z.object({ userId: accountId, chatId: z.uuid().optional(), previous: draftSchema.optional() }).strict(), MESSAGE_BODY_BYTES);
         return Response.json(store.db.transaction(() => {
           guard.check(ctx);
           if (input.previous) saveDraft(input.previous);
@@ -133,7 +134,7 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
       if (s.length === 2 && s[1] === "stop" && method === "POST") {
         guard.requireAdmin(ctx, true);
         if (hasSessionReply(ctx.sessionId)) throw new AppError(409, "Stop the current reply before returning to your workspace.");
-        const input = await readJson(request, z.object({ previous: draftSchema.optional() }).strict());
+        const input = await readJson(request, z.object({ previous: draftSchema.optional() }).strict(), MESSAGE_BODY_BYTES);
         return Response.json(store.db.transaction(() => {
           if (input.previous) saveDraft(input.previous);
           const next = guard.stop(ctx);
@@ -152,12 +153,12 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
       }
       throw new AppError(404, "Admin endpoint not found.");
     }
-    if (s.length === 1 && s[0] === "drafts" && method === "POST") return Response.json({ chat: saveDraft(await readJson(request, draftSchema)) });
+    if (s.length === 1 && s[0] === "drafts" && method === "POST") return Response.json({ chat: saveDraft(await readJson(request, draftSchema, MESSAGE_BODY_BYTES)) });
     if (s.length === 1 && s[0] === "demos" && method === "POST") {
       const input = await readJson(request, z.object({
         demoId: z.enum(DEMO_IDS),
         previous: z.object({ chatId: z.uuid().optional(), draft: z.string().max(LIMITS.inputCharacters) }).strict().optional(),
-      }).strict());
+      }).strict(), MESSAGE_BODY_BYTES);
       return Response.json(run("demo.create", null, () => createDemoChat(store, user.id, input.demoId, input.previous), result => result.detail.chat.id), { status: 201 });
     }
     if (s.length === 1 && s[0] === "models" && method === "GET") {
@@ -190,6 +191,15 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
       run("message.stop", chatId, () => { stopReply(store, user.id, chatId); cancelResearch({ store, guard }, user.id, chatId); });
       return Response.json({ ok: true });
     }
+    // Shows another version of an edited message; the conversation (and the model's context) follows that branch from then on.
+    if (s.length === 3 && s[2] === "branch" && method === "POST") {
+      const { messageId } = await readJson(request, z.object({ messageId: z.uuid() }).strict());
+      const messages = run("message.branch", messageId, () => store.switchBranch(user.id, chatId, messageId));
+      // A coding session remembers the branch it worked on; the next turn starts a fresh one with this branch's recap.
+      if (chat.mode === "code") await disposeCodeChat(chatId);
+      return Response.json({ chat: store.chat(user.id, chatId), messages, attachments: store.attachments(user.id, chatId),
+        ...(chat.mode === "code" ? { codeEvents: store.codeEvents(user.id, chatId), codeLive: hasCodeSession(chatId) } : {}) });
+    }
     const streamSecurity: StreamSecurity = {
       actorId: ctx.actor.id, sessionId: ctx.sessionId, check: () => { guard.check(ctx); },
       accepted: (userMessageId, assistantId) => {
@@ -198,7 +208,13 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
       },
       finished: (messageId, status, lost) => guard.record(ctx, "message.finish", messageId, lost ? "denied" : status === "error" ? "error" : "allowed", lost ? "access_ended" : status),
     };
-    if (s.length === 3 && s[2] === "messages" && method === "POST" && chat.mode === "code") return await handleCodeMessage(request, ctx, guard, store, chatId, streamSecurity);
+    // An edit is recorded with the version it replaces, on top of the usual send records.
+    const editSecurity = (editOf?: string): StreamSecurity => !editOf ? streamSecurity : { ...streamSecurity, accepted: (userMessageId, assistantId) => {
+      streamSecurity.accepted(userMessageId, assistantId);
+      guard.record(ctx, "message.edit", userMessageId, "allowed", `new version of ${editOf}`);
+    } };
+    const editFields = { editOf: z.uuid().optional(), keepFileIds: z.array(z.uuid()).max(100).default([]) };
+    if (s.length === 3 && s[2] === "messages" && method === "POST" && chat.mode === "code") return await handleCodeMessage(request, ctx, guard, store, chatId, editSecurity, streamSecurity);
     // Deep research: drafting a plan, then starting it. Both need web search for this account and are refused while acting.
     if (s.length === 3 && s[2] === "research" && method === "POST") {
       const body = await readJson(request, z.object({
@@ -206,18 +222,22 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
         model: z.string().min(1).max(128),
         thinking: z.enum(THINKING_LEVELS).optional(),
         fileIds: z.array(z.uuid()).default([]),
-      }).strict());
+        ...editFields,
+      }).strict(), MESSAGE_BODY_BYTES);
       if (chat.mode === "code") throw new AppError(400, "Deep research works in ordinary chats, not coding chats.");
       const refused = researchAllowed(guard, user.id, ctx.delegationId);
       if (refused) { guard.record(ctx, "research.plan", chatId, "denied", ctx.delegationId ? "acting" : "no_web_access", true); throw new AppError(403, refused); }
       if (new Set(body.fileIds).size !== body.fileIds.length) throw new AppError(400, "Repeated file IDs are not allowed.");
       store.assertIdle(user.id, chatId);
-      const model = (await listModels()).find(m => m.id === body.model);
+      const models = await listModels();
+      const model = models.find(m => m.id === body.model);
       guard.check(ctx);
       if (!model) throw new AppError(400, "That model is no longer available. Refresh the model list and select another.");
+      const edit = body.editOf ? { editOf: body.editOf, keepFileIds: body.keepFileIds } : undefined;
       const turn = prepareImageTurn(store, user.id, chatId, body.content, body.fileIds, model, runCopilotReply,
-        (id, outcome, reason) => guard.record(ctx, "image.analysis", id, outcome, reason, true), body.thinking);
-      const result = beginResearch({ store, guard }, { ctx, chatId, content: body.content, model, thinking: body.thinking, fileIds: body.fileIds, prompt: turn.prompt, runner: turn.runner });
+        (id, outcome, reason) => guard.record(ctx, "image.analysis", id, outcome, reason, true), body.thinking,
+        { ...edit, summaryModel: chooseSummaryModel(models, model), record: (action, id, outcome, reason) => guard.record(ctx, action, id, outcome, reason, true) });
+      const result = beginResearch({ store, guard }, { ctx, chatId, content: body.content, model, thinking: body.thinking, fileIds: body.fileIds, prompt: turn.prompt, runner: turn.runner, finalPrompt: turn.finalPrompt, edit });
       return Response.json(result, { status: 201 });
     }
     if (s.length === 5 && s[2] === "research" && s[4] === "start" && method === "POST") {
@@ -233,7 +253,8 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
         model: z.string().min(1).max(128),
         thinking: z.enum(THINKING_LEVELS).optional(),
         fileIds: z.array(z.uuid()).default([]),
-      }).strict());
+        ...editFields,
+      }).strict(), MESSAGE_BODY_BYTES);
       if (new Set(body.fileIds).size !== body.fileIds.length) throw new AppError(400, "Repeated file IDs are not allowed.");
       store.assertIdle(user.id, chatId);
       store.contextFiles(user.id, chatId, body.fileIds);
@@ -241,8 +262,10 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
       guard.check(ctx);
       const model = models.find(m => m.id === body.model);
       if (!model) throw new AppError(400, "That model is no longer available. Refresh the model list and select another.");
+      const edit = body.editOf ? { editOf: body.editOf, keepFileIds: body.keepFileIds } : undefined;
       const turn = prepareImageTurn(store, user.id, chatId, body.content, body.fileIds, model, runCopilotReply,
-        (id, outcome, reason) => guard.record(ctx, "image.analysis", id, outcome, reason, true), body.thinking);
+        (id, outcome, reason) => guard.record(ctx, "image.analysis", id, outcome, reason, true), body.thinking,
+        { ...edit, summaryModel: chooseSummaryModel(models, model), record: (action, id, outcome, reason) => guard.record(ctx, action, id, outcome, reason, true) });
       const sandbox = sandboxConfig();
       // Decided on the server for this turn: the owner's own chats by default, never while acting as another user.
       const web = webSearchStatus(ctx, guard).enabled;
@@ -264,7 +287,7 @@ async function handle(request: Request, routeContext: RouteContext): Promise<Res
           if (searches) guard.record(ctx, "web.search", chatId, "allowed", `${searches} search${searches === 1 ? "" : "es"}`, true);
         }
       };
-      return createChatStream(store, user.id, chatId, body.content, body.model, body.fileIds, turn.prompt, runner, request.signal, streamSecurity, undefined, { thinking: replyReasoningEffort(model, body.thinking) ?? null });
+      return createChatStream(store, user.id, chatId, body.content, body.model, body.fileIds, turn.prompt, runner, request.signal, editSecurity(edit?.editOf), undefined, { thinking: replyReasoningEffort(model, body.thinking) ?? null, edit });
     }
     if (s.length === 3 && s[2] === "files" && method === "POST") {
       const release = transferSlot(user.id);
